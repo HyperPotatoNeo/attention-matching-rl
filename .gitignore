@@ -200,3 +200,10 @@ debug_I2_zero_band
 .idea
 
 outputs/
+
+# Compaction artifacts
+vllm_compaction/
+results_*.json
+server_gpu*.log
+server.log
+*.output

@@ -153,6 +153,7 @@ def models(request: Request) -> OpenAIServingModels:
 WORKER_EXTENSION_CLS = {
     "nccl": "prime_rl.inference.vllm.worker.nccl.NCCLWeightUpdateWorker",
     "filesystem": "prime_rl.inference.vllm.worker.filesystem.FileSystemWeightUpdateWorker",
+    "filesystem_compaction": "prime_rl.inference.compaction.worker.CompactionWorker",
 }
 
 
@@ -300,6 +301,12 @@ def custom_build_app(args: Namespace, supported_tasks: tuple):
     """
     app = _original_build_app(args, supported_tasks)
     app.include_router(router)
+
+    if getattr(args, "enable_compaction", False):
+        from prime_rl.inference.compaction.routes import router as compaction_router
+
+        app.include_router(compaction_router)
+
     return app
 
 
@@ -335,7 +342,11 @@ def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
         logger.info(f"Using tool_call_parser='{args.tool_call_parser}' for model '{args.model}'")
 
     # Set the worker extension class based on the broadcast backend
-    args.worker_extension_cls = WORKER_EXTENSION_CLS[config.weight_broadcast.type]
+    enable_compaction = getattr(args, "enable_compaction", False)
+    if enable_compaction and config.weight_broadcast.type == "filesystem":
+        args.worker_extension_cls = WORKER_EXTENSION_CLS["filesystem_compaction"]
+    else:
+        args.worker_extension_cls = WORKER_EXTENSION_CLS[config.weight_broadcast.type]
 
     if args.headless or args.api_server_count < 1:
         run_headless(args)

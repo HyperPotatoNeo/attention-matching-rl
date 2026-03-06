@@ -1,0 +1,10 @@
+[model]
+name = "Qwen/Qwen3-4B"
+enforce_eager = true
+
+[parallel]
+tp = 1
+dp = 4
+
+[vllm_extra]
+enable_compaction = true
