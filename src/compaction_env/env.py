@@ -192,6 +192,7 @@ def load_environment(
     n_compacts: int = 2,
     max_kv_len: int | None = None,
     max_total_tokens: int | None = None,
+    compute_beta: bool = False,
     **inner_env_kwargs,
 ) -> CompactionEnv:
     """Load a CompactionEnv wrapping the specified gym environment.
@@ -208,4 +209,5 @@ def load_environment(
         n_compacts=n_compacts,
         max_kv_len=max_kv_len,
         max_total_tokens=max_total_tokens,
+        compute_beta=compute_beta,
     )

@@ -1,21 +1,18 @@
-# Compaction Full FT Training — Multi-Node Config (5 inference + 3 trainer GPUs)
-#
-# Architecture:
-#   Node 1 (4 GPUs): 4 inference servers (TP=1, ports 8000-8003)
-#   Node 2 (4 GPUs): 1 inference server (GPU 0, port 8004) + trainer (GPUs 1-3, FSDP2)
+# Compaction Full FT Training — No Beta Bias
+# 2-node: 5 inference + 3 trainer GPUs, rg-mix-env, no compute_beta
 #
 # __INFERENCE_NODE__ and __TRAINER_NODE__ are replaced by the launch script.
 
 max_steps = 600
 seq_len = 9216
-output_dir = "outputs/compaction-fullft-multinode"
+output_dir = "outputs/compaction-fullft-nobeta"
 
 [model]
 name = "Qwen/Qwen3-4B"
 
 [wandb]
 project = "compaction-rl"
-name = "compaction-fullft-multinode"
+name = "compaction-fullft-nobeta"
 
 [ckpt]
 interval = 50
@@ -63,12 +60,7 @@ base_url = [
 [orchestrator.sampling]
 max_tokens = 8192
 
-# KV budget mode: generate until KV cache hits 2048, then compact first 1024
-# assistant tokens to 256 (ratio 0.25), freeing 768 slots. Continue generating
-# until 2048 is hit again. Repeat until ~8192 total completion tokens.
 [[orchestrator.env]]
 id = "compaction_env"
 name = "compaction-rg-mix"
 args = { gym = "rg_mix_env", max_seq_len = 9216, max_kv_len = 2048, max_total_tokens = 8192, compact_target_ratio = 0.25, compact_window = 1024, n_compacts = 99, dataset_path = "/pscratch/sd/s/siddart2/datasets/rg_mix_7500", num_train_examples = 7500, num_eval_examples = 100 }
-
-# No [inference] section — inference runs on Node 1.

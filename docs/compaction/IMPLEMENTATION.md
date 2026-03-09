@@ -3,246 +3,160 @@
 ## Overview
 
 KV cache compaction compresses the key-value cache mid-generation to allow longer effective
-context within a fixed memory budget. Instead of generating one long sequence, generation is
-split into segments. After each segment, the oldest portion of the assistant's KV cache is
-compressed using Attention Matching, and generation continues on the compacted cache.
+context within a fixed memory budget. Generation is split into segments. After each segment,
+the oldest portion of the assistant's KV cache is compressed using Attention Matching, and
+generation continues on the compacted cache.
 
-The method is based on [Attention Matching](https://arxiv.org/abs/2602.16284) (Zweiger et al., 2026),
-which selects a subset of keys (C1) and solves for replacement values (C2) that best preserve
-the attention output under random queries.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│ vLLM Server (per GPU)                               │
-│                                                     │
-│  FastAPI ──► /compact_generate  (routes.py)         │
-│                    │                                │
-│                    ▼                                │
-│            collective_rpc("compact_generate")       │
-│                    │                                │
-│                    ▼                                │
-│         CompactionWorker.compact_generate()         │
-│                (worker.py)                          │
-│                    │                                │
-│         ┌─────────┴──────────┐                      │
-│         ▼                    ▼                      │
-│    Manual forward       KV compaction               │
-│    passes (decode)      (_compact_kv)               │
-│         │                    │                      │
-│         ▼                    ▼                      │
-│    FlashAttention       Paged block                 │
-│    metadata             manipulation                │
-│    (_DecodeContext)      (_inject_compacted_kv)      │
-│                                                     │
-└─────────────────────────────────────────────────────┘
-```
-
-### Why manual forward passes?
-
-vLLM's scheduler manages the KV cache and model execution. To inject compacted KV entries
-mid-sequence, we need direct access to the KV cache blocks during generation. The
-`collective_rpc` mechanism pauses the scheduler and gives the worker exclusive access to
-the model and KV cache. The worker then drives generation manually: constructing
-`FlashAttentionMetadata`, running model forward passes, and sampling tokens — all without
-the scheduler's involvement.
+Based on [Attention Matching](https://arxiv.org/abs/2602.16284) (Zweiger et al., 2026):
+select a subset of keys (C1), solve for replacement values (C2) that preserve attention output,
+and optionally compute beta bias to correct the partition function mismatch.
 
 ## File Layout
 
 ```
 src/prime_rl/inference/compaction/
-├── __init__.py
-├── routes.py      # FastAPI endpoint: /compact_generate
-└── worker.py      # CompactionWorker + all generation/compaction logic
+  algorithm.py      # Attention Matching + NNLS beta solver (pure tensors, no vLLM dep)
+  beta_attention.py  # BetaState contiguous mirrors + SDPA decode with per-token bias
+  routes.py          # /compact_generate endpoint + _RequestBatcher (auto-batching B=8)
+  worker.py          # CompactionWorker: generation, compaction, CUDA graphs
 ```
 
-### `worker.py` — Core Logic
+## Compaction Algorithm (`algorithm.py`)
 
-#### `CompactionWorker` (line 29)
+### `compact_kv()`
 
-Extends `FileSystemWeightUpdateWorker` (which itself extends vLLM's worker). The only
-public method is `compact_generate()`, callable via `collective_rpc`.
+Per-layer vectorized Attention Matching across all KV heads simultaneously:
 
-#### `compact_generate()` (line 36)
+1. **Attention scoring**: Random queries `Q` (H, 64, D) probe the full assistant KV.
+   Importance per prefix position = RMS attention weight across queries.
 
-Main entry point. Flow:
+2. **Top-k selection**: Keep `target_ratio` fraction of prefix keys per head.
+   Each head selects independently (different keys per head).
 
-1. **Setup**: Get model, device, KV cache shape. Allocate free paged blocks.
-2. **Prefill**: Run the prompt through the model in one forward pass (`_run_prefill`).
-   This populates the KV cache for all prompt tokens.
-3. **Decode loop**: For each segment (up to `n_compacts + 1` segments):
-   - Generate tokens one at a time using CUDA-graphed decode steps.
-   - Tokens are accumulated in pre-allocated GPU buffers (`seg_token_ids`, `seg_logprobs`)
-     to avoid per-token CPU syncs.
-   - EOS is checked every 64 tokens in batch on GPU.
-   - After the segment, batch-transfer tokens to CPU.
-4. **Compaction** (between segments): Extract KV → run Attention Matching → inject
-   compacted KV back into paged blocks.
-5. **Return**: All token IDs, logprobs, and diagnostics.
+3. **C2 via least-squares**: Solve `softmax(Q @ C1^T [+ beta]) @ C2 = prefix_attn @ V_prefix`
+   so the compacted KV produces the same attention output as the original prefix.
 
-#### RoPE Position Tracking
-
-After compaction removes tokens from the cache, the cache position and the RoPE position
-diverge. The worker tracks `position_offset` — the cumulative number of tokens removed.
-Each decode step computes:
-
-```
-cache_position = current_seq_len - 1        # where to write in KV cache
-rope_position  = cache_position + position_offset  # position encoding for the model
-```
-
-This ensures the model sees monotonically increasing positions even though the cache is shorter.
-
-#### `current_seq_len = new_seq_len + 1` (line 290)
-
-After compaction, the last generated token's KV entry is stale (it attended to pre-compaction
-context). Setting `current_seq_len = new_seq_len + 1` causes the next decode step to
-overwrite that entry — the model recomputes it attending to the compacted context.
-
-### `_DecodeContext` (line 369)
-
-Pre-allocated tensors reused across all decode steps. Avoids creating new
-`FlashAttentionMetadata` objects each step. Fields are updated in-place via
-`_update_decode_state()`.
-
-Key optimization: `attn_metadata_dict` and `slot_mapping_ctx` are pre-built dicts mapping
-attention layer names to the shared metadata object. Since the dict values are mutable
-tensors, updating the tensors updates all dict references simultaneously.
-
-### CUDA Graph Capture (line 127)
-
-With TP=1, a CUDA graph is captured after warm-up, and replayed each decode step. This
-eliminates Python overhead and CPU-GPU synchronization, giving ~5-10x decode speedup.
-With TP>1, NCCL all-reduce ops are incompatible with raw CUDA graphs, so decode falls
-back to eager mode.
-
-The graph is captured with `max_seq_len` set to the maximum possible length. The actual
-sequence length is controlled by the `seq_lens` tensor (updated in-place each step), so
-FlashAttention only reads the valid portion of the KV cache.
-
-### `_run_prefill()` (line 438)
-
-Runs the prompt through the model in a single forward pass. Constructs slot mappings
-that map each position to its paged block location:
-
-```
-slot = block_ids[pos // block_size] * block_size + pos % block_size
-```
-
-### `_sample_token()` (line 513)
-
-Temperature + top-p sampling with deterministic seeding via `rng.manual_seed(seed)`.
-The seed is `len(all_token_ids) + seg_count`, ensuring reproducible results across
-TP ranks (all ranks sample the same token).
-
-## KV Cache Compaction Algorithm
-
-### `_compact_kv()` (line 579)
-
-Implements Attention Matching with β=0 (no regularization). For each layer and head:
-
-**Step 1: Attention scoring with full context**
-
-```python
-Q = torch.randn(64, head_size)  # random query probes
-full_scores = Q @ K_full.T * scale
-full_attn = softmax(full_scores, dim=-1)
-```
-
-Random queries probe which keys receive the most attention. Using the full assistant KV
-(not just the prefix being compressed) ensures the algorithm accounts for the suffix's
-presence when deciding which prefix keys to keep.
-
-**Step 2: Select top-k prefix keys**
-
-```python
-prefix_importance = full_attn[:, :window].pow(2).mean(dim=0).sqrt()
-topk_indices = prefix_importance.topk(target_len).indices.sort().values
-C1 = K_prefix[topk_indices]  # selected keys
-```
-
-The importance score is the RMS attention weight across all random queries. Only prefix
-positions (first `compact_window` assistant tokens) are candidates for selection.
-
-**Step 3: Solve for replacement values (C2)**
-
-```python
-# What the original prefix contributed to the output:
-Y = full_attn[:, :window] @ V_prefix
-
-# What the selected keys would produce with new values:
-X = softmax(Q @ C1.T * scale, dim=-1)
-
-# Least-squares: find C2 such that X @ C2 ≈ Y
-C2 = lstsq(X, Y).solution
-```
-
-This is the key insight from Attention Matching: C1 preserves the original keys (so
-attention patterns are similar), while C2 is a new set of values optimized so that
-`softmax(Q @ C1.T) @ C2 ≈ softmax(Q @ K.T) @ V` — the attention output is preserved
-even though fewer KV entries remain.
+4. **NaN/extreme value handling**: `lstsq` can produce NaN from rank-deficient softmax
+   (peaked betas). NaN entries fall back to original values. C2 is clamped to 2x the
+   original value range.
 
 ### Partial Compaction (`compact_window`)
 
-When `compact_window` is set (e.g., 512), only the first 512 assistant tokens are
-compressed. The remaining tokens (suffix) are preserved unchanged.
+Only the first `compact_window` assistant tokens are compressed. The suffix is preserved:
 
 ```
 Before:  [prompt | ========= 2048 assistant tokens =========]
-                   ↑ window=512 ↑     ↑ suffix=1536          ↑
+                   ^ window=512 ^     ^ suffix=1536          ^
 
 After:   [prompt | C1/C2 (128) | ---- suffix (1536) --------|
 ```
 
-The suffix is crucial context (most recent reasoning). By only compressing the oldest
-tokens, the model retains its recent chain of thought while reclaiming memory from
-earlier, less critical tokens.
+Full-context scoring: even though only the prefix is compressed, attention scoring uses
+the full KV (prefix + suffix) so the algorithm accounts for redundancy with the suffix.
 
-**Full-context scoring**: Even though only the prefix is compressed, the attention
-scoring in Step 1 uses the full KV cache (prefix + suffix). This means the algorithm
-can identify prefix keys that are redundant because the suffix already captures that
-information.
+### NNLS Beta Solver (`_solve_beta_nnls()`)
 
-**Regression target correction**: The regression target Y is `full_attn[:, :window] @ V_prefix`
-— only the prefix's contribution to the attention output. After injection, the suffix
-handles its own contribution directly; C2 only needs to approximate what the prefix
-originally contributed.
+When `compute_beta=True`, finds per-key additive bias that corrects the partition function
+mismatch between full and compacted attention:
 
-### `_inject_compacted_kv()` (line 657)
+- **Target**: `Z_full(q) = sum_k exp(q @ k / sqrt(d))` -- full partition function per query
+- **Design matrix**: `M_{i,j} = exp(q_i @ c1_j / sqrt(d))` -- compacted terms
+- **NNLS**: `min ||M @ B - target||^2, B >= 0` via projected gradient descent (50 iters)
+- **Output**: `beta = log(B)` -- additive bias in log-space
 
-Writes the compacted KV back into vLLM's paged blocks:
+Beta is computed over the prefix keys only (not suffix), since suffix keys remain in
+attention without correction.
 
-```python
-K_new = cat([K_prompt, C1, K_suffix])
-V_new = cat([V_prompt, C2, V_suffix])
+## Beta Attention (`beta_attention.py`)
+
+### `BetaState`
+
+Contiguous KV mirrors + beta buffers that live alongside vLLM's paged KV cache:
+
+- `K[layer]`, `V[layer]`: `(B, max_seq_len, H_kv, D)` -- full contiguous copies
+- `beta[layer]`: `(B, H_kv, max_seq_len)` -- per-token additive bias (zero = no correction)
+- Memory: ~2.6 GB for B=8, S=2048, H_kv=8, D=128, L=36 (Qwen3-4B)
+
+All operations use fixed-shape tensors with in-place updates for CUDA graph compatibility.
+
+### Monkey-patched attention
+
+`patch_attention_layers()` wraps each FlashAttentionImpl with `_BetaAttentionWrapper`:
+- **Inactive** (`beta_state.active = False`): pass through to original FlashAttention
+- **Active** (`beta_state.active = True`): run original forward (keeps paged cache in sync),
+  then override output with GQA manual attention + beta bias
+
+This enables two-phase CUDA graph capture:
+1. Pre-compaction graph: FlashAttention (beta inactive)
+2. Post-compaction graph: SDPA+beta (beta active)
+
+### `compute_attention()`
+
+GQA-aware manual attention with per-token additive bias:
+```
+scores = einsum(Q_grouped, K^T) * scale + beta
+scores = masked_fill(~valid_mask, -inf)
+attn = softmax(scores)
+out = einsum(attn, V)
+```
+Operates in float32 for numerical stability, casts output to model dtype.
+
+## Worker (`worker.py`)
+
+### `CompactionWorker`
+
+Extends `FileSystemWeightUpdateWorker`. Two main methods:
+
+- `compact_generate()`: Single sequence generation with compaction
+- `compact_generate_batch()`: B sequences in parallel (used by auto-batching)
+
+### Generation flow
+
+1. **Prefill**: Single forward pass populates KV cache for all prompt tokens
+2. **Decode loop**: Per-segment token generation with CUDA graphs (TP=1)
+   - Tokens accumulated in GPU buffers, EOS checked every 64 tokens
+   - Batch-transfer to CPU after each segment
+3. **Compaction**: Extract KV -> `compact_kv()` -> inject compacted KV
+   - If `compute_beta`: also computes NNLS beta, updates `BetaState`, activates beta attention
+4. **Two-phase CUDA graphs**: Pre-compaction capture uses FlashAttention; after first
+   compaction with beta, recapture with SDPA+beta active
+
+### RoPE position tracking
+
+After compaction removes tokens, cache position and RoPE position diverge:
+```
+cache_position = current_seq_len - 1
+rope_position  = cache_position + position_offset
 ```
 
-Then writes block-by-block into the paged KV cache. Stale blocks (beyond the new
-sequence length) are zeroed.
+### `current_seq_len = new_seq_len + 1`
 
-## `routes.py` — HTTP Endpoint
+After compaction, the boundary token's KV is stale (attended to pre-compaction context).
+Setting `+1` forces the next decode to recompute it against compacted context.
 
-Thin FastAPI layer. Receives the request, calls `collective_rpc("compact_generate", ...)`
-on the engine, decodes the output tokens, and returns the result. The `collective_rpc`
-call blocks the vLLM scheduler for the entire duration — no other requests can be
-served concurrently on that server instance.
+## Auto-Batching (`routes.py`)
 
-## Performance
+`_RequestBatcher` accumulates individual `/compact_generate` requests (up to B=8, wait
+up to 1.0s) and dispatches them as a single `compact_generate_batch` collective_rpc call.
 
-With TP=1 and CUDA graphs, single-server throughput is ~110 tok/s. With DP=4 (4 servers),
-aggregate throughput is ~400-450 tok/s. Each compaction event takes ~0.5-0.7s
-(~0.4s algorithm + ~0.1-0.2s KV extraction/injection).
+Mandatory cleanup after each batch: `torch.cuda.synchronize() + gc.collect() + empty_cache()`
+to prevent CUDA memory fragmentation.
 
-## Eval Script: `scripts/eval_rg_mix.py`
+## FSDP2 Training
 
-Evaluates on a weighted mix of reasoning-gym tasks:
-- arc_1d, sokoban (hard), countdown (7 numbers), zebra_puzzles (7 people), cryptarithm
-- Tasks weighted by inverse difficulty (harder tasks sampled more)
+`segmented_forward` in the trainer calls `model.forward()` once per compaction segment.
+Under FSDP, each forward triggers all-gather. Variable segment counts across ranks cause
+NCCL deadlock.
 
-Supports two modes:
-- **compaction**: DP=4 parallel requests to ports 8000-8003 via `/compact_generate`
-- **baseline**: Sequential requests to a single server via `/v1/chat/completions`
+Fix: all-reduce MAX segment count, pad with dummy forwards (`result * 0` to preserve
+autograd graph for FSDP backward hooks). `empty_cache()` between segments prevents OOM
+from CUDA memory fragmentation.
 
-Reports overall accuracy, per-task accuracy, accuracy by number of compactions performed,
-compaction statistics, and mean logprob degradation.
+## Performance (Qwen3-4B, A100-80GB)
+
+| Metric | Value |
+|--------|-------|
+| Decode speed (CUDA graph, TP=1) | ~130 tok/s per GPU |
+| Aggregate throughput (DP=4) | ~480 tok/s |
+| Compaction algo time | ~0.05s/event (vectorized across heads) |
+| Compaction % of total time | ~1% |

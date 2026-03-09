@@ -60,7 +60,7 @@ def _solve_beta_nnls(
         # residual = M^T @ (M @ B - target), shape (H, t)
         B = (B - step_size * residual).clamp(min=1e-12)
 
-    beta = torch.log(B)  # (H, t)
+    beta = torch.log(B.clamp(min=1e-10))  # (H, t)
     return beta
 
 
@@ -148,7 +148,10 @@ def compact_kv(
         # Compute beta if requested
         layer_beta = None
         if compute_beta:
-            layer_beta = _solve_beta_nnls(Q, K_h, c1_h, scale, iters=beta_nnls_iters)
+            # Use only window keys for target partition function.
+            # Suffix keys remain in attention without beta correction,
+            # so including them would double-count their contribution.
+            layer_beta = _solve_beta_nnls(Q, Kp_h, c1_h, scale, iters=beta_nnls_iters)
             # layer_beta: (H, target_len)
 
         # Batched lstsq for C2 values
@@ -165,6 +168,14 @@ def compact_kv(
         # Solve: X @ C2 ≈ Y → C2 = lstsq(X, Y)
         c2_h = torch.linalg.lstsq(X, Y).solution  # (H, target_len, D)
 
+        # lstsq produces NaN when X is rank-deficient (e.g., peaked softmax
+        # from large beta). Replace NaN entries with original values at
+        # selected positions — equivalent to no value optimization for those.
+        nan_mask = torch.isnan(c2_h)
+        if nan_mask.any():
+            c2_fallback = torch.gather(Vp_h, 1, idx_expanded)
+            c2_h = torch.where(nan_mask, c2_fallback, c2_h)
+
         # Clamp C2 to prevent extreme values from ill-conditioned lstsq.
         v_absmax = Vp_h.abs().max().item() * 2.0 + 1.0
         c2_h = c2_h.clamp(-v_absmax, v_absmax).to(dtype)  # (H, target_len, D)
@@ -180,6 +191,7 @@ def compact_kv(
 
         if compute_beta and layer_beta is not None:
             # (target_len, H) for consistency with C1/C2 shape convention
+            layer_beta = torch.nan_to_num(layer_beta, nan=0.0)
             beta_list.append(layer_beta.permute(1, 0).to(torch.float32))
 
     return c1_list, c2_list, beta_list

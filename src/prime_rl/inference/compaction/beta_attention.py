@@ -197,7 +197,7 @@ class BetaState:
 
         # QK^T in native dtype (bf16 tensor cores), upcast for softmax
         scores = torch.einsum('bhgd,bhsd->bhgs', Q_grouped, K_t) * self.scale
-        scores = scores.float() + beta.unsqueeze(2)
+        scores = scores.float() + beta.clamp(-30.0, 30.0).unsqueeze(2)
 
         # Mask invalid positions
         scores = scores.masked_fill(~self.valid_mask, float('-inf'))
@@ -271,10 +271,11 @@ class _BetaAttentionWrapper:
 
     @property
     def forward_includes_kv_cache_update(self):
-        return self.original_impl.forward_includes_kv_cache_update
+        return getattr(self.original_impl, 'forward_includes_kv_cache_update', True)
 
     def do_kv_cache_update(self, *args, **kwargs):
-        return self.original_impl.do_kv_cache_update(*args, **kwargs)
+        if hasattr(self.original_impl, 'do_kv_cache_update'):
+            return self.original_impl.do_kv_cache_update(*args, **kwargs)
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, **kwargs):
@@ -283,25 +284,24 @@ class _BetaAttentionWrapper:
                 layer, query, key, value, kv_cache, attn_metadata,
                 output=output, **kwargs)
 
-        # Beta-active path: write K,V to paged cache + contiguous buffer,
-        # then compute SDPA+beta
+        # Beta-active path:
+        # 1. Run original forward to keep paged KV cache in sync
+        #    (FlashAttentionImpl.forward handles both cache update + attention)
+        self.original_impl.forward(
+            layer, query, key, value, kv_cache, attn_metadata,
+            output=output, **kwargs)
 
-        # 1. Write K,V to paged cache (keeps it consistent for compaction reads)
-        if self.original_impl.forward_includes_kv_cache_update:
-            self.original_impl.do_kv_cache_update(
-                layer, key, value, kv_cache, attn_metadata.slot_mapping)
-
-        # 2. Write K,V to contiguous buffer (vectorized, graph-safe)
+        # 2. Update contiguous buffer for beta attention
         B = self.beta_state.B
         positions = self.beta_state.seq_lens - 1
         k_reshaped = key[:B].view(B, self.beta_state.num_kv_heads, self.beta_state.head_size)
         v_reshaped = value[:B].view(B, self.beta_state.num_kv_heads, self.beta_state.head_size)
         self.beta_state.append_token_kv_batch(self.layer_idx, positions, k_reshaped, v_reshaped)
 
-        # 3. Compute attention with beta
+        # 3. Override with beta-corrected attention
         result = self.beta_state.compute_attention(self.layer_idx, query[:B])
 
         if output is not None:
-            output[:B] = result.to(output.dtype)
+            output[:B] = result.to(output.dtype).view_as(output[:B])
             return output
-        return result.to(query.dtype)
+        return result.to(query.dtype).view_as(query[:B])
