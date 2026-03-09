@@ -89,6 +89,8 @@ def interleave_rollout(
             len(tokens["prompt_ids"]) + len(tokens["completion_ids"]),
         )
 
+        segment_boundaries = step.get("extras", {}).get("segment_boundaries")
+
         return TrainingSample(
             prompt_ids=list(tokens["prompt_ids"]),
             prompt_mask=[bool(i) for i in tokens["prompt_mask"]],
@@ -99,6 +101,7 @@ def interleave_rollout(
             teacher_logprobs=None,
             advantage=None,
             routed_experts=routed_experts,
+            segment_boundaries=segment_boundaries,
         )
 
     def extend_sample(sample: TrainingSample, step: vf.TrajectoryStep, prefix_len: int) -> None:

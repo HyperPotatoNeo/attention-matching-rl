@@ -302,10 +302,9 @@ def custom_build_app(args: Namespace, supported_tasks: tuple):
     app = _original_build_app(args, supported_tasks)
     app.include_router(router)
 
-    if getattr(args, "enable_compaction", False):
-        from prime_rl.inference.compaction.routes import router as compaction_router
+    from prime_rl.inference.compaction.routes import router as compaction_router
 
-        app.include_router(compaction_router)
+    app.include_router(compaction_router)
 
     return app
 

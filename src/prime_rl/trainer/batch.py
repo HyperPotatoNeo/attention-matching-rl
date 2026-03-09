@@ -63,6 +63,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         teacher_logprobs=teacher_logprobs,
         temperatures=temperatures,
         routed_experts=routed_experts,
+        segment_boundaries=training_example.segment_boundaries,
         # Multimodal fields (Qwen3-VL) - passed through without modification
         pixel_values=training_example.pixel_values,
         pixel_values_shape=training_example.pixel_values_shape,
@@ -73,6 +74,11 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
 def _is_multimodal_sample(sample: MicroBatch) -> bool:
     """Check if a sample contains multimodal data (images)."""
     return sample.pixel_values is not None
+
+
+def _is_compaction_sample(sample: MicroBatch) -> bool:
+    """Check if a sample has compaction segment boundaries (cannot be packed)."""
+    return sample.segment_boundaries is not None
 
 
 def packed_samples_into_micro_bs(
@@ -100,10 +106,17 @@ def packed_samples_into_micro_bs(
             micro_batches.append(sample)
             continue
 
+        # Compaction samples cannot be packed (segmented forward requires single sample)
+        if _is_compaction_sample(sample):
+            sample.lora_num_tokens = [0] * num_loras
+            sample.lora_num_tokens[idx] = len(sample.input_ids)
+            micro_batches.append(sample)
+            continue
+
         # Try to find a bin that can fit this sequence (only pack text-only samples)
         for bin_content in micro_batches:
-            # Don't pack into multimodal micro batches
-            if _is_multimodal_sample(bin_content):
+            # Don't pack into multimodal or compaction micro batches
+            if _is_multimodal_sample(bin_content) or _is_compaction_sample(bin_content):
                 continue
             # Check if sequence fits in this bin
             if len(bin_content.input_ids) + len(sample.input_ids) <= max_seq_len:

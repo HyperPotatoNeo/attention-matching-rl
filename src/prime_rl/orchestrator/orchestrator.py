@@ -606,6 +606,25 @@ async def orchestrate(config: OrchestratorConfig):
         await val_task
         val_outputs = val_task.result()
 
+        # Extract compaction info from rollouts
+        def _get_num_compactions(rollout):
+            for step in rollout["trajectory"]:
+                sb = step.get("extras", {}).get("segment_boundaries")
+                if sb is not None:
+                    return len(sb) - 1
+            return 0
+
+        def _get_total_generated_tokens(rollout):
+            """Total tokens across all segments (full trajectory length)."""
+            for step in rollout["trajectory"]:
+                sb = step.get("extras", {}).get("segment_boundaries")
+                if sb is not None:
+                    return sb[-1]
+            tokens = step.get("tokens")
+            if tokens is not None:
+                return len(tokens.get("completion_ids", []))
+            return 0
+
         # Gather metrics in dataframes
         results_df = pd.DataFrame(
             {
@@ -621,6 +640,8 @@ async def orchestrate(config: OrchestratorConfig):
                 "num_turns": [len(rollout["trajectory"]) for rollout in train_rollouts],
                 "generation_ms": [rollout["timing"]["generation_ms"] for rollout in train_rollouts],
                 "scoring_ms": [rollout["timing"]["scoring_ms"] for rollout in train_rollouts],
+                "num_compactions": [_get_num_compactions(rollout) for rollout in train_rollouts],
+                "total_generated_tokens": [_get_total_generated_tokens(rollout) for rollout in train_rollouts],
             }
         )
 
@@ -714,6 +735,15 @@ async def orchestrate(config: OrchestratorConfig):
                 .apply(lambda e: e.get("error") if isinstance(e, dict) else e)
                 .value_counts(normalize=True)
                 .items()
+            },
+            # Compaction metrics
+            "compaction/avg_num_compactions": results_df.num_compactions.mean(),
+            "compaction/total_generated_tokens": results_df.total_generated_tokens.mean(),
+            **{
+                f"compaction/accuracy_{k}_compactions": (
+                    group.reward.mean() if len(group) > 0 else 0.0
+                )
+                for k, group in results_df.groupby("num_compactions")
             },
             # Env metrics
             **{f"metrics/{metric}": metrics_df[metric].mean() for metric in metrics_df.columns},

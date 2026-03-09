@@ -31,6 +31,9 @@ class TensorMicroBatch(TypedDict):
     # MoE router replay
     routed_experts: Int[Tensor, "batch seq layers topk"] | None
 
+    # Compaction training: cumulative completion token counts at end of each segment
+    segment_boundaries: list[int] | None
+
     # Multimodal fields (Qwen3-VL)
     # pixel_values: flattened image patches [num_patches, patch_dim] where patch_dim=1176 for Qwen3-VL
     pixel_values: Float[Tensor, "num_patches patch_dim"] | None
@@ -106,6 +109,7 @@ class FakeDataLoader:
             "loss_mask": loss_mask.unsqueeze(0),
             "lora_num_tokens": lora_num_tokens,
             "routed_experts": None,
+            "segment_boundaries": None,
             "pixel_values": None,
             "image_grid_thw": None,
         }
@@ -131,6 +135,7 @@ class FakeDataLoader:
             "loss_mask": torch.ones(self.seq_len, dtype=torch.bool).unsqueeze(0),
             "lora_num_tokens": lora_num_tokens,
             "routed_experts": None,
+            "segment_boundaries": None,
             "pixel_values": None,
             "image_grid_thw": None,
         }
@@ -207,4 +212,5 @@ class DataLoader:
             )  # [1, seq_len, layers, topk]
             if micro_batch.routed_experts is not None
             else None,
+            segment_boundaries=micro_batch.segment_boundaries,
         )

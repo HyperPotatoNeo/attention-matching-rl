@@ -23,6 +23,10 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
 
     routed_experts: list[list[list[int]]] | None = None  # [seq_len, layers, topk]
 
+    # Compaction training: cumulative completion token counts at end of each segment
+    # e.g. [2048, 4096, 6144] means segment 0 had 2048 tokens, segment 1 had 2048 more, etc.
+    segment_boundaries: list[int] | None = None
+
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A batch of training examples with metadata for transport."""
@@ -45,6 +49,9 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     teacher_logprobs: list[float] | None = None
     lora_num_tokens: list[int] | None = None
     routed_experts: list[list[list[int]]] | None = None
+
+    # Compaction training: cumulative completion token counts at end of each segment
+    segment_boundaries: list[int] | None = None
 
     # Multimodal fields (Qwen3-VL) — pixel_values stored as raw float32 bytes for efficient serialization
     pixel_values: bytes | None = None

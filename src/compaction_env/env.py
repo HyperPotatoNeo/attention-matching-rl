@@ -12,11 +12,16 @@ import time
 
 import httpx
 import verifiers as vf
-from openai import AsyncOpenAI
-from openai.types.chat import ChatCompletion, ChatCompletionMessage
-from openai.types.chat.chat_completion import Choice
-from openai.types.completion_usage import CompletionUsage
-from verifiers.types import Messages, ModelResponse, SamplingArgs, State
+from verifiers.types import (
+    Messages,
+    Response,
+    ResponseMessage,
+    ResponseTokens,
+    SamplingArgs,
+    State,
+    Tool,
+    Usage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,14 +33,23 @@ class CompactionEnv(vf.SingleTurnEnv):
         self,
         inner_env: vf.Environment,
         max_seq_len: int = 2048,
+        max_tokens_per_segment: int | None = None,
         compact_target_ratio: float = 0.3,
+        compact_window: int | None = None,
         n_compacts: int = 2,
+        max_kv_len: int | None = None,
+        max_total_tokens: int | None = None,
         **kwargs,
     ):
         self.inner_env = inner_env
         self.compact_max_seq_len = max_seq_len
+        self.compact_max_tokens_per_segment = max_tokens_per_segment
         self.compact_target_ratio = compact_target_ratio
+        self.compact_window = compact_window
         self.n_compacts = n_compacts
+        self.compact_max_kv_len = max_kv_len
+        self.compact_max_total_tokens = max_total_tokens
+        self._last_segment_boundaries: list[int] | None = None
 
         super().__init__(
             dataset=inner_env.dataset,
@@ -49,53 +63,71 @@ class CompactionEnv(vf.SingleTurnEnv):
     async def get_model_response(
         self,
         state: State,
-        prompt: Messages,
-        client: AsyncOpenAI | None = None,
+        prompt: Messages | str,
+        client: vf.Client | None = None,
         model: str | None = None,
+        tool_defs: list[Tool] | None = None,
         sampling_args: SamplingArgs | None = None,
-        **kwargs,
-    ) -> ModelResponse:
-        """Call /compact_generate and return a ChatCompletion with token data.
-
-        The verifiers framework's parse_response_tokens() extracts:
-        - response.prompt_token_ids  (set via setattr)
-        - response.choices[0].token_ids  (set via setattr)
-        - response.choices[0].logprobs.content  (standard OpenAI field)
-        """
-        client = client or state["client"]
+    ) -> Response:
+        """Call /compact_generate and return a verifiers Response with token data."""
+        client = client if client is not None else state["client"]
         model = model or state["model"]
         sampling_args = sampling_args or state.get("sampling_args") or {}
 
-        # Tokenize prompt via vLLM's /tokenize endpoint (supports chat messages)
-        tokenize_resp = await client.post(
-            "/tokenize",
-            body={
-                "model": model,
-                "messages": prompt,
-                "add_generation_prompt": True,
-            },
-            cast_to=object,
-        )
-        prompt_ids = tokenize_resp["tokens"]
-
-        temperature = sampling_args.get("temperature", 0.7)
-        top_p = sampling_args.get("top_p", 0.95)
-
-        # Call the compaction endpoint (not under /v1/)
-        base_url = str(client.base_url).rstrip("/")
+        # Get the base URL from the underlying OpenAI client
+        oai_client = client.client
+        base_url = str(oai_client.base_url).rstrip("/")
         server_url = base_url.rsplit("/v1", 1)[0] if "/v1" in base_url else base_url
 
-        async with httpx.AsyncClient(timeout=600.0) as http_client:
+        # Tokenize prompt via vLLM's /tokenize endpoint
+        async with httpx.AsyncClient(timeout=7200.0) as http_client:
+            # Convert messages to dicts for JSON serialization
+            prompt_dicts = []
+            if isinstance(prompt, str):
+                prompt_dicts = [{"role": "user", "content": prompt}]
+            else:
+                for msg in prompt:
+                    if hasattr(msg, "model_dump"):
+                        prompt_dicts.append(msg.model_dump())
+                    elif isinstance(msg, dict):
+                        prompt_dicts.append(msg)
+                    else:
+                        prompt_dicts.append({"role": getattr(msg, "role", "user"), "content": str(getattr(msg, "content", ""))})
+
+            tokenize_resp = await http_client.post(
+                f"{server_url}/tokenize",
+                json={
+                    "model": model,
+                    "messages": prompt_dicts,
+                    "add_generation_prompt": True,
+                },
+            )
+            tokenize_resp.raise_for_status()
+            prompt_ids = tokenize_resp.json()["tokens"]
+
+            temperature = sampling_args.get("temperature", 0.7)
+            top_p = sampling_args.get("top_p", 0.95)
+
+            request_body = {
+                "prompt_ids": prompt_ids,
+                "max_seq_len": self.compact_max_seq_len,
+                "compact_target_ratio": self.compact_target_ratio,
+                "n_compacts": self.n_compacts,
+                "temperature": temperature,
+                "top_p": top_p,
+            }
+            if self.compact_max_tokens_per_segment is not None:
+                request_body["max_tokens_per_segment"] = self.compact_max_tokens_per_segment
+            if self.compact_window is not None:
+                request_body["compact_window"] = self.compact_window
+            if self.compact_max_kv_len is not None:
+                request_body["max_kv_len"] = self.compact_max_kv_len
+            if self.compact_max_total_tokens is not None:
+                request_body["max_total_tokens"] = self.compact_max_total_tokens
+
             resp = await http_client.post(
                 f"{server_url}/compact_generate",
-                json={
-                    "prompt_ids": prompt_ids,
-                    "max_seq_len": self.compact_max_seq_len,
-                    "compact_target_ratio": self.compact_target_ratio,
-                    "n_compacts": self.n_compacts,
-                    "temperature": temperature,
-                    "top_p": top_p,
-                },
+                json=request_body,
             )
             resp.raise_for_status()
             result = resp.json()
@@ -104,50 +136,58 @@ class CompactionEnv(vf.SingleTurnEnv):
         all_logprobs = result["all_logprobs"]
         final_text = result["final_text"]
 
-        # Build logprobs in OpenAI format for parse_response_tokens
-        from openai.types.chat.chat_completion import ChoiceLogprobs
-        logprobs_content = [
-            {"token": "", "logprob": lp, "bytes": None, "top_logprobs": []}
-            for lp in all_logprobs
-        ]
+        diagnostics = result.get("diagnostics", {})
+        self._last_segment_boundaries = diagnostics.get("segment_boundaries")
 
-        completion = ChatCompletion(
+        tokens = ResponseTokens(
+            prompt_ids=prompt_ids,
+            prompt_mask=[0] * len(prompt_ids),
+            completion_ids=all_token_ids,
+            completion_mask=[1] * len(all_token_ids),
+            completion_logprobs=all_logprobs,
+            routed_experts=None,
+        )
+
+        return Response(
             id=f"compact-{int(time.time())}",
-            model=model,
-            object="chat.completion",
             created=int(time.time()),
-            choices=[
-                Choice(
-                    index=0,
-                    message=ChatCompletionMessage(
-                        role="assistant",
-                        content=final_text,
-                    ),
-                    finish_reason="stop",
-                    logprobs=ChoiceLogprobs(content=None),
-                )
-            ],
-            usage=CompletionUsage(
+            model=model,
+            usage=Usage(
                 prompt_tokens=len(prompt_ids),
+                reasoning_tokens=0,
                 completion_tokens=len(all_token_ids),
                 total_tokens=len(prompt_ids) + len(all_token_ids),
             ),
+            message=ResponseMessage(
+                content=final_text,
+                finish_reason="stop",
+                is_truncated=False,
+                tokens=tokens,
+            ),
         )
 
-        # Monkey-patch the attributes that parse_response_tokens reads via getattr
-        completion.prompt_token_ids = prompt_ids
-        completion.choices[0].token_ids = all_token_ids
-        # Set logprobs as dict (parse_response_tokens handles both obj and dict)
-        completion.choices[0].logprobs = {"content": logprobs_content}
-
-        return completion
+    async def add_model_response(
+        self,
+        state: State,
+        prompt_messages: Messages,
+        response: Response,
+    ):
+        await super().add_model_response(state, prompt_messages, response)
+        if self._last_segment_boundaries is not None:
+            last_step = state["trajectory"][-1]
+            last_step["extras"]["segment_boundaries"] = self._last_segment_boundaries
+            self._last_segment_boundaries = None
 
 
 def load_environment(
     gym: str = "countdown",
     max_seq_len: int = 2048,
+    max_tokens_per_segment: int | None = None,
     compact_target_ratio: float = 0.3,
+    compact_window: int | None = None,
     n_compacts: int = 2,
+    max_kv_len: int | None = None,
+    max_total_tokens: int | None = None,
     **inner_env_kwargs,
 ) -> CompactionEnv:
     """Load a CompactionEnv wrapping the specified gym environment.
@@ -158,6 +198,10 @@ def load_environment(
     return CompactionEnv(
         inner_env=inner_env,
         max_seq_len=max_seq_len,
+        max_tokens_per_segment=max_tokens_per_segment,
         compact_target_ratio=compact_target_ratio,
+        compact_window=compact_window,
         n_compacts=n_compacts,
+        max_kv_len=max_kv_len,
+        max_total_tokens=max_total_tokens,
     )

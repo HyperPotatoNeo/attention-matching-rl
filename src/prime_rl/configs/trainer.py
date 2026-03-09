@@ -664,6 +664,16 @@ class TrainerConfig(BaseConfig):
         ),
     ] = False
 
+    # Compaction training parameters (used when segment_boundaries present in data)
+    compact_target_ratio: Annotated[
+        float,
+        Field(description="Fraction of prefix keys to keep during compaction replay."),
+    ] = 0.25
+    compact_window: Annotated[
+        int | None,
+        Field(description="Only compress first N assistant tokens per compaction event. None = all."),
+    ] = None
+
     memory_profiler_path: Annotated[Path | None, Field(description="Path to write memory profile to.")] = None
 
     bench: Annotated[

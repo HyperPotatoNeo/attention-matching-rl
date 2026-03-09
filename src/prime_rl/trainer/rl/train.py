@@ -38,6 +38,7 @@ from prime_rl.trainer.model import (
     is_tt_moe_model,
     get_load_balance_stats,
 )
+from prime_rl.trainer.rl.compaction import segmented_forward
 from prime_rl.trainer.parallel_dims import get_parallel_dims
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.utils import (
@@ -370,25 +371,69 @@ def train(config: TrainerConfig):
             if cp_enabled:
                 temperatures = shard_for_cp(temperatures, cp_rank=cp_rank, cp_world_size=cp_size)
 
+            # Check for compaction segment boundaries
+            seg_boundaries = micro_batch.get("segment_boundaries")
+
+            # Sync segment count across FSDP ranks: segmented_forward calls
+            # model.forward() once per segment, triggering FSDP all-gather each time.
+            # Different samples have different segment counts, so ranks must pad
+            # with dummy forward passes to avoid NCCL deadlock.
+            n_forwards = len(seg_boundaries) if seg_boundaries is not None else 1
+            max_forwards_t = torch.tensor([n_forwards], device="cuda", dtype=torch.int32)
+            dist.all_reduce(max_forwards_t, op=dist.ReduceOp.MAX)
+            max_forwards = max_forwards_t.item()
+
             # Forward pass with per-token temperatures
             with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
-                out = forward(
-                    model,
-                    input_ids,
-                    forward_position_ids,
-                    labels=labels,
-                    temperature=temperatures,
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
-                    routed_experts=routed_experts,
-                )
+                if seg_boundaries is not None:
+                    # Segmented forward with compaction replay
+                    prompt_len = input_ids.shape[1] - seg_boundaries[-1]
+                    out = segmented_forward(
+                        model,
+                        input_ids,
+                        forward_position_ids,
+                        segment_boundaries=seg_boundaries,
+                        prompt_len=prompt_len,
+                        compact_target_ratio=getattr(config, "compact_target_ratio", 0.25),
+                        compact_window=getattr(config, "compact_window", None),
+                        temperature=temperatures,
+                        max_forward_passes=max_forwards,
+                    )
+                else:
+                    out = forward(
+                        model,
+                        input_ids,
+                        forward_position_ids,
+                        labels=labels,
+                        temperature=temperatures,
+                        pixel_values=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                        routed_experts=routed_experts,
+                    )
+                    # Pad with dummy forward passes if other ranks need more
+                    if max_forwards > 1:
+                        dummy_sum = torch.tensor(0.0, device=input_ids.device)
+                        for _ in range(max_forwards - 1):
+                            d_out = model(
+                                input_ids=input_ids[:, :1],
+                                position_ids=forward_position_ids[:, :1],
+                            )
+                            d_logits = d_out["logits"] if isinstance(d_out, dict) else d_out.logits
+                            if isinstance(d_logits, dict):
+                                d_logits = d_logits["logits"]
+                            dummy_sum = dummy_sum + d_logits.float().mean()
+                        out["logits"] = out["logits"] + (dummy_sum * 0).to(out["logits"].dtype)
 
             if out.get("logprobs") is None:
-                # VanillaOutputLinear was used - need to compute logprobs externally with per-token temps
+                # VanillaOutputLinear was used or segmented forward - compute logprobs from logits
                 assert out.get("logits") is not None, "Logits must be provided to compute logprobs"
                 logits = out["logits"]
-                # Per-token temperature scaling: temperatures is [batch, seq], logits is [batch, seq, vocab]
-                scaled_logits = logits / temperatures.unsqueeze(-1)
+                if seg_boundaries is not None:
+                    # Segmented forward already applied temperature
+                    scaled_logits = logits
+                else:
+                    # Per-token temperature scaling: temperatures is [batch, seq], logits is [batch, seq, vocab]
+                    scaled_logits = logits / temperatures.unsqueeze(-1)
                 out["logprobs"] = selective_log_softmax(scaled_logits, labels)
                 out["entropy"] = compute_entropy(scaled_logits)
             # else: FusedOutputLinear was used - logprobs already computed with per-token temperatures

@@ -1,0 +1,58 @@
+max_steps = 5
+seq_len = 4096
+output_dir = "outputs/compaction-fullft-test"
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[wandb]
+project = "compaction-rl"
+name = "compaction-fullft-test-5steps"
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 3
+
+[trainer]
+compact_target_ratio = 0.25
+compact_window = 1024
+
+[trainer.model]
+impl = "auto"
+optim_cpu_offload = true
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.0
+betas1 = 0.9
+betas2 = 0.9
+
+[trainer.loss]
+type = "default"
+
+[orchestrator]
+batch_size = 16
+rollouts_per_example = 4
+
+[orchestrator.sampling]
+max_tokens = 2048
+
+[[orchestrator.env]]
+id = "compaction_env"
+name = "compaction-rg-mix"
+args = { gym = "rg_mix_env", max_seq_len = 2048, compact_target_ratio = 0.25, compact_window = 1024, n_compacts = 3, dataset_path = "/pscratch/sd/s/siddart2/datasets/rg_mix_7500", num_train_examples = 7500, num_eval_examples = 100 }
+
+[inference]
+gpu_memory_utilization = 0.85
+
+[inference.model]
+enforce_eager = true
+
+[inference.parallel]
+tp = 1
+
+[inference.vllm_extra]
+enable_compaction = true

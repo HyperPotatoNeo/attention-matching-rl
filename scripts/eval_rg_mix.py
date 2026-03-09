@@ -115,7 +115,7 @@ def run_compaction_one(problem, port, tokenizer, args):
 
     t0 = time.time()
     client = httpx.Client(base_url=f"http://localhost:{port}", timeout=600.0)
-    resp = client.post("/compact_generate", json={
+    body = {
         "prompt_ids": prompt_ids,
         "max_seq_len": len(prompt_ids) + max_seg * (n_comp + 1),
         "max_tokens_per_segment": max_seg,
@@ -124,7 +124,12 @@ def run_compaction_one(problem, port, tokenizer, args):
         "compact_window": args.compact_window,
         "temperature": 0.6,
         "top_p": 0.95,
-    })
+    }
+    if args.max_kv_len is not None:
+        body["max_kv_len"] = args.max_kv_len
+    if args.max_total_tokens is not None:
+        body["max_total_tokens"] = args.max_total_tokens
+    resp = client.post("/compact_generate", json=body)
     elapsed = time.time() - t0
     resp.raise_for_status()
     data = resp.json()
@@ -137,6 +142,53 @@ def run_compaction_one(problem, port, tokenizer, args):
         "mean_logprob": data["diagnostics"].get("mean_logprob", 0),
         "logprobs": data["all_logprobs"],
     }
+
+
+def run_compaction_batch(problems, port, tokenizer, args):
+    """Send a batch of problems to one server via /compact_generate_batch."""
+    prompt_ids_list = []
+    for prob in problems:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prob["question"]},
+        ]
+        result = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=True,
+        )
+        ids = list(result["input_ids"]) if hasattr(result, "keys") else list(result)
+        prompt_ids_list.append(ids)
+
+    t0 = time.time()
+    client = httpx.Client(base_url=f"http://localhost:{port}", timeout=1200.0)
+    body = {
+        "prompt_ids_list": prompt_ids_list,
+        "max_tokens_per_segment": args.max_tokens_per_segment,
+        "n_compacts": args.n_compacts,
+        "compact_target_ratio": args.compact_ratio,
+        "compact_window": args.compact_window,
+        "temperature": 0.6,
+        "top_p": 0.95,
+    }
+    if args.max_kv_len is not None:
+        body["max_kv_len"] = args.max_kv_len
+    if args.max_total_tokens is not None:
+        body["max_total_tokens"] = args.max_total_tokens
+    resp = client.post("/compact_generate_batch", json=body)
+    elapsed = time.time() - t0
+    resp.raise_for_status()
+    data = resp.json()
+
+    results = []
+    for r in data["results"]:
+        results.append({
+            "text": r["final_text"],
+            "tokens": len(r["all_token_ids"]),
+            "time": elapsed / len(problems),
+            "diagnostics": r.get("diagnostics", {}),
+            "mean_logprob": r["diagnostics"].get("mean_logprob", 0),
+            "logprobs": r["all_logprobs"],
+        })
+    return results
 
 
 def run_baseline_one(problem, port, model_name, args):
@@ -183,8 +235,14 @@ def main():
     parser.add_argument("--compact-ratio", type=float, default=0.3)
     parser.add_argument("--compact-window", type=int, default=None,
                         help="Only compact the first N assistant tokens (None=all)")
+    parser.add_argument("--max-kv-len", type=int, default=None,
+                        help="KV budget mode: compact when KV reaches this length")
+    parser.add_argument("--max-total-tokens", type=int, default=None,
+                        help="KV budget mode: stop after this many total completion tokens")
     parser.add_argument("--ports", default="8000,8001,8002,8003",
                         help="Comma-separated ports for DP (compaction mode)")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Requests per server (>1 uses batch endpoint)")
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
@@ -202,12 +260,20 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    max_total_tokens = args.max_tokens_per_segment * (args.n_compacts + 1)
+    if args.max_total_tokens is not None:
+        max_total_tokens = args.max_total_tokens
+    else:
+        max_total_tokens = args.max_tokens_per_segment * (args.n_compacts + 1)
     print(f"\nMode: {args.mode}")
     print(f"Max response tokens: {max_total_tokens}")
     if args.mode == "compaction":
-        print(f"  segments of {args.max_tokens_per_segment} tokens, "
-              f"{args.n_compacts} compactions, ratio={args.compact_ratio}")
+        if args.max_kv_len is not None:
+            print(f"  KV budget mode: max_kv_len={args.max_kv_len}, "
+                  f"max_total_tokens={args.max_total_tokens}")
+        else:
+            print(f"  segments of {args.max_tokens_per_segment} tokens, "
+                  f"{args.n_compacts} compactions")
+        print(f"  ratio={args.compact_ratio}, window={args.compact_window}")
         print(f"  DP={len(ports)} (ports: {ports})")
     print()
 
@@ -224,8 +290,81 @@ def main():
     total_tokens = 0
     t_total = time.time()
 
-    if args.mode == "compaction":
-        # DP=4: distribute problems across ports in batches
+    if args.mode == "compaction" and args.batch_size > 1:
+        # Batched mode: send batch_size problems per server per round
+        per_server_bs = args.batch_size
+        total_bs = per_server_bs * len(ports)
+        print(f"  Batch mode: {per_server_bs} per server, {total_bs} per round\n")
+
+        for round_start in range(0, len(problems), total_bs):
+            round_probs = problems[round_start:round_start + total_bs]
+            # Split across servers
+            per_server = [[] for _ in ports]
+            per_server_idx = [[] for _ in ports]
+            for j, prob in enumerate(round_probs):
+                s = j % len(ports)
+                per_server[s].append(prob)
+                per_server_idx[s].append(round_start + j)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(ports)) as ex:
+                futures = {}
+                for s, port in enumerate(ports):
+                    if not per_server[s]:
+                        continue
+                    f = ex.submit(run_compaction_batch, per_server[s], port, tokenizer, args)
+                    futures[f] = (s, per_server[s], per_server_idx[s])
+
+                for f in concurrent.futures.as_completed(futures):
+                    s, probs_batch, idx_batch = futures[f]
+                    try:
+                        gen_batch = f.result()
+                    except Exception as e:
+                        print(f"  BATCH ERROR on port {ports[s]}: {e}")
+                        for j, prob in enumerate(probs_batch):
+                            results.append({
+                                "idx": idx_batch[j], "task": prob["task"],
+                                "correct": False, "score": 0.0, "tokens": 0,
+                                "time": 0.0, "n_compactions": -1,
+                                "mean_logprob": 0, "diagnostics": {},
+                            })
+                        continue
+
+                    for j, gen in enumerate(gen_batch):
+                        prob = probs_batch[j]
+                        idx = idx_batch[j]
+                        score = score_problem(prob, gen["text"])
+                        correct = score >= 0.5
+                        n_actual_compacts = len(
+                            gen["diagnostics"].get("compaction_events", [])
+                        )
+                        total_correct += int(correct)
+                        total_tokens += gen["tokens"]
+
+                        results.append({
+                            "idx": idx,
+                            "task": prob["task"],
+                            "correct": correct,
+                            "score": score,
+                            "tokens": gen["tokens"],
+                            "time": round(gen["time"], 2),
+                            "n_compactions": n_actual_compacts,
+                            "mean_logprob": gen["mean_logprob"],
+                            "diagnostics": gen["diagnostics"],
+                        })
+
+                        status = "OK" if correct else "FAIL"
+                        print(
+                            f"[{len(results):3d}/{args.n}] {status} "
+                            f"task={prob['task']:20s} "
+                            f"tokens={gen['tokens']:5d} "
+                            f"compacts={n_actual_compacts} "
+                            f"time={gen['time']:.1f}s "
+                            f"acc={total_correct}/{len(results)} "
+                            f"({total_correct/len(results):.1%})"
+                        )
+
+    elif args.mode == "compaction":
+        # Single-request mode (batch_size=1): one request per server
         batch_size = len(ports)
         for batch_start in range(0, len(problems), batch_size):
             batch = problems[batch_start:batch_start + batch_size]
@@ -238,7 +377,16 @@ def main():
 
                 for f in concurrent.futures.as_completed(futures):
                     idx, prob = futures[f]
-                    gen = f.result()
+                    try:
+                        gen = f.result()
+                    except Exception as e:
+                        print(f"[{len(results)+1:3d}/{args.n}] ERROR task={prob['task']:20s} {e}")
+                        results.append({
+                            "idx": idx, "task": prob["task"], "correct": False,
+                            "score": 0.0, "tokens": 0, "time": 0.0,
+                            "n_compactions": -1, "mean_logprob": 0, "diagnostics": {},
+                        })
+                        continue
                     score = score_problem(prob, gen["text"])
                     correct = score >= 0.5
 
@@ -343,7 +491,8 @@ def main():
             by_compacts[nc]["tokens"].append(r["tokens"])
             by_compacts[nc]["times"].append(r["time"])
             for evt in r["diagnostics"].get("compaction_events", []):
-                by_compacts[nc]["ratios"].append(evt["ratio"])
+                if "ratio" in evt:
+                    by_compacts[nc]["ratios"].append(evt["ratio"])
 
         print(f"\n{'Compactions':<12} {'Accuracy':>10} {'Correct':>8} {'Total':>6} "
               f"{'AvgTok':>8} {'AvgRatio':>10} {'AvgTime':>8}")

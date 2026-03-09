@@ -1,3 +1,6 @@
+[server]
+host = "0.0.0.0"
+
 [model]
 name = "Qwen/Qwen3-4B"
 enforce_eager = true
