@@ -49,7 +49,7 @@ def bench_algo(num_kv_heads=8, head_size=128, num_layers=36,
     for trial in range(n_trials):
         torch.cuda.synchronize()
         t0 = time.time()
-        c1, c2 = compact_kv(keys, values, prompt_len, target_ratio,
+        c1, c2, _ = compact_kv(keys, values, prompt_len, target_ratio,
                              num_kv_heads, head_size, device,
                              num_queries=num_queries, compact_window=window)
         torch.cuda.synchronize()

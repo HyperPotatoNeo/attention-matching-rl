@@ -53,7 +53,7 @@ class TestCompactKV:
         target_ratio = 0.25
         target_len = max(1, int(asst_len * target_ratio))
 
-        c1_list, c2_list = compact_kv(
+        c1_list, c2_list, _ = compact_kv(
             keys, values, prompt_len, target_ratio,
             num_kv_heads, head_size, device,
         )
@@ -74,7 +74,7 @@ class TestCompactKV:
         keys, values, prompt_len, num_kv_heads, head_size, device, asst_len = kv_inputs
         target_ratio = 0.25
 
-        c1_list, _ = compact_kv(
+        c1_list, _, _ = compact_kv(
             keys, values, prompt_len, target_ratio,
             num_kv_heads, head_size, device,
         )
@@ -99,7 +99,7 @@ class TestCompactKV:
         target_ratio = 0.25
         target_len = max(1, int(compact_window * target_ratio))
 
-        c1_list, c2_list = compact_kv(
+        c1_list, c2_list, _ = compact_kv(
             keys, values, prompt_len, target_ratio,
             num_kv_heads, head_size, device,
             compact_window=compact_window,
@@ -115,7 +115,7 @@ class TestCompactKV:
 
         keys, values, prompt_len, num_kv_heads, head_size, device, _ = kv_inputs
 
-        c1_list, c2_list = compact_kv(
+        c1_list, c2_list, _ = compact_kv(
             keys, values, prompt_len, 0.25,
             num_kv_heads, head_size, device,
         )
@@ -282,7 +282,7 @@ class TestKVReconstruction:
         values = [torch.randn(seq_len, num_kv_heads, head_size, device=device, dtype=torch.bfloat16)
                   for _ in range(num_layers)]
 
-        c1_list, c2_list = compact_kv(
+        c1_list, c2_list, _ = compact_kv(
             keys, values, prompt_len, target_ratio,
             num_kv_heads, head_size, device,
             compact_window=compact_window,

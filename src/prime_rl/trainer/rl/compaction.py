@@ -198,7 +198,7 @@ def segmented_forward(
             asst_len = kv_seq_len - prompt_len
             window = min(compact_window or asst_len, asst_len)
 
-            c1_list, c2_list = compact_kv(
+            c1_list, c2_list, _ = compact_kv(
                 keys, values, prompt_len, compact_target_ratio,
                 num_kv_heads, head_size, device,
                 compact_window=window,

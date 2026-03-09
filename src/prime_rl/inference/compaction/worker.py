@@ -300,7 +300,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             window = min(compact_window or asst_len, asst_len)
             suffix_len = asst_len - window
 
-            c1_list, c2_list = compact_kv(
+            c1_list, c2_list, _ = compact_kv(
                 keys, values, prompt_len, compact_target_ratio,
                 num_kv_heads, head_size, device,
                 compact_window=window,
@@ -486,8 +486,12 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         )
 
         # --- CUDA graph capture (TP=1 only) ---
-        # Disabled for batch mode pending investigation of graph+compaction interaction
-        use_cuda_graph = False
+        # All batch tensors have fixed shapes (B,) with in-place value updates.
+        # FA uses seqused_k (from seq_lens tensor) for variable-length sequences.
+        # Compaction modifies KV data between replays — graph reads updated values.
+        # Inactive sequences (post-EOS) keep decoding with fixed inputs; results ignored.
+        use_cuda_graph = (self.model_runner.vllm_config.parallel_config
+                          .tensor_parallel_size == 1)
         decode_graph = None
         logits_buf = None
 
@@ -631,7 +635,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     asst_len = kv_len - prompt_lens[i]
                     window = min(compact_window or asst_len, asst_len)
 
-                    c1_list, c2_list = compact_kv(
+                    c1_list, c2_list, _ = compact_kv(
                         keys, values, prompt_lens[i], compact_target_ratio,
                         num_kv_heads, head_size, device,
                         compact_window=window,
