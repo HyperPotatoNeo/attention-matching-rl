@@ -22,6 +22,9 @@ from vllm.forward_context import set_forward_context
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 
 from prime_rl.inference.compaction.algorithm import compact_kv
+from prime_rl.inference.compaction.beta_attention import (
+    BetaState, patch_attention_layers, unpatch_attention_layers,
+)
 from prime_rl.inference.vllm.worker.filesystem import FileSystemWeightUpdateWorker
 
 logger = logging.getLogger(__name__)
@@ -46,6 +49,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         eos_token_id: int,
         max_kv_len: int | None = None,
         max_total_tokens: int | None = None,
+        compute_beta: bool = False,
     ) -> dict:
         """Generate text with KV cache compaction between segments.
 
@@ -304,6 +308,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 keys, values, prompt_len, compact_target_ratio,
                 num_kv_heads, head_size, device,
                 compact_window=window,
+                compute_beta=compute_beta,
             )
             algo_time = time.time() - t_algo
 
@@ -387,6 +392,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         eos_token_id: int,
         max_kv_len: int | None = None,
         max_total_tokens: int | None = None,
+        compute_beta: bool = False,
     ) -> list[dict]:
         """Generate B sequences simultaneously with KV compaction.
 
@@ -474,6 +480,22 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
 
         logger.info("Prefilled %d prompts in %.3fs", B, time.time() - t_prefill)
 
+        # --- Beta state setup (contiguous KV + beta buffers) ---
+        beta_state = None
+        beta_originals = None
+        if compute_beta:
+            num_heads = vllm_config.model_config.get_num_attention_heads(
+                vllm_config.parallel_config)
+            beta_state = BetaState(
+                B=B, max_seq_len=max_possible_len, num_layers=num_layers,
+                num_kv_heads=num_kv_heads, num_heads=num_heads,
+                head_size=head_size, device=device, dtype=kv_caches[0].dtype,
+            )
+            beta_state.init_from_prefill(kv_caches, per_seq_blocks, prompt_lens, block_size)
+            beta_state.seq_lens[:] = current_seq_lens
+            beta_state.update_valid_mask()
+            beta_originals = patch_attention_layers(model, beta_state)
+
         # --- Build batch decode context ---
         batch_ctx = _BatchDecodeContext.create(
             B=B,
@@ -496,33 +518,12 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         logits_buf = None
 
         if use_cuda_graph:
-            t_graph = time.time()
-            batch_ctx.metadata.max_seq_len = max_possible_len
-
             batch_ctx.input_ids[:] = last_tokens
             batch_ctx.positions[:] = current_seq_lens - 1
             batch_ctx.seq_lens[:] = current_seq_lens.int()
             _update_batch_slots(batch_ctx, current_seq_lens)
-
-            with set_forward_context(
-                batch_ctx.attn_metadata_dict, batch_ctx.vllm_config,
-                virtual_engine=0, num_tokens=B,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                slot_mapping=batch_ctx.slot_mapping_ctx,
-            ):
-                for _ in range(3):
-                    hidden = model(input_ids=batch_ctx.input_ids,
-                                   positions=batch_ctx.positions)
-                    logits_buf = model.compute_logits(hidden)
-
-                torch.cuda.synchronize()
-                decode_graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(decode_graph):
-                    hidden = model(input_ids=batch_ctx.input_ids,
-                                   positions=batch_ctx.positions)
-                    logits_buf = model.compute_logits(hidden)
-
-            logger.info("CUDA graph captured for B=%d in %.3fs", B, time.time() - t_graph)
+            decode_graph, logits_buf = _capture_decode_graph(
+                model, batch_ctx, B, max_possible_len)
 
         # --- Per-sequence tracking ---
         active = [True] * B
@@ -552,6 +553,11 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 batch_ctx.positions[:] = current_seq_lens - 1 + position_offsets
                 batch_ctx.seq_lens[:] = current_seq_lens.int()
                 _update_batch_slots(batch_ctx, current_seq_lens)
+
+                # Update beta state validity mask before model forward
+                if beta_state is not None:
+                    beta_state.seq_lens[:] = current_seq_lens
+                    beta_state.update_valid_mask()
 
                 # Forward pass
                 if decode_graph is not None:
@@ -635,10 +641,11 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     asst_len = kv_len - prompt_lens[i]
                     window = min(compact_window or asst_len, asst_len)
 
-                    c1_list, c2_list, _ = compact_kv(
+                    c1_list, c2_list, beta_list = compact_kv(
                         keys, values, prompt_lens[i], compact_target_ratio,
                         num_kv_heads, head_size, device,
                         compact_window=window,
+                        compute_beta=compute_beta,
                     )
 
                     compacted_prefix_len = c1_list[0].shape[0]
@@ -650,6 +657,24 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                         per_seq_blocks[i], block_size, prompt_lens[i], num_layers,
                         old_seq_len=kv_len, compact_window=window,
                     )
+
+                    # Update beta state contiguous buffers
+                    if beta_state is not None and beta_list is not None:
+                        for l in range(num_layers):
+                            suffix_K = keys[l][prompt_lens[i] + window:]
+                            suffix_V = values[l][prompt_lens[i] + window:]
+                            beta_state.set_compacted(
+                                l, i, prompt_lens[i],
+                                c1_list[l], c2_list[l], beta_list[l],
+                                suffix_K, suffix_V,
+                            )
+
+                        # Activate beta on first compaction, recapture CUDA graph
+                        if not beta_state.active:
+                            beta_state.active = True
+                            if use_cuda_graph:
+                                decode_graph, logits_buf = _capture_decode_graph(
+                                    model, batch_ctx, B, max_possible_len)
 
                     position_offsets[i] += kv_len - new_seq_len
                     current_seq_lens[i] = new_seq_len + 1
@@ -686,9 +711,13 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             B, total_tokens, total_time, total_tokens / max(total_time, 1e-6),
         )
 
+        # Cleanup beta state
+        if beta_state is not None and beta_originals is not None:
+            unpatch_attention_layers(model, beta_originals)
+
         # Free temporary GPU memory to prevent crashes on repeated batch calls
         torch.cuda.synchronize()
-        del batch_ctx, seg_tokens, seg_lps
+        del batch_ctx, seg_tokens, seg_lps, beta_state
         import gc
         gc.collect()
         torch.cuda.empty_cache()
@@ -993,6 +1022,41 @@ def _update_batch_slots(ctx: _BatchDecodeContext, current_seq_lens: torch.Tensor
     arange = torch.arange(ctx.B, device=pos_in_cache.device)
     block_ids = ctx.block_table_i64[arange, block_indices]
     ctx.slot_mapping[:] = block_ids * ctx.block_size + offsets
+
+
+def _capture_decode_graph(
+    model: Module,
+    batch_ctx: _BatchDecodeContext,
+    B: int,
+    max_seq_len: int,
+) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
+    """Capture (or recapture) a CUDA graph for batched decode.
+
+    Returns (graph, logits_buffer).
+    """
+    t = time.time()
+    batch_ctx.metadata.max_seq_len = max_seq_len
+
+    with set_forward_context(
+        batch_ctx.attn_metadata_dict, batch_ctx.vllm_config,
+        virtual_engine=0, num_tokens=B,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        slot_mapping=batch_ctx.slot_mapping_ctx,
+    ):
+        for _ in range(3):
+            hidden = model(input_ids=batch_ctx.input_ids,
+                           positions=batch_ctx.positions)
+            logits_buf = model.compute_logits(hidden)
+
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            hidden = model(input_ids=batch_ctx.input_ids,
+                           positions=batch_ctx.positions)
+            logits_buf = model.compute_logits(hidden)
+
+    logger.info("CUDA graph captured for B=%d in %.3fs", B, time.time() - t)
+    return graph, logits_buf
 
 
 def _sample_batch(

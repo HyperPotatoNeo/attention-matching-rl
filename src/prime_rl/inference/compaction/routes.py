@@ -32,6 +32,7 @@ class CompactGenerateRequest(BaseModel):
     top_p: float = 0.95
     max_kv_len: int | None = None
     max_total_tokens: int | None = None
+    compute_beta: bool = False
 
 
 class CompactGenerateBatchRequest(BaseModel):
@@ -45,6 +46,7 @@ class CompactGenerateBatchRequest(BaseModel):
     top_p: float = 0.95
     max_kv_len: int | None = None
     max_total_tokens: int | None = None
+    compute_beta: bool = False
 
 
 class _RequestBatcher:
@@ -134,6 +136,7 @@ class _RequestBatcher:
             kwargs={
                 "max_kv_len": first_body.max_kv_len,
                 "max_total_tokens": first_body.max_total_tokens,
+                "compute_beta": first_body.compute_beta,
             },
         )
 

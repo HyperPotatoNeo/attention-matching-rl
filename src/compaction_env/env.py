@@ -39,6 +39,7 @@ class CompactionEnv(vf.SingleTurnEnv):
         n_compacts: int = 2,
         max_kv_len: int | None = None,
         max_total_tokens: int | None = None,
+        compute_beta: bool = False,
         **kwargs,
     ):
         self.inner_env = inner_env
@@ -49,6 +50,7 @@ class CompactionEnv(vf.SingleTurnEnv):
         self.n_compacts = n_compacts
         self.compact_max_kv_len = max_kv_len
         self.compact_max_total_tokens = max_total_tokens
+        self.compute_beta = compute_beta
         self._last_segment_boundaries: list[int] | None = None
 
         super().__init__(
@@ -124,6 +126,8 @@ class CompactionEnv(vf.SingleTurnEnv):
                 request_body["max_kv_len"] = self.compact_max_kv_len
             if self.compact_max_total_tokens is not None:
                 request_body["max_total_tokens"] = self.compact_max_total_tokens
+            if self.compute_beta:
+                request_body["compute_beta"] = True
 
             resp = await http_client.post(
                 f"{server_url}/compact_generate",
