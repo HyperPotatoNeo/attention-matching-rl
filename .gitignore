@@ -207,3 +207,4 @@ results_*.json
 server_gpu*.log
 server.log
 *.output
+skills/multinode/
