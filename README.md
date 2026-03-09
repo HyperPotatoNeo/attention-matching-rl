@@ -1,244 +1,132 @@
-<p align="center">
-</p>
+# KV Cache Compaction RL
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/40c36e38-c5bd-4c5a-9cb3-f7b902cd155d#gh-light-mode-only" alt="Prime Intellect" width="312">
-  <img src="https://github.com/user-attachments/assets/6414bc9b-126b-41ca-9307-9e982430cde8#gh-dark-mode-only"  alt="Prime Intellect" width="312">
-</p>
+RL training with mid-generation KV cache compaction using [Attention Matching](https://arxiv.org/abs/2602.16284). This enables learning over long effective contexts (8K+ tokens) within fixed KV memory budgets (2K), by compressing the cache between generation segments.
 
----
+Built on [PRIME-RL](https://github.com/PrimeIntellect-ai/prime-rl) for async RL and [vLLM](https://github.com/vllm-project/vllm) for inference.
 
-<h3 align="center">
-PRIME-RL: Async RL Training at Scale
-</h3>
+## How It Works
 
----
+The `CompactionWorker` drives model forward passes inside vLLM's `collective_rpc`, bypassing the scheduler for full control over the KV cache. Generation proceeds until the KV cache fills a budget (`max_kv_len`), then:
 
-</br>
-<p align="center">
-  <a href="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/style.yaml">
-    <img src="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/style.yaml/badge.svg" alt="Style" />
-  </a>
-  <a href="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/cpu_tests.yaml">
-    <img src="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/cpu_tests.yaml/badge.svg" alt="Test" />
-  </a>
-  <a href="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/gpu_tests.yaml">
-    <img src="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/gpu_tests.yaml/badge.svg" alt="Test" />
-  </a>
-</p>
+1. **Select** top-k keys by attention importance (C1)
+2. **Solve** least-squares for replacement values (C2)
+3. **Optionally compute** NNLS beta bias for partition function correction
+4. **Inject** `[prompt | C1/C2 | suffix]` back into paged blocks
+5. **Continue** generating until `max_total_tokens` or EOS
 
-## Overview
-
-PRIME-RL is a framework for large-scale asynchronous reinforcement learning. It is designed to be easy-to-use and hackable, yet capable of scaling to 1000+ GPUs. Beyond that, here is why we think you might like it:
-
-1. Integrates natively with [`verifiers`](https://github.com/PrimeIntellect-ai/verifiers) environments via the [Environments Hub](https://app.primeintellect.ai/dashboard/environments?ex_sort=most_stars)
-2. Supports end-to-end post-training, including SFT and RL training and evals
-3. Multi-node deployment with [FSDP2](https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html) training and [vLLM](https://github.com/vllm-project/vllm) inference backend
-4. Designed for asynchronous agentic RL training at scale
-5. Hackable, modular and extensible by nature
+With `compute_beta=true`, an additive per-key bias corrects the softmax partition function mismatch after compaction. This uses contiguous KV mirrors (BetaState) alongside vLLM's paged cache, with SDPA decode replacing FlashAttention for the bias-corrected path.
 
 ## Setup
 
-> *We develop and test on NVIDIA RTX 3090/4090/5090, A100, H100, H200, and B200. If your setup fails, please create an [issue](https://github.com/PrimeIntellect-ai/prime-rl/issues).*
-
-### Prerequisites
-
-Currently, you **need at least one NVIDIA GPU to use PRIME-RL**. If you don't already have access to one, we recommend our [compute platform](https://app.primeintellect.ai) for everything from renting on-demand single GPUs for developing, debugging and small ablations, to [reserving 1000+ GPU clusters](https://app.primeintellect.ai/dashboard/quotes) for production-scale training.
-
-### Quick Setup
-
-Set up PRIME-RL in a single command.
-
 ```bash
-curl -sSL https://raw.githubusercontent.com/PrimeIntellect-ai/prime-rl/main/scripts/install.sh | bash
-```
-
-<details>
-<summary>
-Manual Setup
-</summary>
-<br>
-
-1. Clone the repository
-
-```bash
-git clone https://github.com/PrimeIntellect-ai/prime-rl.git
-cd prime-rl
-```
-
-2. Install [uv](https://docs.astral.sh/uv/)
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source $HOME/.local/bin/env
-```
-
-3. Install dependencies from the lock file
-
-```bash
+git clone https://github.com/HyperPotatoNeo/attention-matching-rl.git
+cd attention-matching-rl
 uv sync --all-extras
 ```
 
-3.1. Optional: Install Flash Attention 3 (on Hopper GPUs only, for flash_attention_3 attention backend)
+## Inference
 
-> *NOTE*: This step will take a while, as it builds the Flash Attention 3 extension from source, as it has no wheels prebuilt.
-> *NOTE*: After this step, you can't run `uv sync --all-extras` or `uv run` as it will uninstall the package, you can avoid it by running `uv sync --inexact` or `uv run --no-sync`
-
-```bash
-uv pip install "flash-attn-3 @ git+https://github.com/Dao-AILab/flash-attention.git@main#subdirectory=hopper" --no-build-isolation
-```
-
-</details>
-
-<details>
-<summary>
-Validate your environment setup
-</summary>
-<br>
-
-1. Check that the environment uses Python 3.12
+### Single-GPU server
 
 ```bash
-uv run python -V
+uv run inference @ configs/compaction/qwen3_4b_serve_tp1.toml --server.port 8000
 ```
 
-2. Check that `flash-attn` is installed
+### Test compaction generation
+
+```python
+import requests
+
+resp = requests.post("http://localhost:8000/compact_generate", json={
+    "prompt_ids": tokenizer.encode("Solve this problem..."),
+    "max_kv_len": 2048,
+    "max_total_tokens": 8192,
+    "compact_target_ratio": 0.25,
+    "compact_window": 1024,
+    "n_compacts": 99,
+    "compute_beta": True,
+    "temperature": 0.6,
+})
+result = resp.json()
+print(result["final_text"])
+print(f"Tokens: {result['diagnostics']['total_tokens']}, "
+      f"Compactions: {len(result['diagnostics']['compaction_events'])}")
+```
+
+### Evaluate on rg-mix-env
 
 ```bash
-uv run python -c "import flash_attn"
+# Start 4 TP=1 servers
+bash scripts/start_4servers.sh
+
+# Run compaction eval
+python scripts/eval_rg_mix.py --mode compaction --n 100 \
+    --max-kv-len 2048 --max-total-tokens 8192 \
+    --n-compacts 99 --compact-ratio 0.25 --compact-window 1024
+
+# Run baseline eval (no compaction)
+python scripts/eval_rg_mix.py --mode baseline --n 100
 ```
 
-3. Check that you can run SFT trainer  (*this requires 1 GPU*)
+## Training
 
-```bash
-uv run sft @ configs/debug/sft/train.toml
-```
+Training uses 2 nodes in mixed mode: 5 inference GPUs + 3 trainer GPUs.
 
-4. Check that you can run the RL trainer (*this requires 1 GPU*)
+**Architecture:**
+- **Node 1** (4 GPUs): 4 independent TP=1 compaction servers (ports 8000-8003)
+- **Node 2** (4 GPUs): 1 inference server on GPU 0 (port 8004) + FSDP2 trainer on GPUs 1-3
 
-```bash
-uv run trainer @ configs/debug/rl/train.toml
-```
+### Config
 
-5. Check that you can run the inference server (*this requires 1 GPU*)
+The training config at `configs/compaction/qwen3_4b_beta_test.toml` uses:
+- `compute_beta = true` for partition function correction
+- `max_kv_len = 2048`, `compact_window = 1024`, `ratio = 0.25`
+- `max_total_tokens = 8192` effective context per rollout
+- `batch_size = 256`, `rollouts_per_example = 8`
+- Full fine-tune, lr=1e-6, AdamW with CPU offload
 
-```bash
-uv run inference @ configs/debug/infer.toml
-```
+### Launch
 
-*Keep the inference server running in the background for the next steps.*
+1. **Create resolved config** — replace `__INFERENCE_NODE__` and `__TRAINER_NODE__` placeholders with actual hostnames
+2. **Node 1**: Run `scripts/start_4servers.sh` (or `multinode/compaction/node1_inference.sh`)
+3. **Node 2**: Run `multinode/compaction/node2_mixed.sh <resolved_config.toml>`
 
-5.1. Check that you can run the orchestrator against the inference server
+The trainer on node 2 waits for the inference server on GPU 0 to become ready, then starts the RL loop. Weight updates are broadcast via the filesystem.
 
-```bash
-uv run orchestrator @ configs/debug/orch.toml
-```
+## Key Files
 
-5.2. Check that you can run evals against the inference server
+| File | Purpose |
+|------|---------|
+| `src/prime_rl/inference/compaction/worker.py` | Generation + compaction (single & batch) |
+| `src/prime_rl/inference/compaction/algorithm.py` | Attention Matching + NNLS beta solver |
+| `src/prime_rl/inference/compaction/beta_attention.py` | BetaState mirrors + SDPA decode with bias |
+| `src/prime_rl/inference/compaction/routes.py` | `/compact_generate` endpoint + auto-batching |
+| `src/compaction_env/env.py` | CompactionEnv (verifiers wrapper) |
+| `scripts/eval_rg_mix.py` | Evaluation script |
 
-```bash
-uv run eval @ configs/debug/eval.toml
-```
+## Configs
 
-</details>
-
-### Additional Setup
-
-1. If you want to log your runs to [W&B](https://wandb.ai), log in
-
-```bash
-uv run wandb login
-# Or set `export WANDB_API_KEY=...`
-```
-
-2. If you require gated/ private models or datasets from [HuggingFace](https://huggingface.co), log in
-
-```bash
-uv run hf auth login
-# Or set `export HF_TOKEN=...`
-```
-
-## Training Examples
-We provide end-to-end training examples in the [`examples`](examples) directory to highlight features of the framework and guide you through the process of training your own models.
-1. [**Reverse Text**](examples/reverse_text/README.md): Train `Qwen3-0.6B` to reverse a small chunk of text. Demonstrates tiny-scale single-turn SFT and RL training. Can be trained on a single consumer GPU in a few minutes, and is ideal for getting started.
-2. [**Wordle**](examples/wordle/README.md): Train `Qwen3-1.7B` to play Wordle. A fun example of multi-turn SFT and RL training. Can be trained on a 2-4 H100 GPUs in a few hours. Ideal for exploring the multi-turn training capabilities of the framework.
-3. [**Alphabet Sort**](examples/alphabet_sort/README.md): Train `Qwen3-4B-Instruct-2507` to sort names alphabetically. Demonstrates multi-turn RL training via LoRA without SFT warmup. Can be trained on a single H100 GPU in just over an hour. Ideal for exploring LoRA-based training.
-4. [**Wiki Search**](examples/wiki_search/README.md): Train `Qwen3-4B-Instruct-2507` to answer trivia questions by searching through a Wikipedia. Demonstrates multi-turn with web search tool use.
-5. [**Hendrycks Sanity**](examples/hendrycks_sanity/README.md): Run a sanity check experiment on `DeepSeek-R1-Distill-Qwen-1.5B` using a filtered subset of MATH where the model already partially solves 20-80% of problems. Useful for algorithm ablations.
-
-*More to come...*
+| Config | Purpose |
+|--------|---------|
+| `qwen3_4b_beta_test.toml` | Beta attention training (5 steps, for testing) |
+| `qwen3_4b_fullft_train.toml` | Full fine-tune training (production) |
+| `qwen3_4b_serve_tp1.toml` | TP=1 compaction server |
+| `qwen3_4b_baseline.toml` | TP=4 baseline (no compaction) |
 
 ## Docs
 
-Check out the [docs](docs) directory for in-depth guides on how to use PRIME-RL.
-
-- [**Entrypoints**](docs/entrypoints.md) - Overview of the main components (orchestrator, trainer, inference) and how to run SFT, RL, and evals
-- [**Configs**](docs/configs.md) - Configuration system using TOML files, CLI arguments, and environment variables
-- [**Environments**](docs/environments.md) - Installing and using verifiers environments from the Environments Hub
-- [**Async Training**](docs/async.md) - Understanding asynchronous off-policy training and step semantics
-- [**Logging**](docs/logging.md) - Logging with loguru, torchrun, and Weights & Biases
-- [**Checkpointing**](docs/checkpointing.md) - Saving and resuming training from checkpoints
-- [**Benchmarking**](docs/benchmarking.md) - Performance benchmarking and throughput measurement
-- [**Deployment**](docs/deployment.md) - Training deployment on single-GPU, multi-GPU, and multi-node clusters
-- [**Troubleshooting**](docs/troubleshooting.md) - Common issues and their solutions
-
-## Contributing
-
-We warmly welcome community contributions! We use [issues](https://github.com/PrimeIntellect-ai/prime-rl/issues) to track bugs, feature requests, and share our internal roadmap. If you encounter bugs, have pain points during development, or have ideas for new features, please open an issue.
-
-Contributions are welcome via PR. Please follow these guidelines:
-1. Install the [pre-commit hooks](#pre-commit-hooks) to ensure your code is formatted correctly.
-2. Please keep your PR in "Draft" until it is ready for review.
-3. If your PR resolves an issue, please link the issue in the PR description
-4. If you can, try running the [test suite](#tests) locally to ensure your changes are working as expected.
-
-### Pre-Commit Hooks
-
-Please install the [pre-commit](https://pre-commit.com) hooks to ensure your code is formatted correctly.
-
-```bash
-uv run pre-commit install
-```
-
-### Tests
-
-Run the full test suite 
-
-```bash
-uv run pytest -v
-```
-
-To run unit tests, run
-
-```bash
-uv run pytest tests/unit -v
-```
-
-To run integration tests, run
-
-```bash
-uv run pytest tests/integration -v
-```
-
-To run CPU-only tests, use the inverse of the `gpu` marker:
-
-```bash
-uv run pytest -v -m "not gpu"
-```
-
-## License
-
-This project is licensed under the Apache 2.0 license, as found in the [License](LICENSE) file.
+- [Implementation details](docs/compaction/IMPLEMENTATION.md) — algorithm, beta correction, CUDA graphs
+- [Speed optimizations](docs/compaction/SPEED_OPTIMIZATION.md) — batching, graph capture, profiling
 
 ## Citation
 
-If you find our work useful, feel free to cite it using
+Based on [Attention Matching](https://arxiv.org/abs/2602.16284):
 
-```tex
-@misc{primeintellect2025prime-rl,
-  author = {Prime Intellect},
-  title = {PRIME-RL},
-  url = {https://github.com/PrimeIntellect-ai/prime-rl},
-  year = {2025}
+```bibtex
+@article{zweiger2025attention,
+  title={Attention Matching: an Attention Decomposition Framework for Efficient KV Cache Compression},
+  author={Zweiger, Adam},
+  journal={arXiv preprint arXiv:2602.16284},
+  year={2025}
 }
 ```
