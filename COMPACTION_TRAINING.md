@@ -68,7 +68,11 @@ correct logprobs for post-compaction tokens.
 
 ## Status
 
-- [ ] Phase 1: Data pipeline
-- [ ] Phase 2: Shared algorithm
-- [ ] Phase 3: Segmented forward
-- [ ] Phase 4: Config & test
+- [x] Phase 1: Data pipeline
+- [x] Phase 2: Shared algorithm
+- [x] Phase 3: Segmented forward
+- [x] Phase 4: Config & test
+
+All phases complete. Deterministic compaction is now default (seeded random queries).
+Beta training hooks implemented in `trainer/rl/compaction.py`. Production runs use
+4+4 layout (4 inference + 4 trainer GPUs).

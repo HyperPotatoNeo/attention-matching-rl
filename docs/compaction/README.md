@@ -125,16 +125,16 @@ Generate text with mid-sequence KV cache compaction. Requests are transparently 
 
 ## Training
 
-Default: 2-node mixed mode (5 inference GPUs + 3 trainer GPUs). See the `multinode` skill
-in `skills/multinode/` for step-by-step launch instructions.
+Default: 2-node, 4+4 layout (4 inference + 4 trainer GPUs). Compaction is deterministic
+by default (seeded random queries ensure identical compaction between inference and training).
 
 ```bash
-sbatch -A m5017 -C "gpu&hbm80g" --qos=premium --time 24:00:00 --gpus-per-node 4 --nodes=2 ~/compaction_multinode.sh
+sbatch -A m5017 -C "gpu&hbm80g" --qos=premium --time 48:00:00 --gpus-per-node 4 --nodes=2 ~/compaction_determ_nobeta.sh
 ```
 
 Architecture:
 - **Node 1** (4 GPUs): 4 TP=1 compaction inference servers (ports 8000-8003)
-- **Node 2** (4 GPUs): 1 inference server (GPU 0, port 8004) + FSDP2 trainer (GPUs 1-3)
+- **Node 2** (4 GPUs): FSDP2 trainer (4 GPUs) + orchestrator (CPU)
 - Weight broadcast via Lustre filesystem
 - Containers use `--net=host` for cross-node communication
 
@@ -142,22 +142,23 @@ Training parameters:
 - Full fine-tune (no LoRA), lr=1e-6, AdamW with CPU offload
 - KV budget: max_kv_len=2048, compact_window=1024, ratio=0.25, max_total_tokens=8192
 - batch_size=256, rollouts_per_example=8, seq_len=9216
+- Checkpoints every 50 steps, auto-resume with `resume_step = -1`
 
 ## Configs
 
 | Config | Purpose |
 |--------|---------|
-| `qwen3_4b_fullft_train.toml` | **Default** -- 2-node Full FT, KV budget mode |
+| `qwen3_4b_fullft_determ_nobeta.toml` | **Default** — 4+4 layout, deterministic, no beta |
+| `qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic) |
 | `qwen3_4b_beta_test.toml` | Beta attention test (compute_beta=true) |
+| `qwen3_4b_fullft_baseline.toml` | Baseline training (no compaction) |
 | `qwen3_4b_serve_tp1.toml` | TP=1 compaction server |
-| `qwen3_4b_baseline.toml` | TP=4 baseline server (no compaction) |
-| `qwen3_4b_countdown_train.toml` | LoRA RL training (countdown, validation) |
 
 ## Scripts
 
 | Script | Purpose |
 |--------|---------|
-| `~/compaction_multinode.sh` | **Default launch** -- 2-node sbatch |
+| `~/compaction_determ_nobeta.sh` | **Default launch** — 2-node sbatch |
 | `scripts/start_4servers.sh` | 4 TP=1 servers on ports 8000-8003 |
 | `scripts/eval_rg_mix.py` | Evaluate on rg-mix-env |
 

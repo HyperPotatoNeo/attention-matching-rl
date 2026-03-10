@@ -14,6 +14,8 @@ The `CompactionWorker` drives model forward passes inside vLLM's `collective_rpc
 4. **Inject** `[prompt | C1/C2 | suffix]` back into paged blocks
 5. **Continue** generating until `max_total_tokens` or EOS
 
+Compaction uses deterministic seeded random queries (`seed + layer_idx`) to ensure identical results between inference and training replay, reducing Mismatch KL by ~6x.
+
 With `compute_beta=true`, an additive per-key bias corrects the softmax partition function mismatch after compaction. This uses contiguous KV mirrors (BetaState) alongside vLLM's paged cache, with SDPA decode replacing FlashAttention for the bias-corrected path.
 
 ## Setup
@@ -70,28 +72,28 @@ python scripts/eval_rg_mix.py --mode baseline --n 100
 
 ## Training
 
-Training uses 2 nodes in mixed mode: 5 inference GPUs + 3 trainer GPUs.
+Training uses 2 nodes with a 4+4 layout:
 
-**Architecture:**
 - **Node 1** (4 GPUs): 4 independent TP=1 compaction servers (ports 8000-8003)
-- **Node 2** (4 GPUs): 1 inference server on GPU 0 (port 8004) + FSDP2 trainer on GPUs 1-3
+- **Node 2** (4 GPUs): FSDP2 trainer (4 GPUs) + orchestrator (CPU)
 
-### Config
-
-The training config at `configs/compaction/qwen3_4b_beta_test.toml` uses:
-- `compute_beta = true` for partition function correction
-- `max_kv_len = 2048`, `compact_window = 1024`, `ratio = 0.25`
-- `max_total_tokens = 8192` effective context per rollout
-- `batch_size = 256`, `rollouts_per_example = 8`
-- Full fine-tune, lr=1e-6, AdamW with CPU offload
+Weight broadcast via Lustre filesystem. Containers use `--net=host` for cross-node communication.
 
 ### Launch
 
-1. **Create resolved config** — replace `__INFERENCE_NODE__` and `__TRAINER_NODE__` placeholders with actual hostnames
-2. **Node 1**: Run `scripts/start_4servers.sh` (or `multinode/compaction/node1_inference.sh`)
-3. **Node 2**: Run `multinode/compaction/node2_mixed.sh <resolved_config.toml>`
+```bash
+sbatch -A m5017 -C "gpu&hbm80g" --qos=premium --time 48:00:00 \
+    --gpus-per-node 4 --nodes=2 ~/compaction_determ_nobeta.sh
+```
 
-The trainer on node 2 waits for the inference server on GPU 0 to become ready, then starts the RL loop. Weight updates are broadcast via the filesystem.
+The launch script handles container setup, config resolution (replacing `__INFERENCE_NODE__` placeholder), inference server health checks, and trainer startup.
+
+### Training parameters
+
+- Full fine-tune (no LoRA), lr=1e-6, AdamW with CPU offload
+- KV budget: max_kv_len=2048, compact_window=1024, ratio=0.25, max_total_tokens=8192
+- batch_size=256, rollouts_per_example=8, seq_len=9216
+- Checkpoints every 50 steps, auto-resume with `resume_step = -1`
 
 ## Key Files
 
@@ -101,6 +103,7 @@ The trainer on node 2 waits for the inference server on GPU 0 to become ready, t
 | `src/prime_rl/inference/compaction/algorithm.py` | Attention Matching + NNLS beta solver |
 | `src/prime_rl/inference/compaction/beta_attention.py` | BetaState mirrors + SDPA decode with bias |
 | `src/prime_rl/inference/compaction/routes.py` | `/compact_generate` endpoint + auto-batching |
+| `src/prime_rl/trainer/rl/compaction.py` | Beta training hooks + deterministic compaction replay |
 | `src/compaction_env/env.py` | CompactionEnv (verifiers wrapper) |
 | `scripts/eval_rg_mix.py` | Evaluation script |
 
@@ -108,10 +111,12 @@ The trainer on node 2 waits for the inference server on GPU 0 to become ready, t
 
 | Config | Purpose |
 |--------|---------|
-| `qwen3_4b_beta_test.toml` | Beta attention training (5 steps, for testing) |
-| `qwen3_4b_fullft_train.toml` | Full fine-tune training (production) |
+| `qwen3_4b_fullft_determ_nobeta.toml` | **Default** — 4+4 layout, deterministic compaction, no beta |
+| `qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic) |
+| `qwen3_4b_fullft_train.toml` | 5+3 layout (legacy mixed-mode) |
+| `qwen3_4b_beta_test.toml` | Beta attention test (compute_beta=true) |
+| `qwen3_4b_fullft_baseline.toml` | Baseline training (no compaction) |
 | `qwen3_4b_serve_tp1.toml` | TP=1 compaction server |
-| `qwen3_4b_baseline.toml` | TP=4 baseline (no compaction) |
 
 ## Docs
 

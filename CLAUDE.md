@@ -12,14 +12,22 @@ the full technical walkthrough.
 |------|---------|
 | `src/prime_rl/inference/compaction/worker.py` | Generation + compaction logic (single & batch) |
 | `src/prime_rl/inference/compaction/routes.py` | `/compact_generate` endpoint + auto-batching |
-| `src/prime_rl/inference/compaction/algorithm.py` | Attention Matching + NNLS beta solver |
+| `src/prime_rl/inference/compaction/algorithm.py` | Attention Matching + NNLS beta solver (deterministic by default) |
 | `src/prime_rl/inference/compaction/beta_attention.py` | BetaState mirrors + SDPA decode with per-token bias |
+| `src/prime_rl/trainer/rl/compaction.py` | Beta training hooks + deterministic compaction replay |
 | `src/compaction_env/env.py` | CompactionEnv (verifiers SingleTurnEnv wrapper) |
 | `scripts/eval_rg_mix.py` | rg-mix-env evaluation (compaction and baseline modes) |
-| `scripts/start_4servers.sh` | Launch 4 TP=1 servers for DP=4 |
-| `configs/compaction/qwen3_4b_fullft_train.toml` | **Default training config** — 2-node, mixed-mode |
+
+### Configs
+
+| Config | Purpose |
+|--------|---------|
+| `configs/compaction/qwen3_4b_fullft_determ_nobeta.toml` | **Default** — 4+4 layout, deterministic compaction, no beta |
+| `configs/compaction/qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic) |
+| `configs/compaction/qwen3_4b_fullft_train.toml` | 5+3 layout (legacy mixed-mode) |
 | `configs/compaction/qwen3_4b_beta_test.toml` | Beta attention test config |
-| `configs/compaction/qwen3_4b_serve_tp1.toml` | TP=1 server config (compaction) |
+| `configs/compaction/qwen3_4b_fullft_baseline.toml` | Baseline (no compaction) |
+| `configs/compaction/qwen3_4b_serve_tp1.toml` | TP=1 inference server |
 
 ### How it works
 
@@ -29,11 +37,17 @@ is compacted using Attention Matching: select top-k keys by attention importance
 solve least-squares for replacement values (C2), optionally compute NNLS beta bias for
 partition function correction, then inject `[prompt | C1/C2 | suffix]` back into paged blocks.
 
+**Deterministic compaction**: `compact_kv()` uses seeded random queries (`seed + layer_idx`)
+to ensure identical compaction between inference and training replay. The seed is derived from
+`prompt_len * 10000 + segment_idx`. This reduces Mismatch KL by ~6x (0.0077 → 0.0013).
+
 **Beta attention**: When `compute_beta=true`, the NNLS solver finds per-key additive biases
 that correct the partition function mismatch between full and compacted attention.
 `BetaState` maintains contiguous KV mirrors alongside paged cache. Decode switches from
 FlashAttention to SDPA+beta via monkey-patched attention layers. Two separate CUDA graph
 captures handle pre-compaction (FlashAttention) and post-compaction (SDPA+beta) phases.
+Beta training hooks (`compaction.py`) inject matching bias into attention_mask during FSDP2
+training for consistency.
 
 **Auto-batching**: Individual `/compact_generate` requests are transparently batched into
 `compact_generate_batch` calls (B=8) by `_RequestBatcher` in routes.py.
@@ -49,14 +63,16 @@ captures handle pre-compaction (FlashAttention) and post-compaction (SDPA+beta) 
 - CUDA graphs: only with TP=1; batch mode uses two-phase capture (pre/post compaction)
 - `empty_cache()` between compaction segments in trainer prevents CUDA fragmentation OOM
 - AC disable in segmented_forward is LoRA-only (Full FT keeps AC enabled)
+- **NNLS target must use K_h (all assistant keys)**, not Kp_h (window-only). Using window-only
+  produces beta that's too small, causing 2.4x lower reward.
 
-### Training
+### Training (default: 2-node, 4+4 layout)
 
-Default: 2-node mixed mode (5 inference + 3 trainer GPUs). See the `multinode` skill for
-launch instructions.
+Node 1: 4 inference servers (TP=1, ports 8000-8003)
+Node 2: 4 trainer GPUs (FSDP2) + orchestrator (CPU)
 
 ```bash
-sbatch -A m5017 -C "gpu&hbm80g" --qos=premium --time 24:00:00 --gpus-per-node 4 --nodes=2 ~/compaction_multinode.sh
+sbatch -A m5017 -C "gpu&hbm80g" --qos=premium --time 48:00:00 --gpus-per-node 4 --nodes=2 ~/compaction_determ_nobeta.sh
 ```
 
 ### Running evals
