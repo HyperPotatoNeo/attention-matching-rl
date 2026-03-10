@@ -673,6 +673,10 @@ class TrainerConfig(BaseConfig):
         int | None,
         Field(description="Only compress first N assistant tokens per compaction event. None = all."),
     ] = None
+    compute_beta: Annotated[
+        bool,
+        Field(description="Compute beta partition function correction during compaction replay, matching inference."),
+    ] = False
 
     memory_profiler_path: Annotated[Path | None, Field(description="Path to write memory profile to.")] = None
 

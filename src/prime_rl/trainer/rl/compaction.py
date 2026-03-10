@@ -11,6 +11,15 @@ boundary token (last of previous segment) with compacted context. The trainer
 must do the same — each segment after the first starts from the boundary token,
 and its first logit (predicting the first new token) replaces the stale
 pre-compaction logit from the previous segment.
+
+Beta correction: when compute_beta=True, the NNLS solver produces per-key
+additive biases that correct the partition function mismatch between full and
+compacted attention. In inference, BetaAttentionWrapper applies these via custom
+SDPA. In training, we achieve the same effect model-agnostically via
+forward_pre_hooks on attention layers that modify the attention_mask to include
+per-head beta at compacted positions. All HF attention implementations (eager,
+SDPA) broadcast attention_mask into attention logits, so a 4D mask with per-head
+beta at compacted positions achieves identical behavior.
 """
 
 import logging
@@ -25,6 +34,110 @@ from prime_rl.inference.compaction.algorithm import compact_kv
 from prime_rl.trainer.models.layers.lora import base as lora_base
 
 logger = logging.getLogger(__name__)
+
+
+# ── Beta attention hooks for training ──────────────────────────────────────
+
+
+class _BetaTrainingState:
+    """Per-layer beta bias for forward_pre_hooks during training.
+
+    After compaction, stores (1, num_heads, 1, kv_len) bias tensors per layer.
+    Hooks on attention modules add these to the attention_mask, matching the
+    inference BetaAttentionWrapper behavior.
+    """
+
+    def __init__(self, num_kv_heads: int, num_heads: int):
+        self.num_kv_heads = num_kv_heads
+        self.num_heads = num_heads
+        self.heads_per_group = num_heads // num_kv_heads
+        self.active = False
+        self.beta_per_layer: dict[int, Tensor] = {}
+
+    def set_beta(
+        self,
+        beta_list: list[Tensor],
+        prompt_len: int,
+        compacted_len: int,
+        total_kv_len: int,
+        device: torch.device,
+    ):
+        """Update beta from compact_kv output.
+
+        Args:
+            beta_list: Per-layer tensors of shape (target_len, num_kv_heads)
+            prompt_len: Number of prompt tokens
+            compacted_len: Number of compacted prefix tokens
+            total_kv_len: Total KV cache length after compaction
+        """
+        self.active = True
+        for layer_idx, beta in enumerate(beta_list):
+            # beta: (target_len, num_kv_heads)
+            bias = torch.zeros(1, self.num_heads, 1, total_kv_len,
+                               device=device, dtype=torch.float32)
+            # Expand from kv_heads to num_heads for GQA: each kv-head serves
+            # heads_per_group query heads (interleaved layout)
+            beta_clamped = beta.T.clamp(-30.0, 30.0)  # (num_kv_heads, target_len)
+            beta_expanded = beta_clamped.repeat_interleave(
+                self.heads_per_group, dim=0)  # (num_heads, target_len)
+            bias[0, :, 0, prompt_len:prompt_len + compacted_len] = beta_expanded
+            self.beta_per_layer[layer_idx] = bias
+
+    def clear(self):
+        self.active = False
+        self.beta_per_layer.clear()
+
+
+def _find_attention_modules(model: torch.nn.Module) -> list[torch.nn.Module]:
+    """Find attention modules by looking for q_proj/k_proj/v_proj.
+
+    Works for Llama, Qwen2, Qwen3, Mistral, Gemma, etc.
+    """
+    modules = []
+    for _name, module in model.named_modules():
+        if (hasattr(module, 'q_proj') and hasattr(module, 'k_proj')
+                and hasattr(module, 'v_proj')):
+            modules.append(module)
+    return modules
+
+
+def _make_beta_hook(layer_idx: int, beta_state: _BetaTrainingState):
+    """Create a forward_pre_hook that adds beta bias to attention_mask."""
+
+    def hook(module, args, kwargs):
+        if not beta_state.active or layer_idx not in beta_state.beta_per_layer:
+            return args, kwargs
+
+        attention_mask = kwargs.get('attention_mask')
+        if attention_mask is None:
+            return args, kwargs
+
+        beta_bias = beta_state.beta_per_layer[layer_idx]
+        KV = attention_mask.shape[-1]
+        bias_slice = beta_bias[:, :, :, :KV].to(attention_mask.dtype)
+
+        # (B, 1, Q, KV) + (1, H, 1, KV) broadcasts to (B, H, Q, KV)
+        kwargs = {**kwargs, 'attention_mask': attention_mask + bias_slice}
+        return args, kwargs
+
+    return hook
+
+
+def _register_beta_hooks(
+    model: torch.nn.Module,
+    beta_state: _BetaTrainingState,
+) -> list[torch.utils.hooks.RemovableHandle]:
+    """Register forward_pre_hooks on attention layers for beta bias injection."""
+    hooks = []
+    attn_modules = _find_attention_modules(model)
+    for layer_idx, module in enumerate(attn_modules):
+        handle = module.register_forward_pre_hook(
+            _make_beta_hook(layer_idx, beta_state),
+            with_kwargs=True,
+        )
+        hooks.append(handle)
+    logger.debug("Registered beta hooks on %d attention layers", len(hooks))
+    return hooks
 
 
 def _get_kv_from_cache(cache: DynamicCache) -> tuple[list[Tensor], list[Tensor], int, int]:
@@ -78,6 +191,7 @@ def segmented_forward(
     compact_window: int | None,
     temperature: Tensor,
     max_forward_passes: int | None = None,
+    compute_beta: bool = False,
 ) -> dict[str, Tensor]:
     """Run segmented forward passes with compaction replay between segments.
 
@@ -134,6 +248,10 @@ def segmented_forward(
     all_logits_pieces = []
     past_key_values = None
     position_offset = 0
+
+    # Beta training state (lazy-initialized on first compaction with beta)
+    beta_state: _BetaTrainingState | None = None
+    beta_hooks: list = []
 
     # Save reference to the LoRA num_tokens tensor and its original value.
     # MultiLoRALinear instances hold a direct reference to this tensor,
@@ -198,10 +316,13 @@ def segmented_forward(
             asst_len = kv_seq_len - prompt_len
             window = min(compact_window or asst_len, asst_len)
 
-            c1_list, c2_list, _ = compact_kv(
+            compact_seed = prompt_len * 10000 + seg_idx
+            c1_list, c2_list, beta_list = compact_kv(
                 keys, values, prompt_len, compact_target_ratio,
                 num_kv_heads, head_size, device,
                 compact_window=window,
+                compute_beta=compute_beta,
+                seed=compact_seed,
             )
 
             compacted_prefix_len = c1_list[0].shape[0]
@@ -222,9 +343,19 @@ def segmented_forward(
 
                 compacted_cache.update(new_K, new_V, l)
 
+            # Register beta hooks for the next segment's forward pass
+            if compute_beta and beta_list is not None:
+                new_kv_len = prompt_len + compacted_prefix_len + suffix_len
+                if beta_state is None:
+                    num_heads = model.config.num_attention_heads
+                    beta_state = _BetaTrainingState(num_kv_heads, num_heads)
+                    beta_hooks = _register_beta_hooks(model, beta_state)
+                beta_state.set_beta(
+                    beta_list, prompt_len, compacted_prefix_len, new_kv_len, device)
+
             tokens_removed = kv_seq_len - (prompt_len + compacted_prefix_len + suffix_len)
             position_offset += tokens_removed
-            del keys, values, c1_list, c2_list, kv_cache
+            del keys, values, c1_list, c2_list, beta_list, kv_cache
             past_key_values = compacted_cache
             torch.cuda.empty_cache()
 
@@ -236,8 +367,12 @@ def segmented_forward(
                 tokens_removed, window, compacted_prefix_len, suffix_len,
             )
 
-    # Restore AC, LoRA offsets, and use_cache
+    # Restore AC, LoRA offsets, use_cache, and beta hooks
     hook_handle.remove()
+    for h in beta_hooks:
+        h.remove()
+    if beta_state is not None:
+        beta_state.clear()
     for name, module in backbone.named_modules():
         if name in saved_checkpoint_fns:
             module.checkpoint_fn = saved_checkpoint_fns[name]

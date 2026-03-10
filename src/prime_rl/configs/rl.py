@@ -703,6 +703,20 @@ class RLConfig(BaseConfig):
                 self.slurm.template_path = templates_dir / "multi_node_rl.sbatch.j2"
         return self
 
+    @model_validator(mode="after")
+    def auto_setup_compute_beta(self):
+        """Sync compute_beta from env args to trainer config.
+
+        When any env sets compute_beta=true, the trainer must also apply beta
+        correction during compaction replay. This avoids requiring the user to
+        set compute_beta in two places.
+        """
+        for env in self.orchestrator.env:
+            if env.args.get("compute_beta", False):
+                self.trainer.compute_beta = True
+                break
+        return self
+
     ### Warnings
 
     @model_validator(mode="after")

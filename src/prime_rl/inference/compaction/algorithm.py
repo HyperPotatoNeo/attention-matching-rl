@@ -76,6 +76,7 @@ def compact_kv(
     compact_window: int | None = None,
     compute_beta: bool = False,
     beta_nnls_iters: int = 50,
+    seed: int | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor] | None]:
     """Compact assistant KV prefix via Attention Matching.
 
@@ -100,6 +101,9 @@ def compact_kv(
         compute_beta: If True, compute NNLS beta bias for partition function
             correction. Returns per-layer beta tensors as the third element.
         beta_nnls_iters: Number of projected gradient descent iterations for NNLS.
+        seed: If set, use deterministic random queries seeded per-layer as
+            seed + layer_idx. Ensures identical compaction between inference
+            and training replay.
 
     Returns:
         c1[layer]: (target_len, num_kv_heads, head_size) - compacted prefix keys
@@ -126,8 +130,15 @@ def compact_kv(
         Kp_h = K_h[:, :window, :]
 
         # Per-head random queries: (H, num_queries, head_size)
-        Q = torch.randn(num_kv_heads, num_queries, head_size,
-                         device=device, dtype=torch.float32)
+        # Deterministic seeding ensures identical compaction in inference and training
+        if seed is not None:
+            g = torch.Generator(device=device)
+            g.manual_seed(seed + layer_idx)
+            Q = torch.randn(num_kv_heads, num_queries, head_size,
+                             device=device, dtype=torch.float32, generator=g)
+        else:
+            Q = torch.randn(num_kv_heads, num_queries, head_size,
+                             device=device, dtype=torch.float32)
 
         # Batched attention: (H, Q, T) = (H, Q, D) @ (H, D, T)
         full_scores = torch.bmm(Q, K_h.transpose(1, 2)) * scale
@@ -148,10 +159,13 @@ def compact_kv(
         # Compute beta if requested
         layer_beta = None
         if compute_beta:
-            # Use only window keys for target partition function.
-            # Suffix keys remain in attention without beta correction,
-            # so including them would double-count their contribution.
-            layer_beta = _solve_beta_nnls(Q, Kp_h, c1_h, scale, iters=beta_nnls_iters)
+            # Use ALL assistant keys (window + suffix) for the target partition
+            # function. During decode, softmax runs over prompt + C1+beta + suffix
+            # + decoded tokens. Using only window keys produces beta that's too
+            # small, causing the model to under-attend to compacted context.
+            # The larger beta from full keys keeps compacted keys relevant.
+            # NaN safety nets (lines below) handle numerical edge cases.
+            layer_beta = _solve_beta_nnls(Q, K_h, c1_h, scale, iters=beta_nnls_iters)
             # layer_beta: (H, target_len)
 
         # Batched lstsq for C2 values

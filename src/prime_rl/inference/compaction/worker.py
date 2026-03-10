@@ -304,11 +304,13 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             window = min(compact_window or asst_len, asst_len)
             suffix_len = asst_len - window
 
+            compact_seed = prompt_len * 10000 + segment
             c1_list, c2_list, _ = compact_kv(
                 keys, values, prompt_len, compact_target_ratio,
                 num_kv_heads, head_size, device,
                 compact_window=window,
                 compute_beta=compute_beta,
+                seed=compact_seed,
             )
             algo_time = time.time() - t_algo
 
@@ -641,11 +643,13 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     asst_len = kv_len - prompt_lens[i]
                     window = min(compact_window or asst_len, asst_len)
 
+                    compact_seed = prompt_lens[i] * 10000 + len(compaction_events[i])
                     c1_list, c2_list, beta_list = compact_kv(
                         keys, values, prompt_lens[i], compact_target_ratio,
                         num_kv_heads, head_size, device,
                         compact_window=window,
                         compute_beta=compute_beta,
+                        seed=compact_seed,
                     )
 
                     compacted_prefix_len = c1_list[0].shape[0]

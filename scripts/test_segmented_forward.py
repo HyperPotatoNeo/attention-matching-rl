@@ -209,6 +209,125 @@ def test_three_segments():
     print("  PASSED")
 
 
+def test_deterministic_compaction():
+    """Test that seeded compaction produces identical results across calls."""
+    print("\n=== Test: Deterministic Compaction (Seeded) ===")
+    model = create_test_model()
+
+    prompt_len = 10
+    seg0_len = 30
+    seg1_len = 20
+    total_len = prompt_len + seg0_len + seg1_len
+    segment_boundaries = [seg0_len, seg0_len + seg1_len]
+
+    input_ids = torch.randint(0, 256, (1, total_len))
+    position_ids = torch.arange(total_len).unsqueeze(0)
+    temperature = torch.ones(1, total_len)
+
+    # Run twice — should produce identical logits because compaction is seeded
+    with torch.no_grad():
+        out1 = segmented_forward(
+            model, input_ids, position_ids,
+            segment_boundaries=segment_boundaries,
+            prompt_len=prompt_len,
+            compact_target_ratio=0.5,
+            compact_window=15,
+            temperature=temperature,
+        )
+        out2 = segmented_forward(
+            model, input_ids, position_ids,
+            segment_boundaries=segment_boundaries,
+            prompt_len=prompt_len,
+            compact_target_ratio=0.5,
+            compact_window=15,
+            temperature=temperature,
+        )
+
+    diff = (out1["logits"] - out2["logits"]).abs().max().item()
+    print(f"  Max logit difference between runs: {diff:.6e}")
+    # Small fp32 accumulation from DynamicCache is expected; randomness would give ~1e0
+    assert diff < 1e-5, f"Non-deterministic compaction! diff={diff}"
+    print("  PASSED")
+
+
+def test_compute_beta():
+    """Test that compute_beta=True works in segmented forward."""
+    print("\n=== Test: Compute Beta ===")
+    model = create_test_model()
+
+    prompt_len = 10
+    seg0_len = 30
+    seg1_len = 20
+    total_len = prompt_len + seg0_len + seg1_len
+    segment_boundaries = [seg0_len, seg0_len + seg1_len]
+
+    input_ids = torch.randint(0, 256, (1, total_len))
+    position_ids = torch.arange(total_len).unsqueeze(0)
+    temperature = torch.ones(1, total_len)
+
+    out = segmented_forward(
+        model, input_ids, position_ids,
+        segment_boundaries=segment_boundaries,
+        prompt_len=prompt_len,
+        compact_target_ratio=0.5,
+        compact_window=15,
+        temperature=temperature,
+        compute_beta=True,
+    )
+
+    assert out["logits"].shape == (1, total_len, model.config.vocab_size)
+
+    # Check gradient flow with beta
+    loss = out["logits"].sum()
+    loss.backward()
+    params_with_grad = sum(1 for p in model.parameters() if p.grad is not None and p.grad.abs().sum() > 0)
+    print(f"  Output shape: {out['logits'].shape}")
+    print(f"  Parameters with gradients: {params_with_grad}")
+    assert params_with_grad > 0
+    print("  PASSED")
+
+
+def test_compact_kv_seed_consistency():
+    """Test that compact_kv with same seed produces identical C1/C2."""
+    print("\n=== Test: compact_kv Seed Consistency ===")
+    from prime_rl.inference.compaction.algorithm import compact_kv
+
+    num_kv_heads, head_size, num_layers = 4, 16, 2
+    seq_len, prompt_len = 50, 10
+    keys = [torch.randn(seq_len, num_kv_heads, head_size) for _ in range(num_layers)]
+    values = [torch.randn(seq_len, num_kv_heads, head_size) for _ in range(num_layers)]
+
+    kwargs = dict(
+        prompt_len=prompt_len, target_ratio=0.5, num_kv_heads=num_kv_heads,
+        head_size=head_size, device=torch.device("cpu"), compact_window=20,
+        compute_beta=True, seed=12345,
+    )
+
+    c1a, c2a, ba = compact_kv(keys, values, **kwargs)
+    c1b, c2b, bb = compact_kv(keys, values, **kwargs)
+
+    for l in range(num_layers):
+        assert torch.equal(c1a[l], c1b[l]), f"C1 differs at layer {l}"
+        # lstsq uses SVD/QR which isn't bitwise deterministic; check approximate equality
+        c2_diff = (c2a[l] - c2b[l]).abs().max().item()
+        assert c2_diff < 1e-5, f"C2 differs too much at layer {l}: {c2_diff}"
+        beta_diff = (ba[l] - bb[l]).abs().max().item()
+        assert beta_diff < 1e-5, f"Beta differs too much at layer {l}: {beta_diff}"
+
+    # Without seed: should differ (with very high probability)
+    c1c, c2c, _ = compact_kv(keys, values, prompt_len=prompt_len, target_ratio=0.5,
+                              num_kv_heads=num_kv_heads, head_size=head_size,
+                              device=torch.device("cpu"), compact_window=20)
+    c1d, c2d, _ = compact_kv(keys, values, prompt_len=prompt_len, target_ratio=0.5,
+                              num_kv_heads=num_kv_heads, head_size=head_size,
+                              device=torch.device("cpu"), compact_window=20)
+    any_diff = any(not torch.equal(c1c[l], c1d[l]) for l in range(num_layers))
+    print(f"  Seeded: identical=True")
+    print(f"  Unseeded: differs={any_diff}")
+    assert any_diff, "Unseeded calls should produce different results"
+    print("  PASSED")
+
+
 if __name__ == "__main__":
     torch.manual_seed(42)
     test_single_segment()
@@ -216,4 +335,7 @@ if __name__ == "__main__":
     test_gradient_flow()
     test_partial_compaction()
     test_three_segments()
+    test_deterministic_compaction()
+    test_compute_beta()
+    test_compact_kv_seed_consistency()
     print("\n=== ALL TESTS PASSED ===")

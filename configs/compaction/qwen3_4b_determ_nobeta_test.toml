@@ -1,21 +1,20 @@
-# Compaction Full FT Training — No Beta Bias (4-4 config)
+# Deterministic compaction test — No Beta, 5 steps
+# Tests that deterministic seed in inference produces lower mismatch KL in training
 # 2-node: Node 1 = 4 inference (TP=1), Node 2 = 4 trainer (FSDP2)
-#
-# __INFERENCE_NODE__ is replaced by the launch script.
 
-max_steps = 600
+max_steps = 5
 seq_len = 9216
-output_dir = "outputs/compaction-fullft-nobeta"
+output_dir = "outputs/compaction-determ-nobeta-test"
 
 [model]
 name = "Qwen/Qwen3-4B"
 
 [wandb]
 project = "compaction-rl"
-name = "compaction-fullft-nobeta"
+name = "determ-nobeta-test"
 
 [ckpt]
-interval = 50
+interval = 100
 resume_step = -1
 
 [deployment]

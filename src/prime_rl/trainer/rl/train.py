@@ -398,6 +398,7 @@ def train(config: TrainerConfig):
                         compact_window=getattr(config, "compact_window", None),
                         temperature=temperatures,
                         max_forward_passes=max_forwards,
+                        compute_beta=getattr(config, "compute_beta", False),
                     )
                 else:
                     out = forward(

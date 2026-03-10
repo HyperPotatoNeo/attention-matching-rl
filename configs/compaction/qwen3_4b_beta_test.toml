@@ -24,6 +24,7 @@ num_infer_gpus = 0
 dist_timeout_seconds = 3600
 compact_target_ratio = 0.25
 compact_window = 1024
+compute_beta = true
 
 [trainer.model]
 impl = "auto"
