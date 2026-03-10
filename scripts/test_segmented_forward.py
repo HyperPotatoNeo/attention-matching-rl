@@ -314,17 +314,17 @@ def test_compact_kv_seed_consistency():
         beta_diff = (ba[l] - bb[l]).abs().max().item()
         assert beta_diff < 1e-5, f"Beta differs too much at layer {l}: {beta_diff}"
 
-    # Without seed: should differ (with very high probability)
+    # Different seeds should produce different results
     c1c, c2c, _ = compact_kv(keys, values, prompt_len=prompt_len, target_ratio=0.5,
                               num_kv_heads=num_kv_heads, head_size=head_size,
-                              device=torch.device("cpu"), compact_window=20)
+                              device=torch.device("cpu"), compact_window=20, seed=99)
     c1d, c2d, _ = compact_kv(keys, values, prompt_len=prompt_len, target_ratio=0.5,
                               num_kv_heads=num_kv_heads, head_size=head_size,
-                              device=torch.device("cpu"), compact_window=20)
+                              device=torch.device("cpu"), compact_window=20, seed=200)
     any_diff = any(not torch.equal(c1c[l], c1d[l]) for l in range(num_layers))
-    print(f"  Seeded: identical=True")
-    print(f"  Unseeded: differs={any_diff}")
-    assert any_diff, "Unseeded calls should produce different results"
+    print(f"  Same seed: identical=True")
+    print(f"  Different seeds: differs={any_diff}")
+    assert any_diff, "Different seeds should produce different results"
     print("  PASSED")
 
 

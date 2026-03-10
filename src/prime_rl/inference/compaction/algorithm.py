@@ -76,7 +76,7 @@ def compact_kv(
     compact_window: int | None = None,
     compute_beta: bool = False,
     beta_nnls_iters: int = 50,
-    seed: int | None = None,
+    seed: int = 0,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor] | None]:
     """Compact assistant KV prefix via Attention Matching.
 
@@ -101,7 +101,7 @@ def compact_kv(
         compute_beta: If True, compute NNLS beta bias for partition function
             correction. Returns per-layer beta tensors as the third element.
         beta_nnls_iters: Number of projected gradient descent iterations for NNLS.
-        seed: If set, use deterministic random queries seeded per-layer as
+        seed: Deterministic random query seed. Seeded per-layer as
             seed + layer_idx. Ensures identical compaction between inference
             and training replay.
 
@@ -131,14 +131,10 @@ def compact_kv(
 
         # Per-head random queries: (H, num_queries, head_size)
         # Deterministic seeding ensures identical compaction in inference and training
-        if seed is not None:
-            g = torch.Generator(device=device)
-            g.manual_seed(seed + layer_idx)
-            Q = torch.randn(num_kv_heads, num_queries, head_size,
-                             device=device, dtype=torch.float32, generator=g)
-        else:
-            Q = torch.randn(num_kv_heads, num_queries, head_size,
-                             device=device, dtype=torch.float32)
+        g = torch.Generator(device=device)
+        g.manual_seed(seed + layer_idx)
+        Q = torch.randn(num_kv_heads, num_queries, head_size,
+                         device=device, dtype=torch.float32, generator=g)
 
         # Batched attention: (H, Q, T) = (H, Q, D) @ (H, D, T)
         full_scores = torch.bmm(Q, K_h.transpose(1, 2)) * scale
