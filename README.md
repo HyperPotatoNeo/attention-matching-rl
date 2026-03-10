@@ -113,7 +113,6 @@ The launch script handles container setup, config resolution (replacing `__INFER
 |--------|---------|
 | `qwen3_4b_fullft_determ_nobeta.toml` | **Default** — 4+4 layout, deterministic compaction, no beta |
 | `qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic) |
-| `qwen3_4b_fullft_train.toml` | 5+3 layout (legacy mixed-mode) |
 | `qwen3_4b_beta_test.toml` | Beta attention test (compute_beta=true) |
 | `qwen3_4b_fullft_baseline.toml` | Baseline training (no compaction) |
 | `qwen3_4b_serve_tp1.toml` | TP=1 compaction server |

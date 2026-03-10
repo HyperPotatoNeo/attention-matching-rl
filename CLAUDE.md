@@ -24,7 +24,6 @@ the full technical walkthrough.
 |--------|---------|
 | `configs/compaction/qwen3_4b_fullft_determ_nobeta.toml` | **Default** — 4+4 layout, deterministic compaction, no beta |
 | `configs/compaction/qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic) |
-| `configs/compaction/qwen3_4b_fullft_train.toml` | 5+3 layout (legacy mixed-mode) |
 | `configs/compaction/qwen3_4b_beta_test.toml` | Beta attention test config |
 | `configs/compaction/qwen3_4b_fullft_baseline.toml` | Baseline (no compaction) |
 | `configs/compaction/qwen3_4b_serve_tp1.toml` | TP=1 inference server |
