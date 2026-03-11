@@ -183,6 +183,9 @@ def train(config: TrainerConfig):
     progress = Progress()
     if checkpoint_step is not None:
         ckpt_manager.load(checkpoint_step, model, [optimizer], scheduler, progress)
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
         logger.info(f"Resuming training from checkpoint step {checkpoint_step}")
 
     logger.info(
@@ -399,6 +402,8 @@ def train(config: TrainerConfig):
                         temperature=temperatures,
                         max_forward_passes=max_forwards,
                         compute_beta=getattr(config, "compute_beta", False),
+                        use_suffix_queries=getattr(config, "use_suffix_queries", False),
+                        compaction_indices=micro_batch.get("compaction_indices"),
                     )
                 else:
                     out = forward(
@@ -456,6 +461,12 @@ def train(config: TrainerConfig):
                 out["entropy"], pad_value=torch.log(torch.tensor(float(vocab_size))).item()
             )
 
+            # Free logits to reduce peak memory before backward.
+            out.pop("logits", None)
+            scaled_logits = None
+            logits = None
+            torch.cuda.empty_cache()
+
             # Compute loss
             response_lengths = get_response_lengths(position_ids)
             loss, loss_tensors = compute_loss(
@@ -470,7 +481,10 @@ def train(config: TrainerConfig):
                 loss_scale=loss_scale,
             )
 
-            # Backward pass
+            # Backward pass — empty_cache() first to defragment CUDA memory.
+            # Without this, checkpoint resume causes OOM during backward
+            # due to memory fragmentation from segmented_forward.
+            torch.cuda.empty_cache()
             with maybe_record_function("backward"):
                 loss.backward()
 

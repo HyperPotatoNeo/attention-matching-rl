@@ -677,6 +677,10 @@ class TrainerConfig(BaseConfig):
         bool,
         Field(description="Compute beta partition function correction during compaction replay, matching inference."),
     ] = False
+    use_suffix_queries: Annotated[
+        bool,
+        Field(description="Use suffix token queries for compaction importance scoring instead of random probes."),
+    ] = False
 
     memory_profiler_path: Annotated[Path | None, Field(description="Path to write memory profile to.")] = None
 

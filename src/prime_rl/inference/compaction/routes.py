@@ -33,6 +33,7 @@ class CompactGenerateRequest(BaseModel):
     max_kv_len: int | None = None
     max_total_tokens: int | None = None
     compute_beta: bool = False
+    use_suffix_queries: bool = False
 
 
 class CompactGenerateBatchRequest(BaseModel):
@@ -47,6 +48,7 @@ class CompactGenerateBatchRequest(BaseModel):
     max_kv_len: int | None = None
     max_total_tokens: int | None = None
     compute_beta: bool = False
+    use_suffix_queries: bool = False
 
 
 class _RequestBatcher:
@@ -137,6 +139,7 @@ class _RequestBatcher:
                 "max_kv_len": first_body.max_kv_len,
                 "max_total_tokens": first_body.max_total_tokens,
                 "compute_beta": first_body.compute_beta,
+                "use_suffix_queries": first_body.use_suffix_queries,
             },
         )
 
@@ -198,6 +201,7 @@ async def compact_generate_batch(body: CompactGenerateBatchRequest, request: Req
         kwargs={
             "max_kv_len": body.max_kv_len,
             "max_total_tokens": body.max_total_tokens,
+            "use_suffix_queries": body.use_suffix_queries,
         },
     )
 

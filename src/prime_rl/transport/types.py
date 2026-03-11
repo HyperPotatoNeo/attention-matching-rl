@@ -27,6 +27,10 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # e.g. [2048, 4096, 6144] means segment 0 had 2048 tokens, segment 1 had 2048 more, etc.
     segment_boundaries: list[int] | None = None
 
+    # Compaction training: per-event top-k indices from inference for deterministic replay.
+    # Shape: compaction_indices[event_idx][layer_idx] = list[list[int]] (H × target_len)
+    compaction_indices: list | None = None
+
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A batch of training examples with metadata for transport."""
@@ -52,6 +56,9 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
 
     # Compaction training: cumulative completion token counts at end of each segment
     segment_boundaries: list[int] | None = None
+
+    # Compaction training: per-event top-k indices from inference
+    compaction_indices: list | None = None
 
     # Multimodal fields (Qwen3-VL) — pixel_values stored as raw float32 bytes for efficient serialization
     pixel_values: bytes | None = None

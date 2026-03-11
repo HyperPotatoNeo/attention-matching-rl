@@ -140,6 +140,85 @@ def _register_beta_hooks(
     return hooks
 
 
+def _make_query_capture_hook(layer_idx: int, buffer: dict[int, Tensor]):
+    """Create a forward_pre_hook that captures Q after q_proj + q_norm + RoPE.
+
+    Works with HuggingFace Qwen3Attention which has separate q_proj, q_norm,
+    and receives position_embeddings as a kwarg for RoPE.
+    """
+
+    def hook(module, args, kwargs):
+        hidden_states = args[0] if args else kwargs.get('hidden_states')
+        if hidden_states is None:
+            return
+
+        head_dim = module.head_dim
+        hidden_shape = (*hidden_states.shape[:-1], -1, head_dim)
+
+        q = module.q_proj(hidden_states).view(hidden_shape)
+        if hasattr(module, 'q_norm'):
+            q = module.q_norm(q)
+        q = q.transpose(1, 2)  # (batch, num_heads, seq_len, head_dim)
+
+        position_embeddings = kwargs.get('position_embeddings')
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            # apply_rotary_pos_emb expects (batch, heads, seq, dim)
+            # Import from the model's own module to match its RoPE implementation
+            model_module = type(module).__module__
+            import importlib
+            mod = importlib.import_module(model_module)
+            rope_fn = getattr(mod, 'apply_rotary_pos_emb')
+            q, _ = rope_fn(q, q, cos, sin)
+
+        # Store detached: (batch, num_heads, seq_len, head_dim)
+        buffer[layer_idx] = q.detach()
+
+    return hook
+
+
+def _extract_suffix_queries_from_buffer(
+    buffer: dict[int, Tensor],
+    num_layers: int,
+    suffix_start_in_segment: int,
+    num_kv_heads: int,
+    head_size: int,
+    device: torch.device,
+) -> list[Tensor]:
+    """Extract suffix queries from captured buffer, grouped into KV-head space.
+
+    Args:
+        buffer: {layer_idx: (1, num_attn_heads, seg_len, head_dim)} captured queries
+        suffix_start_in_segment: index within the segment where the suffix begins
+        num_kv_heads: number of KV heads for GQA grouping
+        head_size: dimension per head
+
+    Returns:
+        suffix_queries[layer]: (num_kv_heads, suffix_len * heads_per_group, head_size)
+    """
+    result = []
+    for l in range(num_layers):
+        if l not in buffer:
+            result.append(torch.zeros(num_kv_heads, 0, head_size,
+                                      device=device, dtype=torch.float32))
+            continue
+        q = buffer[l]  # (1, num_attn_heads, seg_len, head_dim)
+        q = q[0, :, suffix_start_in_segment:, :]  # (num_attn_heads, suffix_len, head_dim)
+        num_attn_heads = q.shape[0]
+        suffix_len = q.shape[1]
+        if suffix_len == 0:
+            result.append(torch.zeros(num_kv_heads, 0, head_size,
+                                      device=device, dtype=torch.float32))
+            continue
+        heads_per_group = num_attn_heads // num_kv_heads
+        # (num_kv_heads, heads_per_group, suffix_len, head_dim)
+        q = q.view(num_kv_heads, heads_per_group, suffix_len, head_size)
+        # Concat GQA group heads as separate queries
+        q = q.reshape(num_kv_heads, heads_per_group * suffix_len, head_size).float()
+        result.append(q)
+    return result
+
+
 def _get_kv_from_cache(cache: DynamicCache) -> tuple[list[Tensor], list[Tensor], int, int]:
     """Extract key/value tensors and dimensions from a DynamicCache.
 
@@ -192,6 +271,8 @@ def segmented_forward(
     temperature: Tensor,
     max_forward_passes: int | None = None,
     compute_beta: bool = False,
+    use_suffix_queries: bool = False,
+    compaction_indices: list | None = None,
 ) -> dict[str, Tensor]:
     """Run segmented forward passes with compaction replay between segments.
 
@@ -270,6 +351,10 @@ def segmented_forward(
                 saved_checkpoint_fns[name] = module.checkpoint_fn
                 module.checkpoint_fn = lambda fn, *args, **kwargs: fn(*args, **kwargs)
 
+    # Query capture for suffix queries (lazy-initialized)
+    query_capture_hooks: list = []
+    query_buffer: dict[int, Tensor] = {}
+
     for seg_idx, (seg_start, seg_end) in enumerate(seg_input_ranges):
         seg_ids = input_ids[:, seg_start:seg_end]
         seg_positions = position_ids[:, seg_start:seg_end]
@@ -281,6 +366,17 @@ def segmented_forward(
         if saved_lora_num_tokens is not None:
             seg_len = seg_end - seg_start
             saved_lora_num_tokens[0] = seg_len
+
+        # Register query capture hooks for non-last segments when using suffix queries
+        is_last_segment = (seg_idx == len(seg_input_ranges) - 1)
+        if use_suffix_queries and not is_last_segment and not query_capture_hooks:
+            attn_modules = _find_attention_modules(model)
+            for layer_idx, module in enumerate(attn_modules):
+                handle = module.register_forward_pre_hook(
+                    _make_query_capture_hook(layer_idx, query_buffer),
+                    with_kwargs=True,
+                )
+                query_capture_hooks.append(handle)
 
         out = model(
             input_ids=seg_ids,
@@ -316,13 +412,35 @@ def segmented_forward(
             asst_len = kv_seq_len - prompt_len
             window = min(compact_window or asst_len, asst_len)
 
+            # Extract suffix queries from captured buffer
+            suffix_queries = None
+            if use_suffix_queries and query_buffer:
+                suffix_start_in_seg = prompt_len + window - seg_start
+                suffix_queries = _extract_suffix_queries_from_buffer(
+                    query_buffer, num_layers, suffix_start_in_seg,
+                    num_kv_heads, head_size, device,
+                )
+                query_buffer.clear()
+
+            # Convert inference indices to forced_indices tensors if available
+            seg_forced_indices = None
+            if compaction_indices is not None and seg_idx < len(compaction_indices):
+                seg_ci = compaction_indices[seg_idx]
+                if seg_ci is not None:
+                    seg_forced_indices = [
+                        torch.tensor(layer_indices, dtype=torch.int64, device=device)
+                        for layer_indices in seg_ci
+                    ]
+
             compact_seed = prompt_len * 10000 + seg_idx
-            c1_list, c2_list, beta_list = compact_kv(
+            c1_list, c2_list, beta_list, _ = compact_kv(
                 keys, values, prompt_len, compact_target_ratio,
                 num_kv_heads, head_size, device,
                 compact_window=window,
                 compute_beta=compute_beta,
                 seed=compact_seed,
+                suffix_queries=suffix_queries,
+                forced_indices=seg_forced_indices,
             )
 
             compacted_prefix_len = c1_list[0].shape[0]
@@ -367,9 +485,11 @@ def segmented_forward(
                 tokens_removed, window, compacted_prefix_len, suffix_len,
             )
 
-    # Restore AC, LoRA offsets, use_cache, and beta hooks
+    # Restore AC, LoRA offsets, use_cache, and beta/query hooks
     hook_handle.remove()
     for h in beta_hooks:
+        h.remove()
+    for h in query_capture_hooks:
         h.remove()
     if beta_state is not None:
         beta_state.clear()

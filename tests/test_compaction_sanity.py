@@ -53,7 +53,7 @@ class TestCompactKV:
         target_ratio = 0.25
         target_len = max(1, int(asst_len * target_ratio))
 
-        c1_list, c2_list, _ = compact_kv(
+        c1_list, c2_list, _, _ = compact_kv(
             keys, values, prompt_len, target_ratio,
             num_kv_heads, head_size, device,
         )
@@ -74,7 +74,7 @@ class TestCompactKV:
         keys, values, prompt_len, num_kv_heads, head_size, device, asst_len = kv_inputs
         target_ratio = 0.25
 
-        c1_list, _, _ = compact_kv(
+        c1_list, _, _, _ = compact_kv(
             keys, values, prompt_len, target_ratio,
             num_kv_heads, head_size, device,
         )
@@ -99,7 +99,7 @@ class TestCompactKV:
         target_ratio = 0.25
         target_len = max(1, int(compact_window * target_ratio))
 
-        c1_list, c2_list, _ = compact_kv(
+        c1_list, c2_list, _, _ = compact_kv(
             keys, values, prompt_len, target_ratio,
             num_kv_heads, head_size, device,
             compact_window=compact_window,
@@ -115,7 +115,7 @@ class TestCompactKV:
 
         keys, values, prompt_len, num_kv_heads, head_size, device, _ = kv_inputs
 
-        c1_list, c2_list, _ = compact_kv(
+        c1_list, c2_list, _, _ = compact_kv(
             keys, values, prompt_len, 0.25,
             num_kv_heads, head_size, device,
         )
@@ -282,7 +282,7 @@ class TestKVReconstruction:
         values = [torch.randn(seq_len, num_kv_heads, head_size, device=device, dtype=torch.bfloat16)
                   for _ in range(num_layers)]
 
-        c1_list, c2_list, _ = compact_kv(
+        c1_list, c2_list, _, _ = compact_kv(
             keys, values, prompt_len, target_ratio,
             num_kv_heads, head_size, device,
             compact_window=compact_window,
@@ -607,6 +607,428 @@ class TestGradientFlow:
         has_grad = any(p.grad is not None and p.grad.abs().max() > 0
                        for p in model.parameters() if p.requires_grad)
         assert has_grad, "No gradients flowed through two-segment forward"
+
+
+# ── 8. Suffix query algorithm integration ──────────────────────────────────
+
+class TestSuffixQueries:
+    """Verify compact_kv works correctly with external suffix queries."""
+
+    @pytest.fixture
+    def kv_inputs(self):
+        num_layers = 2
+        num_kv_heads = 4
+        head_size = 128
+        prompt_len = 50
+        asst_len = 200
+        compact_window = 100
+        seq_len = prompt_len + asst_len
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = torch.bfloat16
+
+        keys = [torch.randn(seq_len, num_kv_heads, head_size, device=device, dtype=dtype)
+                for _ in range(num_layers)]
+        values = [torch.randn(seq_len, num_kv_heads, head_size, device=device, dtype=dtype)
+                  for _ in range(num_layers)]
+
+        return keys, values, prompt_len, num_kv_heads, head_size, device, compact_window
+
+    def test_suffix_queries_produce_valid_output(self, kv_inputs):
+        """compact_kv with suffix_queries produces same-shape output as random queries."""
+        from prime_rl.inference.compaction.algorithm import compact_kv
+
+        keys, values, prompt_len, num_kv_heads, head_size, device, compact_window = kv_inputs
+        target_ratio = 0.25
+        target_len = max(1, int(compact_window * target_ratio))
+        suffix_len = 100  # asst_len - compact_window
+
+        # Synthetic suffix queries: (num_kv_heads, suffix_len, head_size)
+        suffix_queries = [
+            torch.randn(num_kv_heads, suffix_len, head_size, device=device, dtype=torch.float32)
+            for _ in range(len(keys))
+        ]
+
+        c1_list, c2_list, _, _ = compact_kv(
+            keys, values, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window,
+            suffix_queries=suffix_queries,
+        )
+
+        for l in range(len(keys)):
+            assert c1_list[l].shape == (target_len, num_kv_heads, head_size)
+            assert c2_list[l].shape == (target_len, num_kv_heads, head_size)
+
+    def test_suffix_queries_differ_from_random(self, kv_inputs):
+        """Suffix queries should produce different key selection than random queries."""
+        from prime_rl.inference.compaction.algorithm import compact_kv
+
+        keys, values, prompt_len, num_kv_heads, head_size, device, compact_window = kv_inputs
+        target_ratio = 0.25
+
+        # Random queries (seeded)
+        c1_random, _, _, _ = compact_kv(
+            keys, values, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window, seed=42,
+        )
+
+        # Suffix queries (use actual suffix keys as queries — different signal)
+        suffix_len = 100
+        suffix_queries = [
+            keys[l][prompt_len + compact_window:].permute(1, 0, 2).float()
+            for l in range(len(keys))
+        ]
+
+        c1_suffix, _, _, _ = compact_kv(
+            keys, values, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window,
+            suffix_queries=suffix_queries,
+        )
+
+        # The selected keys should generally differ (not guaranteed but very likely
+        # with random data and different query distributions)
+        any_diff = False
+        for l in range(len(keys)):
+            if not torch.equal(c1_random[l], c1_suffix[l]):
+                any_diff = True
+                break
+        assert any_diff, "Suffix queries produced identical selection to random — suspicious"
+
+    def test_suffix_queries_fallback_on_empty(self, kv_inputs):
+        """When suffix_queries has empty tensors, falls back to random queries."""
+        from prime_rl.inference.compaction.algorithm import compact_kv
+
+        keys, values, prompt_len, num_kv_heads, head_size, device, compact_window = kv_inputs
+        target_ratio = 0.25
+
+        # Empty suffix queries
+        suffix_queries = [
+            torch.zeros(num_kv_heads, 0, head_size, device=device, dtype=torch.float32)
+            for _ in range(len(keys))
+        ]
+
+        # Should not crash — falls back to random
+        c1_list, c2_list, _, _ = compact_kv(
+            keys, values, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window,
+            suffix_queries=suffix_queries,
+            seed=42,
+        )
+
+        # Also run with no suffix queries to verify fallback matches
+        c1_ref, c2_ref, _, _ = compact_kv(
+            keys, values, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window,
+            seed=42,
+        )
+
+        for l in range(len(keys)):
+            assert torch.equal(c1_list[l], c1_ref[l]), \
+                "Empty suffix queries should fall back to random (same as no suffix_queries)"
+
+    def test_suffix_queries_with_beta(self, kv_inputs):
+        """Suffix queries + beta correction produces valid output."""
+        from prime_rl.inference.compaction.algorithm import compact_kv
+
+        keys, values, prompt_len, num_kv_heads, head_size, device, compact_window = kv_inputs
+        target_ratio = 0.25
+        target_len = max(1, int(compact_window * target_ratio))
+        suffix_len = 100
+
+        suffix_queries = [
+            torch.randn(num_kv_heads, suffix_len, head_size, device=device, dtype=torch.float32)
+            for _ in range(len(keys))
+        ]
+
+        c1_list, c2_list, beta_list, _ = compact_kv(
+            keys, values, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window,
+            compute_beta=True,
+            suffix_queries=suffix_queries,
+        )
+
+        assert beta_list is not None
+        for l in range(len(keys)):
+            assert c1_list[l].shape == (target_len, num_kv_heads, head_size)
+            assert beta_list[l].shape == (target_len, num_kv_heads)
+            assert not torch.isnan(beta_list[l]).any(), f"Beta has NaN at layer {l}"
+
+
+# ── 9. Suffix query trainer integration ────────────────────────────────────
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+class TestSuffixQueryTrainer:
+    """Verify segmented_forward with suffix queries."""
+
+    @pytest.fixture
+    def small_model(self):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        model_name = "Qwen/Qwen2.5-0.5B"
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name, dtype=torch.bfloat16,
+            ).to("cuda")
+            model.eval()
+        except Exception as e:
+            pytest.skip(f"Could not load {model_name}: {e}")
+
+        return model, tokenizer
+
+    def test_suffix_queries_shape_correct(self, small_model):
+        """segmented_forward with use_suffix_queries produces correct output shape."""
+        model, tokenizer = small_model
+
+        prompt = "Count to ten: "
+        text = prompt + "one two three four five six seven eight nine ten done"
+        inputs = tokenizer(text, return_tensors="pt").to("cuda")
+        input_ids = inputs["input_ids"]
+        seq_len = input_ids.shape[1]
+
+        prompt_ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
+        prompt_len = prompt_ids.shape[1]
+        completion_len = seq_len - prompt_len
+
+        mid = completion_len // 2
+        boundaries = [mid, completion_len]
+
+        position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0)
+        temperature = torch.ones(1, seq_len, device="cuda")
+
+        model.config.use_cache = False
+
+        from prime_rl.trainer.rl.compaction import segmented_forward
+
+        with torch.no_grad():
+            seg_out = segmented_forward(
+                model=model,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                segment_boundaries=boundaries,
+                prompt_len=prompt_len,
+                compact_target_ratio=0.25,
+                compact_window=None,
+                temperature=temperature,
+                use_suffix_queries=True,
+            )
+
+        seg_logits = seg_out["logits"]
+        assert seg_logits.shape[1] == seq_len, \
+            f"Suffix queries logits length {seg_logits.shape[1]} != input length {seq_len}"
+
+    def test_suffix_queries_gradients_flow(self, small_model):
+        """Gradients flow through segmented_forward with suffix queries."""
+        model, tokenizer = small_model
+        model.train()
+
+        text = "One two three four five six seven eight nine ten eleven twelve"
+        inputs = tokenizer(text, return_tensors="pt").to("cuda")
+        input_ids = inputs["input_ids"]
+        seq_len = input_ids.shape[1]
+        prompt_len = 2
+        completion_len = seq_len - prompt_len
+        mid = completion_len // 2
+
+        position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0)
+        temperature = torch.ones(1, seq_len, device="cuda")
+
+        from prime_rl.trainer.rl.compaction import segmented_forward
+
+        model.config.use_cache = False
+        out = segmented_forward(
+            model=model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            segment_boundaries=[mid, completion_len],
+            prompt_len=prompt_len,
+            compact_target_ratio=0.25,
+            compact_window=None,
+            temperature=temperature,
+            use_suffix_queries=True,
+        )
+
+        loss = out["logits"].sum()
+        loss.backward()
+
+        has_grad = any(p.grad is not None and p.grad.abs().max() > 0
+                       for p in model.parameters() if p.requires_grad)
+        assert has_grad, "No gradients flowed through segmented_forward with suffix queries"
+
+
+# ── 10. Forced indices (topk_indices passing) ─────────────────────────────
+
+class TestForcedIndices:
+    """Verify compact_kv with forced_indices produces identical C1 keys
+    and that indices are correctly returned."""
+
+    @pytest.fixture
+    def kv_inputs(self):
+        num_layers = 2
+        num_kv_heads = 4
+        head_size = 128
+        prompt_len = 50
+        asst_len = 200
+        compact_window = 100
+        seq_len = prompt_len + asst_len
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = torch.bfloat16
+
+        keys = [torch.randn(seq_len, num_kv_heads, head_size, device=device, dtype=dtype)
+                for _ in range(num_layers)]
+        values = [torch.randn(seq_len, num_kv_heads, head_size, device=device, dtype=dtype)
+                  for _ in range(num_layers)]
+
+        return keys, values, prompt_len, num_kv_heads, head_size, device, compact_window
+
+    def test_indices_returned(self, kv_inputs):
+        """compact_kv returns indices_list with correct shape."""
+        from prime_rl.inference.compaction.algorithm import compact_kv
+
+        keys, values, prompt_len, num_kv_heads, head_size, device, compact_window = kv_inputs
+        target_ratio = 0.25
+        target_len = max(1, int(compact_window * target_ratio))
+
+        _, _, _, indices_list = compact_kv(
+            keys, values, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window, seed=42,
+        )
+
+        assert len(indices_list) == len(keys)
+        for l in range(len(keys)):
+            assert indices_list[l].shape == (num_kv_heads, target_len), \
+                f"indices[{l}] shape {indices_list[l].shape}, expected ({num_kv_heads}, {target_len})"
+
+    def test_forced_indices_produce_same_c1(self, kv_inputs):
+        """Passing forced_indices back to compact_kv produces identical C1 keys."""
+        from prime_rl.inference.compaction.algorithm import compact_kv
+
+        keys, values, prompt_len, num_kv_heads, head_size, device, compact_window = kv_inputs
+        target_ratio = 0.25
+
+        # First call: get indices normally
+        c1_orig, _, _, indices_list = compact_kv(
+            keys, values, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window, seed=42,
+        )
+
+        # Second call: force the same indices
+        c1_forced, _, _, indices_forced = compact_kv(
+            keys, values, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window, seed=99,  # different seed — shouldn't matter
+            forced_indices=indices_list,
+        )
+
+        for l in range(len(keys)):
+            assert torch.equal(c1_orig[l], c1_forced[l]), \
+                f"C1 differs at layer {l} with forced_indices"
+            assert torch.equal(indices_list[l], indices_forced[l]), \
+                f"Returned indices differ at layer {l}"
+
+    def test_forced_indices_different_c2_with_different_kv(self, kv_inputs):
+        """With forced_indices but different KV tensors, C1 matches but C2 differs."""
+        from prime_rl.inference.compaction.algorithm import compact_kv
+
+        keys, values, prompt_len, num_kv_heads, head_size, device, compact_window = kv_inputs
+        target_ratio = 0.25
+
+        # Get indices from original KV
+        c1_orig, c2_orig, _, indices_list = compact_kv(
+            keys, values, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window, seed=42,
+        )
+
+        # Different values (same keys) — C2 should differ
+        values_alt = [v + torch.randn_like(v) * 0.1 for v in values]
+        c1_forced, c2_forced, _, _ = compact_kv(
+            keys, values_alt, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window,
+            forced_indices=indices_list,
+        )
+
+        for l in range(len(keys)):
+            # C1 should be identical (same keys, same indices)
+            assert torch.equal(c1_orig[l], c1_forced[l]), \
+                f"C1 differs at layer {l} — should match with same keys+indices"
+
+        # C2 should differ (different values)
+        any_c2_diff = any(
+            not torch.equal(c2_orig[l], c2_forced[l]) for l in range(len(keys))
+        )
+        assert any_c2_diff, "C2 should differ with different value tensors"
+
+    def test_forced_indices_with_beta(self, kv_inputs):
+        """Beta computation works with forced_indices."""
+        from prime_rl.inference.compaction.algorithm import compact_kv
+
+        keys, values, prompt_len, num_kv_heads, head_size, device, compact_window = kv_inputs
+        target_ratio = 0.25
+        target_len = max(1, int(compact_window * target_ratio))
+
+        # Get indices normally
+        _, _, _, indices_list = compact_kv(
+            keys, values, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window, seed=42,
+        )
+
+        # Force indices with beta
+        c1_list, c2_list, beta_list, _ = compact_kv(
+            keys, values, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window,
+            compute_beta=True,
+            forced_indices=indices_list,
+        )
+
+        assert beta_list is not None
+        for l in range(len(keys)):
+            assert c1_list[l].shape == (target_len, num_kv_heads, head_size)
+            assert beta_list[l].shape == (target_len, num_kv_heads)
+            assert not torch.isnan(beta_list[l]).any(), f"Beta has NaN at layer {l}"
+
+    def test_forced_indices_with_suffix_queries(self, kv_inputs):
+        """Forced indices override suffix query importance scoring."""
+        from prime_rl.inference.compaction.algorithm import compact_kv
+
+        keys, values, prompt_len, num_kv_heads, head_size, device, compact_window = kv_inputs
+        target_ratio = 0.25
+        suffix_len = 100
+
+        # Get indices with random queries
+        c1_random, _, _, indices_random = compact_kv(
+            keys, values, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window, seed=42,
+        )
+
+        # Force those indices while providing suffix queries
+        suffix_queries = [
+            torch.randn(num_kv_heads, suffix_len, head_size, device=device, dtype=torch.float32)
+            for _ in range(len(keys))
+        ]
+
+        c1_forced, _, _, _ = compact_kv(
+            keys, values, prompt_len, target_ratio,
+            num_kv_heads, head_size, device,
+            compact_window=compact_window,
+            suffix_queries=suffix_queries,
+            forced_indices=indices_random,
+        )
+
+        for l in range(len(keys)):
+            assert torch.equal(c1_random[l], c1_forced[l]), \
+                f"C1 differs at layer {l} — forced_indices should override suffix queries"
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ def test_output_shapes(kv_data):
     window = 100
     target_len = max(1, int(window * target_ratio))
 
-    c1_list, c2_list, _ = compact_kv(
+    c1_list, c2_list, _, _ = compact_kv(
         kv_data["keys"], kv_data["values"],
         kv_data["prompt_len"], target_ratio,
         kv_data["num_kv_heads"], kv_data["head_size"],
@@ -57,7 +57,7 @@ def test_c1_keys_are_subset(kv_data):
     target_ratio = 0.25
     window = 100
 
-    c1_list, _, _ = compact_kv(
+    c1_list, _, _, _ = compact_kv(
         kv_data["keys"], kv_data["values"],
         kv_data["prompt_len"], target_ratio,
         kv_data["num_kv_heads"], kv_data["head_size"],
@@ -79,7 +79,7 @@ def test_full_window_compaction(kv_data):
     target_ratio = 0.25
     target_len = max(1, int(kv_data["asst_len"] * target_ratio))
 
-    c1_list, c2_list, _ = compact_kv(
+    c1_list, c2_list, _, _ = compact_kv(
         kv_data["keys"], kv_data["values"],
         kv_data["prompt_len"], target_ratio,
         kv_data["num_kv_heads"], kv_data["head_size"],
@@ -92,7 +92,7 @@ def test_full_window_compaction(kv_data):
 
 
 def test_dtype_preserved(kv_data):
-    c1_list, c2_list, _ = compact_kv(
+    c1_list, c2_list, _, _ = compact_kv(
         kv_data["keys"], kv_data["values"],
         kv_data["prompt_len"], 0.25,
         kv_data["num_kv_heads"], kv_data["head_size"],
@@ -105,7 +105,7 @@ def test_dtype_preserved(kv_data):
 
 
 def test_no_nan_inf(kv_data):
-    c1_list, c2_list, _ = compact_kv(
+    c1_list, c2_list, _, _ = compact_kv(
         kv_data["keys"], kv_data["values"],
         kv_data["prompt_len"], 0.25,
         kv_data["num_kv_heads"], kv_data["head_size"],

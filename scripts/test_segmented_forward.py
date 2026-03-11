@@ -303,8 +303,8 @@ def test_compact_kv_seed_consistency():
         compute_beta=True, seed=12345,
     )
 
-    c1a, c2a, ba = compact_kv(keys, values, **kwargs)
-    c1b, c2b, bb = compact_kv(keys, values, **kwargs)
+    c1a, c2a, ba, _ = compact_kv(keys, values, **kwargs)
+    c1b, c2b, bb, _ = compact_kv(keys, values, **kwargs)
 
     for l in range(num_layers):
         assert torch.equal(c1a[l], c1b[l]), f"C1 differs at layer {l}"
@@ -315,12 +315,12 @@ def test_compact_kv_seed_consistency():
         assert beta_diff < 1e-5, f"Beta differs too much at layer {l}: {beta_diff}"
 
     # Different seeds should produce different results
-    c1c, c2c, _ = compact_kv(keys, values, prompt_len=prompt_len, target_ratio=0.5,
-                              num_kv_heads=num_kv_heads, head_size=head_size,
-                              device=torch.device("cpu"), compact_window=20, seed=99)
-    c1d, c2d, _ = compact_kv(keys, values, prompt_len=prompt_len, target_ratio=0.5,
-                              num_kv_heads=num_kv_heads, head_size=head_size,
-                              device=torch.device("cpu"), compact_window=20, seed=200)
+    c1c, c2c, _, _ = compact_kv(keys, values, prompt_len=prompt_len, target_ratio=0.5,
+                                num_kv_heads=num_kv_heads, head_size=head_size,
+                                device=torch.device("cpu"), compact_window=20, seed=99)
+    c1d, c2d, _, _ = compact_kv(keys, values, prompt_len=prompt_len, target_ratio=0.5,
+                                num_kv_heads=num_kv_heads, head_size=head_size,
+                                device=torch.device("cpu"), compact_window=20, seed=200)
     any_diff = any(not torch.equal(c1c[l], c1d[l]) for l in range(num_layers))
     print(f"  Same seed: identical=True")
     print(f"  Different seeds: differs={any_diff}")

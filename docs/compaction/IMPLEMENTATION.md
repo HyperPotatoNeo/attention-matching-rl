@@ -27,14 +27,20 @@ src/prime_rl/inference/compaction/
 
 Per-layer vectorized Attention Matching across all KV heads simultaneously:
 
-1. **Attention scoring**: Random queries `Q` (H, 64, D) probe the full assistant KV.
-   Importance per prefix position = RMS attention weight across queries.
+1. **Full-context scoring**: Query probes `Q` score all keys (prompt + assistant) in a
+   single softmax. By default, 1024 seeded random Gaussian probes are used; with
+   `suffix_queries`, real post-RoPE query vectors from suffix tokens are used instead.
+   Prompt keys participate in the softmax denominator so window positions that compete
+   with strong prompt keys get appropriately lower importance scores.
+   Importance per window position = RMS attention weight across queries.
 
-2. **Top-k selection**: Keep `target_ratio` fraction of prefix keys per head.
-   Each head selects independently (different keys per head).
+2. **Top-k selection**: Keep `target_ratio` fraction of window keys per head.
+   Each head selects independently (different keys per head). When `forced_indices`
+   are provided (from inference), importance scoring and top-k selection are skipped
+   entirely — the exact indices from inference are reused.
 
-3. **C2 via least-squares**: Solve `softmax(Q @ C1^T [+ beta]) @ C2 = prefix_attn @ V_prefix`
-   so the compacted KV produces the same attention output as the original prefix.
+3. **C2 via least-squares**: Solve `softmax(Q @ C1^T [+ beta]) @ C2 = window_attn @ V_window`
+   so the compacted KV produces the same attention output as the original window.
 
 4. **NaN/extreme value handling**: `lstsq` can produce NaN from rank-deficient softmax
    (peaked betas). NaN entries fall back to original values. C2 is clamped to 2x the
@@ -51,8 +57,9 @@ Before:  [prompt | ========= 2048 assistant tokens =========]
 After:   [prompt | C1/C2 (128) | ---- suffix (1536) --------|
 ```
 
-Full-context scoring: even though only the prefix is compressed, attention scoring uses
-the full KV (prefix + suffix) so the algorithm accounts for redundancy with the suffix.
+Full-context scoring: the softmax denominator includes prompt keys, window keys, and suffix
+keys, so importance scores reflect each window key's true contribution relative to the
+entire sequence. Keys redundant with prompt or suffix content score lower.
 
 ### NNLS Beta Solver (`_solve_beta_nnls()`)
 
@@ -64,8 +71,10 @@ mismatch between full and compacted attention:
 - **NNLS**: `min ||M @ B - target||^2, B >= 0` via projected gradient descent (50 iters)
 - **Output**: `beta = log(B)` -- additive bias in log-space
 
-Beta is computed over the prefix keys only (not suffix), since suffix keys remain in
-attention without correction.
+The NNLS target partition function uses all keys (prompt + assistant) — `K_all_h`, not
+just window keys — since during decode, softmax runs over `[prompt, C1+beta, suffix, decoded]`.
+Using window-only keys produces beta that's too small (2.4x lower reward). Suffix keys
+remain in attention without beta correction.
 
 ## Beta Attention (`beta_attention.py`)
 
@@ -100,6 +109,79 @@ attn = softmax(scores)
 out = einsum(attn, V)
 ```
 Operates in float32 for numerical stability, casts output to model dtype.
+
+## Suffix Queries (`worker.py`: `_extract_suffix_queries()`)
+
+Instead of random N(0,I) probes, suffix queries use the real query vectors from the suffix
+tokens that already attend to every key in the compaction window. This grounds importance
+scoring in the model's actual attention patterns.
+
+### Extraction via inner Attention hooks
+
+The extraction is model-agnostic. It hooks on `vllm.model_executor.layers.attention.Attention`
+— the inner module that all architectures use — rather than any model-specific attention class.
+This module receives `(query, key, value)` as positional args after all model-specific
+transforms (qkv_proj, norms, RoPE) have been applied.
+
+```
+Model-specific layer (e.g. Qwen3Attention, LlamaAttention)
+  └─ qkv_proj → q_norm/k_norm → rotary_emb
+       └─ inner Attention.forward(query, key, value)   ← hook here
+```
+
+A `register_forward_pre_hook(with_kwargs=True)` on each inner Attention module captures the
+query tensor. Using `with_kwargs=True` handles architectures that may pass arguments either
+positionally or as kwargs.
+
+### Prefill pass
+
+Suffix tokens are at positions `[kv_len - suffix_len, kv_len)` in the KV cache. The prefill
+re-runs them at their original positions (`prefill_start = kv_len - suffix_len`, `seq_len = kv_len`)
+so queries get correct RoPE encoding. Since these positions already have KV entries, the pass
+overwrites them in-place (idempotent).
+
+### GQA head grouping
+
+For GQA models (e.g. Qwen3-4B: 32 attention heads, 8 KV heads), the captured queries are
+reshaped from `(suffix_len, num_attn_heads, head_dim)` into
+`(num_kv_heads, heads_per_group * suffix_len, head_dim)`. Each KV head gets
+`heads_per_group * suffix_len` query probes (e.g. 4 * suffix_len for Qwen3-4B).
+
+### Integration with `compact_kv()`
+
+When `suffix_queries` is provided, `compact_kv()` uses these instead of generating random
+Gaussian probes. The rest of the Attention Matching pipeline (importance scoring, top-k
+selection, C2 solve, optional beta) is unchanged.
+
+## Forced Indices (`algorithm.py`: `forced_indices`)
+
+When `forced_indices` is provided (per-layer `(H, target_len)` int64 tensors), `compact_kv()`
+skips importance scoring and top-k selection entirely, using the exact indices from inference.
+C2 values are still recomputed from the trainer's own KV cache — this is where gradients
+flow. Key selection is a discrete operation with no gradient, so recomputing it adds no value
+and creates a determinism risk (especially with suffix queries, where vLLM and HuggingFace
+produce numerically different query vectors).
+
+### Data flow: inference → trainer
+
+```
+Inference (worker.py)                    Trainer (compaction.py)
+─────────────────────                    ────────────────────────
+compact_kv()                             segmented_forward()
+  → importance scoring                     → extract KV from cache
+  → top-k selection                        → compact_kv(forced_indices=...)
+  → C2 solve                                 → SKIP importance & top-k
+  → returns c1, c2, beta, indices            → C2 solve (own KV, gradients)
+
+diagnostics.compaction_indices ──────→ extras.compaction_indices
+                               ──────→ TrainingSample.compaction_indices
+                               ──────→ MicroBatch.compaction_indices
+                               ──────→ segmented_forward(compaction_indices=...)
+```
+
+Indices are serialized as nested Python lists in diagnostics: `indices[event][layer]` =
+`list[list[int]]` (H × target_len). Size: ~5 MB per sequence with 9 compaction events
+(H=8, target_len=256, 36 layers).
 
 ## Worker (`worker.py`)
 

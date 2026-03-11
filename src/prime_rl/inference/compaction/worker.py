@@ -50,6 +50,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         max_kv_len: int | None = None,
         max_total_tokens: int | None = None,
         compute_beta: bool = False,
+        use_suffix_queries: bool = False,
     ) -> dict:
         """Generate text with KV cache compaction between segments.
 
@@ -304,13 +305,35 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             window = min(compact_window or asst_len, asst_len)
             suffix_len = asst_len - window
 
+            # Extract suffix query vectors for importance scoring
+            suffix_queries = None
+            if use_suffix_queries and suffix_len > 0:
+                suffix_start = prompt_len + window
+                suffix_ids = torch.tensor(
+                    all_token_ids[window:window + suffix_len],
+                    dtype=torch.long, device=device,
+                )
+                suffix_positions = torch.arange(
+                    suffix_start + position_offset,
+                    suffix_start + position_offset + suffix_len,
+                    dtype=torch.long, device=device,
+                )
+                suffix_queries = _extract_suffix_queries(
+                    model, suffix_ids, suffix_positions,
+                    kv_caches, my_blocks, kv_len,
+                    block_size, attn_layer_names,
+                    vllm_config, device,
+                    num_kv_heads, head_size,
+                )
+
             compact_seed = prompt_len * 10000 + segment
-            c1_list, c2_list, _ = compact_kv(
+            c1_list, c2_list, _, topk_indices_list = compact_kv(
                 keys, values, prompt_len, compact_target_ratio,
                 num_kv_heads, head_size, device,
                 compact_window=window,
                 compute_beta=compute_beta,
                 seed=compact_seed,
+                suffix_queries=suffix_queries,
             )
             algo_time = time.time() - t_algo
 
@@ -348,6 +371,9 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 "algo_time": round(algo_time, 3),
                 "inject_time": round(inject_time, 3),
                 "total_time": round(compact_time, 3),
+                "compaction_indices": [
+                    idx.cpu().tolist() for idx in topk_indices_list
+                ],
             }
             compaction_events.append(event)
 
@@ -395,6 +421,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         max_kv_len: int | None = None,
         max_total_tokens: int | None = None,
         compute_beta: bool = False,
+        use_suffix_queries: bool = False,
     ) -> list[dict]:
         """Generate B sequences simultaneously with KV compaction.
 
@@ -642,14 +669,37 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
 
                     asst_len = kv_len - prompt_lens[i]
                     window = min(compact_window or asst_len, asst_len)
+                    suffix_len_i = asst_len - window
+
+                    # Extract suffix queries for this sequence
+                    suffix_queries = None
+                    if use_suffix_queries and suffix_len_i > 0:
+                        suffix_start = prompt_lens[i] + window
+                        suffix_ids = torch.tensor(
+                            all_token_ids[i][window:window + suffix_len_i],
+                            dtype=torch.long, device=device,
+                        )
+                        suffix_positions = torch.arange(
+                            suffix_start + int(position_offsets[i].item()),
+                            suffix_start + int(position_offsets[i].item()) + suffix_len_i,
+                            dtype=torch.long, device=device,
+                        )
+                        suffix_queries = _extract_suffix_queries(
+                            model, suffix_ids, suffix_positions,
+                            kv_caches, per_seq_blocks[i], kv_len,
+                            block_size, attn_layer_names,
+                            vllm_config, device,
+                            num_kv_heads, head_size,
+                        )
 
                     compact_seed = prompt_lens[i] * 10000 + len(compaction_events[i])
-                    c1_list, c2_list, beta_list = compact_kv(
+                    c1_list, c2_list, beta_list, topk_indices_list = compact_kv(
                         keys, values, prompt_lens[i], compact_target_ratio,
                         num_kv_heads, head_size, device,
                         compact_window=window,
                         compute_beta=compute_beta,
                         seed=compact_seed,
+                        suffix_queries=suffix_queries,
                     )
 
                     compacted_prefix_len = c1_list[0].shape[0]
@@ -694,6 +744,9 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                         "extract_time": 0.0,
                         "inject_time": 0.0,
                         "total_time": round(compact_time, 3),
+                        "compaction_indices": [
+                            idx.cpu().tolist() for idx in topk_indices_list
+                        ],
                     })
 
         # Final flush for remaining tokens
@@ -908,26 +961,41 @@ def _run_prefill(
     model, input_ids, positions,
     seq_len, block_ids, block_size,
     attn_layer_names, vllm_config, device,
+    prefill_start: int = 0,
+    prefill_len: int | None = None,
 ) -> torch.Tensor:
-    """Run prefill forward pass (variable-length, not optimized for reuse)."""
+    """Run prefill forward pass (variable-length, not optimized for reuse).
+
+    Args:
+        prefill_start: Cache position where these tokens begin writing KV.
+            Default 0 (full prefill). For suffix-only prefill, set to kv_len
+            so the suffix tokens write after existing KV.
+        prefill_len: Number of tokens being prefilled. Default is seq_len.
+            For suffix-only prefill, this is the suffix length while seq_len
+            is the total KV length (prefix + suffix) for attention.
+    """
+    if prefill_len is None:
+        prefill_len = seq_len
+
+    # slot_mapping maps each INPUT token to its KV cache write position
     slots = []
-    for pos in range(seq_len):
+    for i in range(prefill_len):
+        pos = prefill_start + i
         block_idx = pos // block_size
         offset = pos % block_size
         slots.append(block_ids[block_idx] * block_size + offset)
 
     slot_mapping = torch.tensor(slots, dtype=torch.int64, device=device)
 
-    n_blocks = len(block_ids)
     block_table = torch.tensor(
         block_ids, dtype=torch.int32, device=device,
     ).unsqueeze(0)
 
     metadata = FlashAttentionMetadata(
-        num_actual_tokens=seq_len,
-        max_query_len=seq_len,
+        num_actual_tokens=prefill_len,
+        max_query_len=prefill_len,
         query_start_loc=torch.tensor(
-            [0, seq_len], dtype=torch.int32, device=device
+            [0, prefill_len], dtype=torch.int32, device=device
         ),
         max_seq_len=seq_len,
         seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=device),
@@ -947,7 +1015,7 @@ def _run_prefill(
         attn_metadata,
         vllm_config,
         virtual_engine=0,
-        num_tokens=seq_len,
+        num_tokens=prefill_len,
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
         slot_mapping=slot_mapping_dict,
     ):
@@ -1189,3 +1257,100 @@ def _inject_compacted_kv(
         kv = kv_caches[layer_idx]
         kv[0, bids] = K_padded.view(n_blocks, block_size, K.shape[1], K.shape[2])
         kv[1, bids] = V_padded.view(n_blocks, block_size, V.shape[1], V.shape[2])
+
+
+# ---------------------------------------------------------------------------
+# Suffix query extraction for real-query compaction
+# ---------------------------------------------------------------------------
+
+def _extract_suffix_queries(
+    model: Module,
+    suffix_token_ids: torch.Tensor,
+    suffix_positions: torch.Tensor,
+    kv_caches: list[torch.Tensor],
+    block_ids: list[int],
+    kv_len: int,
+    block_size: int,
+    attn_layer_names: list[str],
+    vllm_config,
+    device: torch.device,
+    num_kv_heads: int,
+    head_size: int,
+) -> list[torch.Tensor]:
+    """Extract query vectors from suffix tokens via a single prefill pass.
+
+    Hooks on each inner Attention layer (vllm.model_executor.layers.attention.Attention)
+    to capture the query tensor after all model-specific transforms (qkv_proj, norms, RoPE).
+    This is model-agnostic — works for any architecture that uses vLLM's Attention class.
+
+    Returns:
+        suffix_queries[layer]: (num_kv_heads, suffix_len * heads_per_group, head_size)
+    """
+    suffix_len = len(suffix_token_ids)
+    if suffix_len == 0:
+        return []
+
+    from vllm.model_executor.layers.attention.attention import Attention
+
+    # Find all inner Attention modules (the ones that receive q, k, v)
+    attn_modules = []
+    for _name, module in model.named_modules():
+        if isinstance(module, Attention):
+            attn_modules.append(module)
+
+    if not attn_modules:
+        logger.warning("No Attention modules found for suffix query extraction")
+        return []
+
+    num_layers = len(attn_modules)
+    captured_queries: dict[int, torch.Tensor] = {}
+
+    def _make_hook(layer_idx: int):
+        def hook_fn(module, args, kwargs):
+            # Attention.forward(self, query, key, value, ...)
+            q = args[0] if args else kwargs["query"]
+            # q shape: (suffix_len, num_heads * head_dim)
+            q = q.view(suffix_len, -1, head_size)
+            captured_queries[layer_idx] = q.detach().float()
+        return hook_fn
+
+    hooks = []
+    for layer_idx, module in enumerate(attn_modules):
+        handle = module.register_forward_pre_hook(
+            _make_hook(layer_idx), with_kwargs=True,
+        )
+        hooks.append(handle)
+
+    # Run prefill on suffix tokens, writing at their original KV positions.
+    suffix_cache_start = kv_len - suffix_len
+    try:
+        _run_prefill(
+            model, suffix_token_ids, suffix_positions,
+            seq_len=kv_len,
+            block_ids=block_ids,
+            block_size=block_size,
+            attn_layer_names=attn_layer_names,
+            vllm_config=vllm_config,
+            device=device,
+            prefill_start=suffix_cache_start,
+            prefill_len=suffix_len,
+        )
+    finally:
+        for h in hooks:
+            h.remove()
+
+    # Group attention heads into KV heads for GQA
+    result = []
+    for l in range(num_layers):
+        if l not in captured_queries:
+            result.append(torch.zeros(num_kv_heads, 0, head_size,
+                                      device=device, dtype=torch.float32))
+            continue
+        q = captured_queries[l]  # (suffix_len, num_attn_heads, head_dim)
+        num_attn_heads = q.shape[1]
+        heads_per_group = num_attn_heads // num_kv_heads
+        q = q.view(suffix_len, num_kv_heads, heads_per_group, head_size)
+        q = q.permute(1, 2, 0, 3).reshape(num_kv_heads, heads_per_group * suffix_len, head_size)
+        result.append(q)
+
+    return result

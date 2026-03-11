@@ -72,12 +72,14 @@ def compact_kv(
     num_kv_heads: int,
     head_size: int,
     device: torch.device,
-    num_queries: int = 64,
+    num_queries: int = 1024,
     compact_window: int | None = None,
     compute_beta: bool = False,
     beta_nnls_iters: int = 50,
     seed: int = 0,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor] | None]:
+    suffix_queries: list[torch.Tensor] | None = None,
+    forced_indices: list[torch.Tensor] | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor] | None, list[torch.Tensor]]:
     """Compact assistant KV prefix via Attention Matching.
 
     When compact_window is set, only the first `compact_window` assistant tokens
@@ -104,11 +106,22 @@ def compact_kv(
         seed: Deterministic random query seed. Seeded per-layer as
             seed + layer_idx. Ensures identical compaction between inference
             and training replay.
-
+        suffix_queries: Per-layer suffix query tensors for importance scoring.
+            Each tensor has shape (num_kv_heads, num_suffix_tokens, head_size)
+            in float32. When provided, these real queries from the suffix tokens
+            replace seeded random probes, giving exact importance scores.
+            Falls back to random queries if None or if a layer's tensor is empty.
+        forced_indices: Per-layer pre-computed top-k indices from inference.
+            Each tensor has shape (num_kv_heads, target_len) with int64 dtype.
+            When provided, skips importance scoring and top-k selection entirely.
+            C2 is still recomputed using the trainer's own KV cache for correct
+            gradients. Used to guarantee identical key selection between inference
+            and training when suffix queries produce numerical differences.
     Returns:
         c1[layer]: (target_len, num_kv_heads, head_size) - compacted prefix keys
         c2[layer]: (target_len, num_kv_heads, head_size) - compacted prefix values
         beta[layer] or None: (target_len, num_kv_heads) - per-key bias if compute_beta
+        indices[layer]: (num_kv_heads, target_len) - selected window-relative indices
     """
     num_layers = len(keys)
     dtype = keys[0].dtype
@@ -116,83 +129,90 @@ def compact_kv(
 
     c1_list, c2_list = [], []
     beta_list = [] if compute_beta else None
+    indices_list = []
 
     for layer_idx in range(num_layers):
-        asst_K = keys[layer_idx][prompt_len:]
-        asst_V = values[layer_idx][prompt_len:]
-        asst_len = asst_K.shape[0]
+        all_K = keys[layer_idx]  # (seq_len, H, D) — prompt + assistant
+        all_V = values[layer_idx]
+        seq_len = all_K.shape[0]
+        asst_len = seq_len - prompt_len
         window = min(compact_window or asst_len, asst_len)
         target_len = max(1, int(window * target_ratio))
 
-        # (num_kv_heads, asst_len, head_size) — heads-first for batched ops
-        K_h = asst_K.permute(1, 0, 2).float()
-        V_h = asst_V.permute(1, 0, 2).float()
-        Kp_h = K_h[:, :window, :]
+        window_start = prompt_len
+        window_end = prompt_len + window
+        suffix_len = asst_len - window
 
-        # Per-head random queries: (H, num_queries, head_size)
-        # Deterministic seeding ensures identical compaction in inference and training
-        g = torch.Generator(device=device)
-        g.manual_seed(seed + layer_idx)
-        Q = torch.randn(num_kv_heads, num_queries, head_size,
-                         device=device, dtype=torch.float32, generator=g)
+        # (H, seq_len, D) — heads-first for batched ops
+        K_all_h = all_K.permute(1, 0, 2).float()
+        V_all_h = all_V.permute(1, 0, 2).float()
+        Kw_h = K_all_h[:, window_start:window_end, :]  # (H, window, D)
 
-        # Batched attention: (H, Q, T) = (H, Q, D) @ (H, D, T)
-        full_scores = torch.bmm(Q, K_h.transpose(1, 2)) * scale
-        full_attn = torch.softmax(full_scores, dim=-1)  # (H, Q, T)
+        # Query probes: use suffix queries if available, else seeded random
+        if suffix_queries is not None and suffix_queries[layer_idx].shape[1] > 0:
+            Q = suffix_queries[layer_idx].to(device=device, dtype=torch.float32)
+        else:
+            g = torch.Generator(device=device)
+            g.manual_seed(seed + layer_idx)
+            Q = torch.randn(num_kv_heads, num_queries, head_size,
+                             device=device, dtype=torch.float32, generator=g)
 
-        # Importance scores per prefix position: RMS attention weight
-        prefix_attn = full_attn[:, :, :window]  # (H, Q, window)
-        importance = prefix_attn.pow(2).mean(dim=1).sqrt()  # (H, window)
+        # Attention over ALL keys (prompt + assistant) for full-context scoring
+        full_scores = torch.bmm(Q, K_all_h.transpose(1, 2)) * scale  # (H, Q, seq_len)
+        full_attn = torch.softmax(full_scores, dim=-1)
 
-        # Top-k selection per head
-        topk_indices = importance.topk(target_len, dim=-1).indices  # (H, target_len)
-        topk_indices = topk_indices.sort(dim=-1).values
+        # Window attention from full-context softmax (used for importance + C2 target)
+        window_attn = full_attn[:, :, window_start:window_end]  # (H, Q, window)
+
+        # Top-k selection: use forced indices or compute from importance scores
+        if forced_indices is not None:
+            topk_indices = forced_indices[layer_idx].to(device)  # (H, target_len)
+        else:
+            importance = window_attn.pow(2).mean(dim=1).sqrt()  # (H, window)
+            topk_indices = importance.topk(target_len, dim=-1).indices  # (H, target_len)
+            topk_indices = topk_indices.sort(dim=-1).values
+
+        indices_list.append(topk_indices)
 
         # Gather selected keys: (H, target_len, D)
         idx_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, head_size)
-        c1_h = torch.gather(Kp_h, 1, idx_expanded)
+        c1_h = torch.gather(Kw_h, 1, idx_expanded)
 
-        # Compute beta if requested
+        # Compute beta if requested (full keys for correct partition function)
         layer_beta = None
         if compute_beta:
-            # Use ALL assistant keys (window + suffix) for the target partition
-            # function. During decode, softmax runs over prompt + C1+beta + suffix
-            # + decoded tokens. Using only window keys produces beta that's too
-            # small, causing the model to under-attend to compacted context.
-            # The larger beta from full keys keeps compacted keys relevant.
-            # NaN safety nets (lines below) handle numerical edge cases.
-            layer_beta = _solve_beta_nnls(Q, K_h, c1_h, scale, iters=beta_nnls_iters)
-            # layer_beta: (H, target_len)
+            layer_beta = _solve_beta_nnls(Q, K_all_h, c1_h, scale, iters=beta_nnls_iters)
 
-        # Batched lstsq for C2 values
-        # Y = prefix_attn @ V_prefix: (H, Q, D)
-        Vp_h = V_h[:, :window, :]
-        Y = torch.bmm(prefix_attn, Vp_h)
-
-        # X = softmax(Q @ C1^T / sqrt(d) [+ beta]): (H, Q, target_len)
-        X = torch.bmm(Q, c1_h.transpose(1, 2)) * scale
+        # C2 target: window's contribution to full-context output.
+        # full_attn is conditioned on prompt (prompt keys are in the softmax
+        # denominator), so window positions that compete with strong prompt
+        # keys get appropriately lower weights. But we do NOT subtract
+        # prompt/suffix corrections — that embeds "anti-prompt" bias into C2
+        # which compounds across multiple compactions.
+        c1_scores = torch.bmm(Q, c1_h.transpose(1, 2)) * scale
         if layer_beta is not None:
-            X = X + layer_beta.unsqueeze(1)  # broadcast beta across queries
-        X = torch.softmax(X, dim=-1)
+            c1_scores = c1_scores + layer_beta.unsqueeze(1)
+
+        Vw_h = V_all_h[:, window_start:window_end, :]
+        Y = torch.bmm(window_attn, Vw_h)  # (H, Q, D)
+
+        X = torch.softmax(c1_scores, dim=-1)  # (H, Q, target_len)
 
         # Solve: X @ C2 ≈ Y → C2 = lstsq(X, Y)
         c2_h = torch.linalg.lstsq(X, Y).solution  # (H, target_len, D)
 
-        # lstsq produces NaN when X is rank-deficient (e.g., peaked softmax
-        # from large beta). Replace NaN entries with original values at
-        # selected positions — equivalent to no value optimization for those.
         nan_mask = torch.isnan(c2_h)
         if nan_mask.any():
-            c2_fallback = torch.gather(Vp_h, 1, idx_expanded)
+            c2_fallback = torch.gather(Vw_h, 1, idx_expanded)
             c2_h = torch.where(nan_mask, c2_fallback, c2_h)
 
-        # Clamp C2 to prevent extreme values from ill-conditioned lstsq.
-        v_absmax = Vp_h.abs().max().item() * 2.0 + 1.0
-        c2_h = c2_h.clamp(-v_absmax, v_absmax).to(dtype)  # (H, target_len, D)
+        # Clamp C2 to prevent extreme values from ill-conditioned lstsq
+        v_absmax = Vw_h.abs().max().item() * 2.0 + 1.0
+        c2_h = c2_h.clamp(-v_absmax, v_absmax).to(dtype)
 
         # Back to (target_len, H, D) format
         c1_out = torch.gather(
-            asst_K[:window],  # (window, H, D) in original dtype
+            all_K[window_start:window_end],
             0,
             topk_indices.permute(1, 0).unsqueeze(-1).expand(-1, -1, head_size),
         )
@@ -200,8 +220,7 @@ def compact_kv(
         c2_list.append(c2_h.permute(1, 0, 2).to(dtype))
 
         if compute_beta and layer_beta is not None:
-            # (target_len, H) for consistency with C1/C2 shape convention
             layer_beta = torch.nan_to_num(layer_beta, nan=0.0)
             beta_list.append(layer_beta.permute(1, 0).to(torch.float32))
 
-    return c1_list, c2_list, beta_list
+    return c1_list, c2_list, beta_list, indices_list

@@ -96,6 +96,7 @@ Generate text with mid-sequence KV cache compaction. Requests are transparently 
 | `max_kv_len` | `int\|null` | null | KV budget: compact when cache reaches this length |
 | `max_total_tokens` | `int\|null` | null | KV budget: stop after this many completion tokens |
 | `compute_beta` | `bool` | false | Compute NNLS beta bias for partition function correction |
+| `use_suffix_queries` | `bool` | false | Use suffix token attention queries instead of random probes for compaction |
 
 **Response:**
 
@@ -148,8 +149,11 @@ Training parameters:
 
 | Config | Purpose |
 |--------|---------|
-| `qwen3_4b_fullft_determ_nobeta.toml` | **Default** — 4+4 layout, deterministic, no beta |
-| `qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic) |
+| `qwen3_4b_fullft_determ_nobeta.toml` | **Default** — 4+4 layout, deterministic random queries, no beta |
+| `qwen3_4b_fullft_suffix_queries.toml` | Suffix queries — real query vectors instead of random probes |
+| `qwen3_4b_fullft_determ_suffix.toml` | Deterministic random queries + prompt keys (same as default) |
+| `qwen3_4b_fullft_fixed_1024q.toml` | 1024 random queries (matches new default `num_queries`) |
+| `qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic, legacy) |
 | `qwen3_4b_beta_test.toml` | Beta attention test (compute_beta=true) |
 | `qwen3_4b_fullft_baseline.toml` | Baseline training (no compaction) |
 | `qwen3_4b_serve_tp1.toml` | TP=1 compaction server |
@@ -162,6 +166,65 @@ Training parameters:
 | `scripts/start_4servers.sh` | 4 TP=1 servers on ports 8000-8003 |
 | `scripts/eval_rg_mix.py` | Evaluate on rg-mix-env |
 
+## Prompt Keys (Default Behavior)
+
+The compaction algorithm scores key importance using full-context attention: the softmax
+denominator includes **all** keys (prompt + assistant), not just assistant keys. This means
+window keys that are redundant with prompt content score lower and are more likely to be
+evicted. No flag needed — this is the default in `compact_kv()`.
+
+## Compaction Indices Passing
+
+During RL training, the trainer must replay compaction identically to inference. By default,
+deterministic seeded random queries ensure this. For suffix queries (which produce different
+Q vectors in vLLM vs HuggingFace due to numerical differences), the inference worker returns
+the exact top-k indices in `diagnostics.compaction_indices`. The trainer passes these as
+`forced_indices` to `compact_kv()`, skipping importance scoring entirely. C2 values are
+still recomputed from the trainer's KV cache for correct gradients.
+
+Data flow: `worker.compact_generate()` → `env.py` (extras) → `trajectories.py` →
+`TrainingSample` → `MicroBatch` → `segmented_forward(compaction_indices=...)`.
+
+## Suffix Queries
+
+By default, compaction uses random Gaussian probes to score key importance. With
+`use_suffix_queries=true`, the server instead extracts real query vectors from the
+suffix tokens that already attend to every key in the compaction window. This produces
+importance scores grounded in the model's actual attention patterns rather than random
+projections.
+
+### How it works
+
+1. Before compaction, a prefill pass re-runs the suffix tokens through the model
+2. Forward pre-hooks on vLLM's inner `Attention` layers capture the query tensors
+   (post-projection, post-RoPE) at every layer
+3. Queries are grouped by GQA KV head and used as probes in the Attention Matching algorithm
+
+This is model-agnostic — hooks target `vllm.model_executor.layers.attention.Attention`,
+which all architectures use.
+
+### Usage
+
+```bash
+# API: add use_suffix_queries to request body
+curl -X POST http://localhost:8000/compact_generate -d '{
+    "prompt_ids": [1, 2, 3],
+    "max_kv_len": 2048,
+    "max_total_tokens": 8192,
+    "n_compacts": 99,
+    "compact_target_ratio": 0.25,
+    "compact_window": 1024,
+    "use_suffix_queries": true
+}'
+
+# Eval script
+python scripts/eval_rg_mix.py \
+    --mode compaction --n 100 --batch-size 4 \
+    --max-kv-len 2048 --max-total-tokens 8192 \
+    --n-compacts 99 --compact-ratio 0.25 --compact-window 1024 \
+    --use-suffix-queries
+```
+
 ## Eval Results (Qwen3-4B base, rg-mix-env, 100 problems)
 
 | Configuration | Accuracy | Avg Tokens | Throughput |
@@ -170,5 +233,9 @@ Training parameters:
 | Partial compaction (ratio=0.25, window=512) | 13.0% | ~7400 | -- |
 | KV budget (w=1024, ratio=0.25, 8k total) | 16.0% | ~7855 | 440 tok/s |
 | KV budget batched (B=4, same params) | 9.0% | ~7890 | 616 tok/s |
+| KV budget + suffix queries (B=4, same params) | 13.0% | ~7875 | 1067 tok/s |
+| KV budget + random queries (B=4, same params) | 10.0% | ~7830 | 1321 tok/s |
 
-The accuracy gap is what RL training aims to close.
+Suffix queries give +3% accuracy over random probes at the cost of ~20% slower wall time
+(extra prefill pass per compaction event, ~0.8s vs ~0.3s algo time). The accuracy gap
+between compaction and baseline is what RL training aims to close.

@@ -40,6 +40,7 @@ class CompactionEnv(vf.SingleTurnEnv):
         max_kv_len: int | None = None,
         max_total_tokens: int | None = None,
         compute_beta: bool = False,
+        use_suffix_queries: bool = False,
         **kwargs,
     ):
         self.inner_env = inner_env
@@ -51,7 +52,9 @@ class CompactionEnv(vf.SingleTurnEnv):
         self.compact_max_kv_len = max_kv_len
         self.compact_max_total_tokens = max_total_tokens
         self.compute_beta = compute_beta
+        self.use_suffix_queries = use_suffix_queries
         self._last_segment_boundaries: list[int] | None = None
+        self._last_compaction_indices: list | None = None
 
         super().__init__(
             dataset=inner_env.dataset,
@@ -128,6 +131,8 @@ class CompactionEnv(vf.SingleTurnEnv):
                 request_body["max_total_tokens"] = self.compact_max_total_tokens
             if self.compute_beta:
                 request_body["compute_beta"] = True
+            if self.use_suffix_queries:
+                request_body["use_suffix_queries"] = True
 
             resp = await http_client.post(
                 f"{server_url}/compact_generate",
@@ -142,6 +147,10 @@ class CompactionEnv(vf.SingleTurnEnv):
 
         diagnostics = result.get("diagnostics", {})
         self._last_segment_boundaries = diagnostics.get("segment_boundaries")
+        events = diagnostics.get("compaction_events", [])
+        self._last_compaction_indices = [
+            e.get("compaction_indices") for e in events
+        ] if events else None
 
         tokens = ResponseTokens(
             prompt_ids=prompt_ids,
@@ -180,7 +189,10 @@ class CompactionEnv(vf.SingleTurnEnv):
         if self._last_segment_boundaries is not None:
             last_step = state["trajectory"][-1]
             last_step["extras"]["segment_boundaries"] = self._last_segment_boundaries
+            if self._last_compaction_indices is not None:
+                last_step["extras"]["compaction_indices"] = self._last_compaction_indices
             self._last_segment_boundaries = None
+            self._last_compaction_indices = None
 
 
 def load_environment(
@@ -193,6 +205,7 @@ def load_environment(
     max_kv_len: int | None = None,
     max_total_tokens: int | None = None,
     compute_beta: bool = False,
+    use_suffix_queries: bool = False,
     **inner_env_kwargs,
 ) -> CompactionEnv:
     """Load a CompactionEnv wrapping the specified gym environment.
@@ -210,4 +223,5 @@ def load_environment(
         max_kv_len=max_kv_len,
         max_total_tokens=max_total_tokens,
         compute_beta=compute_beta,
+        use_suffix_queries=use_suffix_queries,
     )

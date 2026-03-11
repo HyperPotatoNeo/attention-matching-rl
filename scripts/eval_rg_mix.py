@@ -129,6 +129,8 @@ def run_compaction_one(problem, port, tokenizer, args):
         body["max_kv_len"] = args.max_kv_len
     if args.max_total_tokens is not None:
         body["max_total_tokens"] = args.max_total_tokens
+    if args.use_suffix_queries:
+        body["use_suffix_queries"] = True
     resp = client.post("/compact_generate", json=body)
     elapsed = time.time() - t0
     resp.raise_for_status()
@@ -173,6 +175,8 @@ def run_compaction_batch(problems, port, tokenizer, args):
         body["max_kv_len"] = args.max_kv_len
     if args.max_total_tokens is not None:
         body["max_total_tokens"] = args.max_total_tokens
+    if args.use_suffix_queries:
+        body["use_suffix_queries"] = True
     resp = client.post("/compact_generate_batch", json=body)
     elapsed = time.time() - t0
     resp.raise_for_status()
@@ -243,6 +247,8 @@ def main():
                         help="Comma-separated ports for DP (compaction mode)")
     parser.add_argument("--batch-size", type=int, default=1,
                         help="Requests per server (>1 uses batch endpoint)")
+    parser.add_argument("--use-suffix-queries", action="store_true",
+                        help="Use suffix queries instead of random probes for compaction")
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
@@ -274,6 +280,7 @@ def main():
             print(f"  segments of {args.max_tokens_per_segment} tokens, "
                   f"{args.n_compacts} compactions")
         print(f"  ratio={args.compact_ratio}, window={args.compact_window}")
+        print(f"  suffix_queries={args.use_suffix_queries}")
         print(f"  DP={len(ports)} (ports: {ports})")
     print()
 
@@ -545,6 +552,7 @@ def main():
             "max_tokens_per_segment": args.max_tokens_per_segment,
             "n_compacts": args.n_compacts,
             "compact_ratio": args.compact_ratio,
+            "use_suffix_queries": args.use_suffix_queries,
             "temperature": 0.6,
             "seed": args.seed,
         },

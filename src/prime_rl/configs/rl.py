@@ -717,6 +717,15 @@ class RLConfig(BaseConfig):
                 break
         return self
 
+    @model_validator(mode="after")
+    def auto_setup_use_suffix_queries(self):
+        """Sync use_suffix_queries from env args to trainer config."""
+        for env in self.orchestrator.env:
+            if env.args.get("use_suffix_queries", False):
+                self.trainer.use_suffix_queries = True
+                break
+        return self
+
     ### Warnings
 
     @model_validator(mode="after")
