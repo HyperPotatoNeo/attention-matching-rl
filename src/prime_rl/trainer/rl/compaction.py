@@ -271,7 +271,7 @@ def segmented_forward(
     temperature: Tensor,
     max_forward_passes: int | None = None,
     compute_beta: bool = False,
-    use_suffix_queries: bool = False,
+    use_suffix_queries: bool = True,
     compaction_indices: list | None = None,
 ) -> dict[str, Tensor]:
     """Run segmented forward passes with compaction replay between segments.

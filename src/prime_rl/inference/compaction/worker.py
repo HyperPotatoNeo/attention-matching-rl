@@ -50,7 +50,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         max_kv_len: int | None = None,
         max_total_tokens: int | None = None,
         compute_beta: bool = False,
-        use_suffix_queries: bool = False,
+        use_suffix_queries: bool = True,
     ) -> dict:
         """Generate text with KV cache compaction between segments.
 
@@ -421,7 +421,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         max_kv_len: int | None = None,
         max_total_tokens: int | None = None,
         compute_beta: bool = False,
-        use_suffix_queries: bool = False,
+        use_suffix_queries: bool = True,
     ) -> list[dict]:
         """Generate B sequences simultaneously with KV compaction.
 

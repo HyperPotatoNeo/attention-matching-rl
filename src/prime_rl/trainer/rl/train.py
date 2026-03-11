@@ -402,7 +402,7 @@ def train(config: TrainerConfig):
                         temperature=temperatures,
                         max_forward_passes=max_forwards,
                         compute_beta=getattr(config, "compute_beta", False),
-                        use_suffix_queries=getattr(config, "use_suffix_queries", False),
+                        use_suffix_queries=getattr(config, "use_suffix_queries", True),
                         compaction_indices=micro_batch.get("compaction_indices"),
                     )
                 else:

@@ -33,7 +33,7 @@ class CompactGenerateRequest(BaseModel):
     max_kv_len: int | None = None
     max_total_tokens: int | None = None
     compute_beta: bool = False
-    use_suffix_queries: bool = False
+    use_suffix_queries: bool = True
 
 
 class CompactGenerateBatchRequest(BaseModel):
@@ -48,7 +48,7 @@ class CompactGenerateBatchRequest(BaseModel):
     max_kv_len: int | None = None
     max_total_tokens: int | None = None
     compute_beta: bool = False
-    use_suffix_queries: bool = False
+    use_suffix_queries: bool = True
 
 
 class _RequestBatcher:

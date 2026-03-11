@@ -40,7 +40,7 @@ class CompactionEnv(vf.SingleTurnEnv):
         max_kv_len: int | None = None,
         max_total_tokens: int | None = None,
         compute_beta: bool = False,
-        use_suffix_queries: bool = False,
+        use_suffix_queries: bool = True,
         **kwargs,
     ):
         self.inner_env = inner_env
@@ -205,7 +205,7 @@ def load_environment(
     max_kv_len: int | None = None,
     max_total_tokens: int | None = None,
     compute_beta: bool = False,
-    use_suffix_queries: bool = False,
+    use_suffix_queries: bool = True,
     **inner_env_kwargs,
 ) -> CompactionEnv:
     """Load a CompactionEnv wrapping the specified gym environment.
