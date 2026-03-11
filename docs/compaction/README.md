@@ -96,7 +96,7 @@ Generate text with mid-sequence KV cache compaction. Requests are transparently 
 | `max_kv_len` | `int\|null` | null | KV budget: compact when cache reaches this length |
 | `max_total_tokens` | `int\|null` | null | KV budget: stop after this many completion tokens |
 | `compute_beta` | `bool` | false | Compute NNLS beta bias for partition function correction |
-| `use_suffix_queries` | `bool` | false | Use suffix token attention queries instead of random probes for compaction |
+| `use_suffix_queries` | `bool` | true | Use suffix token attention queries instead of random probes |
 
 **Response:**
 
@@ -126,11 +126,12 @@ Generate text with mid-sequence KV cache compaction. Requests are transparently 
 
 ## Training
 
-Default: 2-node, 4+4 layout (4 inference + 4 trainer GPUs). Compaction is deterministic
-by default (seeded random queries ensure identical compaction between inference and training).
+Default: 2-node, 4+4 layout (4 inference + 4 trainer GPUs). Uses suffix queries for
+key importance scoring with forced indices passed from inference to trainer, ensuring
+identical key selection despite numerical differences between vLLM and HuggingFace.
 
 ```bash
-sbatch -A m5017 -C "gpu&hbm80g" --qos=premium --time 48:00:00 --gpus-per-node 4 --nodes=2 ~/compaction_determ_nobeta.sh
+sbatch -A m5017 -C "gpu&hbm80g" --qos=premium --time 48:00:00 --gpus-per-node 4 --nodes=2 ~/compaction_suffix_queries.sh
 ```
 
 Architecture:
@@ -143,16 +144,17 @@ Training parameters:
 - Full fine-tune (no LoRA), lr=1e-6, AdamW with CPU offload
 - KV budget: max_kv_len=2048, compact_window=1024, ratio=0.25, max_total_tokens=8192
 - batch_size=256, rollouts_per_example=8, seq_len=9216
-- Checkpoints every 50 steps, auto-resume with `resume_step = -1`
+- Suffix queries + forced indices (default), no beta
+- Checkpoints every 10 steps, auto-resume with `resume_step = -1`
 
 ## Configs
 
 | Config | Purpose |
 |--------|---------|
-| `qwen3_4b_fullft_determ_nobeta.toml` | **Default** — 4+4 layout, deterministic random queries, no beta |
-| `qwen3_4b_fullft_suffix_queries.toml` | Suffix queries — real query vectors instead of random probes |
-| `qwen3_4b_fullft_determ_suffix.toml` | Deterministic random queries + prompt keys (same as default) |
-| `qwen3_4b_fullft_fixed_1024q.toml` | 1024 random queries (matches new default `num_queries`) |
+| `qwen3_4b_fullft_suffix_queries.toml` | **Default** — 4+4 layout, suffix queries + forced indices, no beta |
+| `qwen3_4b_fullft_determ_nobeta.toml` | Random queries, deterministic compaction, no beta |
+| `qwen3_4b_fullft_determ_suffix.toml` | Deterministic random queries + prompt keys |
+| `qwen3_4b_fullft_fixed_1024q.toml` | 1024 random queries |
 | `qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic, legacy) |
 | `qwen3_4b_beta_test.toml` | Beta attention test (compute_beta=true) |
 | `qwen3_4b_fullft_baseline.toml` | Baseline training (no compaction) |
@@ -162,7 +164,7 @@ Training parameters:
 
 | Script | Purpose |
 |--------|---------|
-| `~/compaction_determ_nobeta.sh` | **Default launch** — 2-node sbatch |
+| `~/compaction_suffix_queries.sh` | **Default launch** — 2-node sbatch (suffix queries + forced indices) |
 | `scripts/start_4servers.sh` | 4 TP=1 servers on ports 8000-8003 |
 | `scripts/eval_rg_mix.py` | Evaluate on rg-mix-env |
 
@@ -225,17 +227,26 @@ python scripts/eval_rg_mix.py \
     --use-suffix-queries
 ```
 
-## Eval Results (Qwen3-4B base, rg-mix-env, 100 problems)
+## Eval Results (Qwen3-4B base, rg-mix-env)
+
+### Compression sweep (200 problems, max_kv_len=2048, max_total_tokens=8192, window=1024)
+
+| Compression | Random Queries | Suffix Queries | Delta |
+|-------------|---------------|----------------|-------|
+| 1024 → 256 (25%) | 14.5% | 14.5% | 0.0% |
+| 1024 → 128 (12.5%) | 13.0% | 13.0% | 0.0% |
+| 1024 → 64 (6.25%) | 13.5% | 14.0% | +0.5% |
+| 1024 → 32 (3.1%) | 14.0% | **17.0%** | **+3.0%** |
+
+Suffix queries provide increasing benefit at higher compression. At 97% compression
+(1024→32), suffix queries give +3% accuracy, driven by reasoning tasks (countdown +9.4%,
+sokoban +7.3%). At mild compression the two modes are equivalent.
+
+### Baseline comparison (100 problems)
 
 | Configuration | Accuracy | Avg Tokens | Throughput |
 |---------------|----------|------------|------------|
 | Baseline (8192 tokens, no compaction) | 15.0% | ~5000 | 213 tok/s |
-| Partial compaction (ratio=0.25, window=512) | 13.0% | ~7400 | -- |
 | KV budget (w=1024, ratio=0.25, 8k total) | 16.0% | ~7855 | 440 tok/s |
-| KV budget batched (B=4, same params) | 9.0% | ~7890 | 616 tok/s |
-| KV budget + suffix queries (B=4, same params) | 13.0% | ~7875 | 1067 tok/s |
-| KV budget + random queries (B=4, same params) | 10.0% | ~7830 | 1321 tok/s |
 
-Suffix queries give +3% accuracy over random probes at the cost of ~20% slower wall time
-(extra prefill pass per compaction event, ~0.8s vs ~0.3s algo time). The accuracy gap
-between compaction and baseline is what RL training aims to close.
+See `reports/compression_sweep.md` for the full experiment report.

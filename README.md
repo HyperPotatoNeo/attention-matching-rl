@@ -83,7 +83,7 @@ Weight broadcast via Lustre filesystem. Containers use `--net=host` for cross-no
 
 ```bash
 sbatch -A m5017 -C "gpu&hbm80g" --qos=premium --time 48:00:00 \
-    --gpus-per-node 4 --nodes=2 ~/compaction_determ_nobeta.sh
+    --gpus-per-node 4 --nodes=2 ~/compaction_suffix_queries.sh
 ```
 
 The launch script handles container setup, config resolution (replacing `__INFERENCE_NODE__` placeholder), inference server health checks, and trainer startup.
@@ -111,8 +111,9 @@ The launch script handles container setup, config resolution (replacing `__INFER
 
 | Config | Purpose |
 |--------|---------|
-| `qwen3_4b_fullft_determ_nobeta.toml` | **Default** — 4+4 layout, deterministic compaction, no beta |
-| `qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic) |
+| `qwen3_4b_fullft_suffix_queries.toml` | **Default** — 4+4 layout, suffix queries + forced indices, no beta |
+| `qwen3_4b_fullft_determ_nobeta.toml` | Random queries, deterministic compaction, no beta |
+| `qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic, legacy) |
 | `qwen3_4b_beta_test.toml` | Beta attention test (compute_beta=true) |
 | `qwen3_4b_fullft_baseline.toml` | Baseline training (no compaction) |
 | `qwen3_4b_serve_tp1.toml` | TP=1 compaction server |
