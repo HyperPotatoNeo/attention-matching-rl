@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-MAX_BATCH_SIZE = 8
+MAX_BATCH_SIZE = 32
 MAX_WAIT_SECONDS = 1.0
 
 
