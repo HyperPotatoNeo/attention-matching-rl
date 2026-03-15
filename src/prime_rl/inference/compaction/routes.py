@@ -34,6 +34,8 @@ class CompactGenerateRequest(BaseModel):
     max_total_tokens: int | None = None
     compute_beta: bool = False
     use_suffix_queries: bool = True
+    inject_budget_message: bool = False
+    budget_message_template: str = "Budget: {used}/{total} tokens generated. ~{remaining} tokens remaining."
 
 
 class CompactGenerateBatchRequest(BaseModel):
@@ -49,6 +51,8 @@ class CompactGenerateBatchRequest(BaseModel):
     max_total_tokens: int | None = None
     compute_beta: bool = False
     use_suffix_queries: bool = True
+    inject_budget_message: bool = False
+    budget_message_template: str = "Budget: {used}/{total} tokens generated. ~{remaining} tokens remaining."
 
 
 class _RequestBatcher:
@@ -140,6 +144,8 @@ class _RequestBatcher:
                 "max_total_tokens": first_body.max_total_tokens,
                 "compute_beta": first_body.compute_beta,
                 "use_suffix_queries": first_body.use_suffix_queries,
+                "inject_budget_message": first_body.inject_budget_message,
+                "budget_message_template": first_body.budget_message_template,
             },
         )
 
@@ -202,6 +208,8 @@ async def compact_generate_batch(body: CompactGenerateBatchRequest, request: Req
             "max_kv_len": body.max_kv_len,
             "max_total_tokens": body.max_total_tokens,
             "use_suffix_queries": body.use_suffix_queries,
+            "inject_budget_message": body.inject_budget_message,
+            "budget_message_template": body.budget_message_template,
         },
     )
 

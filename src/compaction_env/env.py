@@ -41,6 +41,8 @@ class CompactionEnv(vf.SingleTurnEnv):
         max_total_tokens: int | None = None,
         compute_beta: bool = False,
         use_suffix_queries: bool = True,
+        inject_budget_message: bool = False,
+        budget_message_template: str = "Budget: {used}/{total} tokens generated. ~{remaining} tokens remaining.",
         **kwargs,
     ):
         self.inner_env = inner_env
@@ -53,8 +55,11 @@ class CompactionEnv(vf.SingleTurnEnv):
         self.compact_max_total_tokens = max_total_tokens
         self.compute_beta = compute_beta
         self.use_suffix_queries = use_suffix_queries
+        self.inject_budget_message = inject_budget_message
+        self.budget_message_template = budget_message_template
         self._last_segment_boundaries: list[int] | None = None
         self._last_compaction_indices: list | None = None
+        self._last_inject_ranges: list[tuple[int, int]] | None = None
 
         super().__init__(
             dataset=inner_env.dataset,
@@ -133,6 +138,9 @@ class CompactionEnv(vf.SingleTurnEnv):
                 request_body["compute_beta"] = True
             if self.use_suffix_queries:
                 request_body["use_suffix_queries"] = True
+            if self.inject_budget_message:
+                request_body["inject_budget_message"] = True
+                request_body["budget_message_template"] = self.budget_message_template
 
             resp = await http_client.post(
                 f"{server_url}/compact_generate",
@@ -152,11 +160,19 @@ class CompactionEnv(vf.SingleTurnEnv):
             e.get("compaction_indices") for e in events
         ] if events else None
 
+        # Build completion_mask: 0 for injected budget tokens, 1 for model-generated
+        raw_inject_ranges = diagnostics.get("inject_ranges", [])
+        self._last_inject_ranges = [(s, e) for s, e in raw_inject_ranges] if raw_inject_ranges else None
+        completion_mask = [1] * len(all_token_ids)
+        for start, end in raw_inject_ranges:
+            for idx in range(start, min(end, len(all_token_ids))):
+                completion_mask[idx] = 0
+
         tokens = ResponseTokens(
             prompt_ids=prompt_ids,
             prompt_mask=[0] * len(prompt_ids),
             completion_ids=all_token_ids,
-            completion_mask=[1] * len(all_token_ids),
+            completion_mask=completion_mask,
             completion_logprobs=all_logprobs,
             routed_experts=None,
         )
@@ -206,6 +222,8 @@ def load_environment(
     max_total_tokens: int | None = None,
     compute_beta: bool = False,
     use_suffix_queries: bool = True,
+    inject_budget_message: bool = False,
+    budget_message_template: str = "Budget: {used}/{total} tokens generated. ~{remaining} tokens remaining.",
     **inner_env_kwargs,
 ) -> CompactionEnv:
     """Load a CompactionEnv wrapping the specified gym environment.
@@ -224,4 +242,6 @@ def load_environment(
         max_total_tokens=max_total_tokens,
         compute_beta=compute_beta,
         use_suffix_queries=use_suffix_queries,
+        inject_budget_message=inject_budget_message,
+        budget_message_template=budget_message_template,
     )

@@ -1,0 +1,66 @@
+# Compaction Full FT Training — Budget Injection (4-4 config)
+# Same as determ-nobeta but with inject_budget_message=true.
+# 2-node: Node 1 = 4 inference (TP=1), Node 2 = 4 trainer (FSDP2)
+#
+# __INFERENCE_NODE__ is replaced by the launch script.
+
+max_steps = 600
+seq_len = 9216
+output_dir = "outputs/compaction-fullft-inject-budget"
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[wandb]
+project = "compaction-rl"
+name = "compaction-fullft-inject-budget"
+
+[ckpt]
+interval = 30
+resume_step = -1
+
+[deployment]
+num_train_gpus = 4
+num_infer_gpus = 0
+
+[trainer]
+dist_timeout_seconds = 3600
+compact_target_ratio = 0.25
+compact_window = 1024
+
+[trainer.model]
+impl = "auto"
+optim_cpu_offload = true
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+
+[trainer.loss]
+type = "default"
+
+[orchestrator]
+batch_size = 256
+rollouts_per_example = 8
+
+# 4 inference servers on Node 1
+[orchestrator.client]
+base_url = [
+    "http://__INFERENCE_NODE__:8000/v1",
+    "http://__INFERENCE_NODE__:8001/v1",
+    "http://__INFERENCE_NODE__:8002/v1",
+    "http://__INFERENCE_NODE__:8003/v1",
+]
+
+[orchestrator.sampling]
+max_tokens = 8192
+
+[[orchestrator.env]]
+id = "compaction_env"
+name = "compaction-rg-mix"
+args = { gym = "rg_mix_env", max_seq_len = 9216, max_kv_len = 2048, max_total_tokens = 8192, compact_target_ratio = 0.25, compact_window = 1024, n_compacts = 99, inject_budget_message = true, dataset_path = "/pscratch/sd/s/siddart2/datasets/rg_mix_7500", num_train_examples = 7500, num_eval_examples = 100 }

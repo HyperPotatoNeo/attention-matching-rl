@@ -172,11 +172,17 @@ def compact_kv(
             topk_indices = importance.topk(target_len, dim=-1).indices  # (H, target_len)
             topk_indices = topk_indices.sort(dim=-1).values
 
+        # Clamp all indices to window bounds — inject tokens can shift the
+        # effective window between inference and training replay, and async
+        # CUDA errors from OOB gathers are hard to diagnose.
+        topk_indices = topk_indices.clamp(min=0, max=max(window - 1, 0))
+
         indices_list.append(topk_indices)
 
         # Gather selected keys: (H, target_len, D)
         idx_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, head_size)
-        c1_h = torch.gather(Kw_h, 1, idx_expanded)
+        idx_clamped = idx_expanded.clamp(min=0, max=max(Kw_h.shape[1] - 1, 0))
+        c1_h = torch.gather(Kw_h, 1, idx_clamped)
 
         # Compute beta if requested (full keys for correct partition function)
         layer_beta = None
@@ -198,29 +204,25 @@ def compact_kv(
 
         X = torch.softmax(c1_scores, dim=-1)  # (H, Q, target_len)
 
-        # Solve: X @ C2 ≈ Y → C2 = lstsq(X, Y)
-        c2_h = torch.linalg.lstsq(X, Y).solution  # (H, target_len, D)
-
-        nan_mask = torch.isnan(c2_h)
-        if nan_mask.any():
-            c2_fallback = torch.gather(Vw_h, 1, idx_expanded)
-            c2_h = torch.where(nan_mask, c2_fallback, c2_h)
-
-        # Clamp C2 to prevent extreme values from ill-conditioned lstsq
-        v_absmax = Vw_h.abs().max().item() * 2.0 + 1.0
-        c2_h = c2_h.clamp(-v_absmax, v_absmax).to(dtype)
+        # Solve C2 via ridge regression: (X^T X + λI) C2 = X^T Y
+        # lstsq's gels driver (CUDA) assumes full-rank X and crashes when
+        # special tokens create peaked attention → near-rank-deficient X.
+        # Ridge regression handles arbitrary conditioning by construction.
+        lambda_reg = 1e-4
+        XtX = torch.bmm(X.transpose(1, 2), X)  # (H, target_len, target_len)
+        XtX.diagonal(dim1=-2, dim2=-1).add_(lambda_reg)
+        XtY = torch.bmm(X.transpose(1, 2), Y)  # (H, target_len, D)
+        c2_h = torch.linalg.solve(XtX, XtY).to(dtype)  # (H, target_len, D)
 
         # Back to (target_len, H, D) format
-        c1_out = torch.gather(
-            all_K[window_start:window_end],
-            0,
-            topk_indices.permute(1, 0).unsqueeze(-1).expand(-1, -1, head_size),
-        )
+        window_K = all_K[window_start:window_end]
+        c1_idx = topk_indices.permute(1, 0).unsqueeze(-1).expand(-1, -1, head_size)
+        c1_idx = c1_idx.clamp(max=window_K.shape[0] - 1)
+        c1_out = torch.gather(window_K, 0, c1_idx)
         c1_list.append(c1_out)
         c2_list.append(c2_h.permute(1, 0, 2).to(dtype))
 
         if compute_beta and layer_beta is not None:
-            layer_beta = torch.nan_to_num(layer_beta, nan=0.0)
             beta_list.append(layer_beta.permute(1, 0).to(torch.float32))
 
     return c1_list, c2_list, beta_list, indices_list

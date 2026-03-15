@@ -35,6 +35,12 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
             teacher_logprobs = teacher_logprobs[:seq_len]
         if routed_experts is not None:
             routed_experts = routed_experts[:seq_len]
+        if training_example.segment_boundaries is not None:
+            max_completion = seq_len - len(training_example.prompt_ids)
+            training_example = copy.copy(training_example)
+            training_example.segment_boundaries = [
+                min(b, max_completion) for b in training_example.segment_boundaries
+            ]
 
     assert (
         len(input_ids)

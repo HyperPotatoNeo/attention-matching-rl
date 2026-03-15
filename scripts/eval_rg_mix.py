@@ -45,8 +45,25 @@ TASK_VARIANTS = [
 SYSTEM_PROMPT = SYSTEM_PROMPTS["default"]
 
 
-def generate_dataset(n: int, seed: int = 42):
+def generate_dataset(n: int, seed: int = 42, task_filter: str | None = None):
     """Generate n rg-mix problems with inverse-difficulty weighting."""
+    if task_filter:
+        variant = next(v for v in TASK_VARIANTS if v["id"] == task_filter)
+        ds = rg.create_dataset(
+            variant["task"], seed=seed + 1, size=n, **variant["config"],
+        )
+        problems = []
+        for i in range(n):
+            entry = ds[i % len(ds)]
+            problems.append({
+                "idx": i,
+                "task": variant["id"],
+                "question": entry["question"],
+                "entry": entry,
+                "dataset": ds,
+            })
+        return problems
+
     weights = [1.0 / v["pass_at_1"] for v in TASK_VARIANTS]
     rng = random.Random(seed)
 
@@ -131,6 +148,8 @@ def run_compaction_one(problem, port, tokenizer, args):
         body["max_total_tokens"] = args.max_total_tokens
     if args.use_suffix_queries:
         body["use_suffix_queries"] = True
+    if getattr(args, "inject_budget_message", False):
+        body["inject_budget_message"] = True
     resp = client.post("/compact_generate", json=body)
     elapsed = time.time() - t0
     resp.raise_for_status()
@@ -177,6 +196,8 @@ def run_compaction_batch(problems, port, tokenizer, args):
         body["max_total_tokens"] = args.max_total_tokens
     if args.use_suffix_queries:
         body["use_suffix_queries"] = True
+    if getattr(args, "inject_budget_message", False):
+        body["inject_budget_message"] = True
     resp = client.post("/compact_generate_batch", json=body)
     elapsed = time.time() - t0
     resp.raise_for_status()
@@ -245,17 +266,28 @@ def main():
                         help="KV budget mode: stop after this many total completion tokens")
     parser.add_argument("--ports", default="8000,8001,8002,8003",
                         help="Comma-separated ports for DP (compaction mode)")
-    parser.add_argument("--batch-size", type=int, default=1,
-                        help="Requests per server (>1 uses batch endpoint)")
+    parser.add_argument("--batch-size", type=int, default=32,
+                        help="Requests per server for concurrent processing")
     parser.add_argument("--use-suffix-queries", action="store_true",
                         help="Use suffix queries instead of random probes for compaction")
+    parser.add_argument("--task-filter", default=None,
+                        help="Only generate problems from this task ID (e.g. sokoban_hard)")
+    parser.add_argument("--start-idx", type=int, default=0,
+                        help="Skip first N problems (for resuming partial runs)")
+    parser.add_argument("--inject-budget-message", action="store_true",
+                        help="Inject user budget messages after each compaction")
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
     ports = [int(p) for p in args.ports.split(",")]
 
     print(f"Generating {args.n} rg-mix problems (seed={args.seed})...")
-    problems = generate_dataset(args.n, args.seed)
+    problems = generate_dataset(args.n, args.seed, task_filter=args.task_filter)
+    if args.start_idx > 0:
+        print(f"Skipping first {args.start_idx} problems...")
+        problems = problems[args.start_idx:]
+        for i, p in enumerate(problems):
+            p["idx"] = args.start_idx + i
 
     task_dist = defaultdict(int)
     for p in problems:
@@ -282,12 +314,12 @@ def main():
         print(f"  ratio={args.compact_ratio}, window={args.compact_window}")
         print(f"  suffix_queries={args.use_suffix_queries}")
         print(f"  DP={len(ports)} (ports: {ports})")
+    else:
+        print(f"  DP={len(ports)} (ports: {ports})")
     print()
 
     # Health check
-    check_port = ports[0] if args.mode == "compaction" else int(
-        args.server_url.rsplit(":", 1)[-1].split("/")[0]
-    )
+    check_port = ports[0]
     health = httpx.get(f"http://localhost:{check_port}/health", timeout=10.0)
     health.raise_for_status()
     print("Server health: OK\n")
@@ -426,35 +458,57 @@ def main():
                         f"({total_correct/len(results):.1%})"
                     )
     else:
-        # Baseline: sequential on single server
-        base_port = int(args.server_url.rsplit(":", 1)[-1].split("/")[0])
-        for i, prob in enumerate(problems):
-            gen = run_baseline_one(prob, base_port, args.model, args)
-            score = score_problem(prob, gen["text"])
-            correct = score >= 0.5
-            total_correct += int(correct)
-            total_tokens += gen["tokens"]
+        # Baseline: parallel on multiple servers (DP), batch_size requests per server
+        per_server_bs = args.batch_size if args.batch_size > 1 else 1
+        batch_size = per_server_bs * len(ports)
+        print(f"  Baseline DP: {per_server_bs} per server, {batch_size} concurrent")
+        for batch_start in range(0, len(problems), batch_size):
+            batch = problems[batch_start:batch_start + batch_size]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as ex:
+                futures = {}
+                for j, prob in enumerate(batch):
+                    port = ports[j % len(ports)]
+                    f = ex.submit(run_baseline_one, prob, port, args.model, args)
+                    futures[f] = (batch_start + j, prob)
 
-            results.append({
-                "idx": i,
-                "task": prob["task"],
-                "correct": correct,
-                "score": score,
-                "tokens": gen["tokens"],
-                "time": round(gen["time"], 2),
-                "n_compactions": 0,
-                "mean_logprob": 0,
-                "diagnostics": {},
-            })
+                for f in concurrent.futures.as_completed(futures):
+                    idx, prob = futures[f]
+                    try:
+                        gen = f.result()
+                    except Exception as e:
+                        print(f"[{len(results)+1:3d}/{args.n}] ERROR task={prob['task']:20s} {e}")
+                        results.append({
+                            "idx": idx, "task": prob["task"], "correct": False,
+                            "score": 0.0, "tokens": 0, "time": 0.0,
+                            "n_compactions": 0, "mean_logprob": 0, "diagnostics": {},
+                        })
+                        continue
+                    score = score_problem(prob, gen["text"])
+                    correct = score >= 0.5
+                    total_correct += int(correct)
+                    total_tokens += gen["tokens"]
 
-            status = "OK" if correct else "FAIL"
-            print(
-                f"[{i+1:3d}/{args.n}] {status} "
-                f"task={prob['task']:20s} "
-                f"tokens={gen['tokens']:5d} "
-                f"time={gen['time']:.1f}s "
-                f"acc={total_correct}/{i+1} ({total_correct/(i+1):.1%})"
-            )
+                    results.append({
+                        "idx": idx,
+                        "task": prob["task"],
+                        "correct": correct,
+                        "score": score,
+                        "tokens": gen["tokens"],
+                        "time": round(gen["time"], 2),
+                        "n_compactions": 0,
+                        "mean_logprob": 0,
+                        "diagnostics": {},
+                    })
+
+                    status = "OK" if correct else "FAIL"
+                    print(
+                        f"[{len(results):3d}/{args.n}] {status} "
+                        f"task={prob['task']:20s} "
+                        f"tokens={gen['tokens']:5d} "
+                        f"time={gen['time']:.1f}s "
+                        f"acc={total_correct}/{len(results)} "
+                        f"({total_correct/len(results):.1%})"
+                    )
 
     wall_time = time.time() - t_total
 

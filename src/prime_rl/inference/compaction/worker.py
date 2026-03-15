@@ -29,6 +29,28 @@ from prime_rl.inference.vllm.worker.filesystem import FileSystemWeightUpdateWork
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on inject token count (for block allocation headroom)
+_MAX_INJECT_TOKENS = 40
+
+
+def _build_inject_tokens(tokenizer, message: str) -> list[int]:
+    """Build token IDs for ending assistant turn, user budget message, and restarting assistant.
+
+    Produces: <|im_end|>\n<|im_start|>user\n{message}<|im_end|>\n<|im_start|>assistant\n
+    """
+    im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    newline = tokenizer.encode("\n", add_special_tokens=False)
+    user_ids = tokenizer.encode("user\n", add_special_tokens=False)
+    asst_ids = tokenizer.encode("assistant\n", add_special_tokens=False)
+    msg_ids = tokenizer.encode(message, add_special_tokens=False)
+
+    return (
+        [im_end] + newline
+        + [im_start] + user_ids + msg_ids + [im_end] + newline
+        + [im_start] + asst_ids
+    )
+
 
 class CompactionWorker(FileSystemWeightUpdateWorker):
     """Worker extension with KV cache compaction for RL training.
@@ -36,6 +58,14 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
     Inherits filesystem weight updates. Adds compact_generate() for
     generating text with mid-sequence KV cache compaction.
     """
+
+    def _get_tokenizer(self):
+        if not hasattr(self, '_cached_tokenizer'):
+            from transformers import AutoTokenizer
+            model_name = self.model_runner.vllm_config.model_config.model
+            self._cached_tokenizer = AutoTokenizer.from_pretrained(
+                model_name, trust_remote_code=True)
+        return self._cached_tokenizer
 
     def compact_generate(
         self,
@@ -51,6 +81,8 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         max_total_tokens: int | None = None,
         compute_beta: bool = False,
         use_suffix_queries: bool = True,
+        inject_budget_message: bool = False,
+        budget_message_template: str = "Budget: {used}/{total} tokens generated. ~{remaining} tokens remaining.",
     ) -> dict:
         """Generate text with KV cache compaction between segments.
 
@@ -82,18 +114,25 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         if kv_budget_mode:
             max_total_tokens = max_total_tokens or max_kv_len * 2
             # In KV budget mode, KV cache never exceeds max_kv_len
-            max_possible_len = max_kv_len
+            # Add headroom for inject tokens (temporarily exceed budget after compaction)
+            inject_headroom = _MAX_INJECT_TOKENS if inject_budget_message else 0
+            max_possible_len = max_kv_len + inject_headroom
         else:
             max_possible_len = len(prompt_ids) + max_tokens_per_segment * (n_compacts + 1)
+
+        # Budget injection state
+        inject_ranges: list[tuple[int, int]] = []
+        injected_count = 0  # cumulative inject tokens (for accurate budget tracking)
+        tokenizer = self._get_tokenizer() if inject_budget_message else None
 
         logger.info(
             "compact_generate: prompt_len=%d, max_tokens_per_seg=%d, n_compacts=%d, "
             "ratio=%.2f, temp=%.2f, top_p=%.2f, kv_budget_mode=%s, "
-            "max_kv_len=%s, max_total_tokens=%s | "
+            "max_kv_len=%s, max_total_tokens=%s, inject_budget=%s | "
             "KV: layers=%d, blocks=%d, block_size=%d, kv_heads=%d, head_size=%d",
             len(prompt_ids), max_tokens_per_segment, n_compacts,
             compact_target_ratio, temperature, top_p,
-            kv_budget_mode, max_kv_len, max_total_tokens,
+            kv_budget_mode, max_kv_len, max_total_tokens, inject_budget_message,
             num_layers, num_total_blocks, block_size, num_kv_heads, head_size,
         )
 
@@ -194,10 +233,15 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
 
         eos_check_interval = 64
         max_segments = n_compacts + 1 if not kv_budget_mode else 10000
+        # After inject prefill, the first assistant token is already sampled
+        injected_last_segment = False
 
         for segment in range(max_segments):
             t_seg = time.time()
-            tokens_in_segment = 1 if segment == 0 else 0
+            # First segment starts at 1 (token from prefill).
+            # After inject, also 1 (first asst token sampled from inject prefill).
+            tokens_in_segment = 1 if (segment == 0 or injected_last_segment) else 0
+            injected_last_segment = False
             eos_hit = (all_token_ids[-1] == eos_token_id)
             seg_count = 0
 
@@ -282,7 +326,9 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             if eos_hit:
                 break
             if kv_budget_mode:
-                if len(all_token_ids) >= max_total_tokens:
+                # Use assistant-only count so inject overhead doesn't reduce model's budget
+                effective_tokens = len(all_token_ids) - injected_count
+                if effective_tokens >= max_total_tokens:
                     break
             elif segment == n_compacts:
                 break
@@ -350,9 +396,64 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             inject_time = time.time() - t_inject
 
             position_offset += kv_len - new_seq_len
-            # +1 because the boundary token's KV will be recomputed
-            # in the next decode step (it attends to compacted context)
-            current_seq_len = new_seq_len + 1
+
+            if inject_budget_message:
+                # Inject user budget message after compaction.
+                # Prefill [boundary_token + inject_tokens] in one pass:
+                #   - boundary token gets KV recomputed with compacted context
+                #   - inject tokens (end asst + user msg + start asst) get their KV written
+                #   - last logit predicts first token of new assistant response
+                asst_tokens_generated = len(all_token_ids) - injected_count
+                remaining = max(0, max_total_tokens - asst_tokens_generated)
+                msg = budget_message_template.format(
+                    used=asst_tokens_generated, total=max_total_tokens, remaining=remaining)
+                inject_ids = _build_inject_tokens(tokenizer, msg)
+
+                boundary_token = all_token_ids[-1]
+                prefill_input = torch.tensor(
+                    [boundary_token] + inject_ids, dtype=torch.long, device=device)
+                prefill_positions = torch.arange(
+                    new_seq_len, new_seq_len + len(prefill_input),
+                    dtype=torch.long, device=device) + position_offset
+
+                inject_logits = _run_prefill(
+                    model, prefill_input, prefill_positions,
+                    seq_len=new_seq_len + len(prefill_input),
+                    block_ids=my_blocks,
+                    block_size=block_size,
+                    attn_layer_names=attn_layer_names,
+                    vllm_config=vllm_config,
+                    device=device,
+                    prefill_start=new_seq_len,
+                    prefill_len=len(prefill_input),
+                )
+
+                seed_val = len(all_token_ids) + len(inject_ids)
+                first_token, first_lp = _sample_token(
+                    inject_logits[-1:], temperature, top_p, rng, seed=seed_val)
+
+                # Track injected tokens (for mask — these are not model-generated)
+                inject_start = len(all_token_ids)
+                all_token_ids.extend(inject_ids)
+                all_logprobs.extend([0.0] * len(inject_ids))
+                inject_ranges.append((inject_start, inject_start + len(inject_ids)))
+                injected_count += len(inject_ids)
+
+                # Add first assistant token (model-generated)
+                all_token_ids.append(first_token.item())
+                all_logprobs.append(first_lp.item())
+
+                current_seq_len = new_seq_len + 1 + len(inject_ids) + 1
+                last_token_gpu = first_token.view(1)
+
+                injected_last_segment = True
+                logger.info(
+                    "Budget inject: %d tokens, msg='%s', remaining=%d",
+                    len(inject_ids), msg, remaining)
+            else:
+                # +1 because the boundary token's KV will be recomputed
+                # in the next decode step (it attends to compacted context)
+                current_seq_len = new_seq_len + 1
 
             compact_time = time.time() - t_compact
             new_assistant_len = compacted_prefix_len + suffix_len
@@ -403,6 +504,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 "total_time": round(total_time, 3),
                 "compaction_events": compaction_events,
                 "segment_boundaries": segment_boundaries,
+                "inject_ranges": inject_ranges,
                 "final_position_offset": position_offset,
                 "mean_logprob": sum(all_logprobs) / max(len(all_logprobs), 1),
             },
@@ -422,6 +524,8 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         max_total_tokens: int | None = None,
         compute_beta: bool = False,
         use_suffix_queries: bool = True,
+        inject_budget_message: bool = False,
+        budget_message_template: str = "Budget: {used}/{total} tokens generated. ~{remaining} tokens remaining.",
     ) -> list[dict]:
         """Generate B sequences simultaneously with KV compaction.
 
@@ -448,10 +552,16 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         kv_budget_mode = max_kv_len is not None
         if kv_budget_mode:
             max_total_tokens = max_total_tokens or max_kv_len * 2
-            max_possible_len = max_kv_len
+            inject_headroom = _MAX_INJECT_TOKENS if inject_budget_message else 0
+            max_possible_len = max_kv_len + inject_headroom
         else:
             max_prompt = max(len(p) for p in prompt_ids_list)
             max_possible_len = max_prompt + max_tokens_per_segment * (n_compacts + 1)
+
+        # Budget injection state
+        inject_ranges: list[list[tuple[int, int]]] = [[] for _ in range(B)]
+        injected_counts = [0] * B
+        tokenizer = self._get_tokenizer() if inject_budget_message else None
 
         max_blocks_per_seq = (max_possible_len + block_size - 1) // block_size
 
@@ -651,8 +761,9 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                                seg_tokens, seg_lps, seg_counts,
                                segment_boundaries)
 
-                    # Check termination
-                    if kv_budget_mode and len(all_token_ids[i]) >= max_total_tokens:
+                    # Check termination (assistant-only count excludes inject overhead)
+                    effective_tokens_i = len(all_token_ids[i]) - injected_counts[i]
+                    if kv_budget_mode and effective_tokens_i >= max_total_tokens:
                         active[i] = False
                         continue
                     if not kv_budget_mode and len(compaction_events[i]) >= n_compacts:
@@ -731,7 +842,52 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                                     model, batch_ctx, B, max_possible_len)
 
                     position_offsets[i] += kv_len - new_seq_len
-                    current_seq_lens[i] = new_seq_len + 1
+
+                    if inject_budget_message:
+                        asst_gen = len(all_token_ids[i]) - injected_counts[i]
+                        remaining = max(0, max_total_tokens - asst_gen)
+                        msg = budget_message_template.format(
+                            used=asst_gen, total=max_total_tokens, remaining=remaining)
+                        inject_ids = _build_inject_tokens(tokenizer, msg)
+
+                        boundary_token = all_token_ids[i][-1]
+                        prefill_input = torch.tensor(
+                            [boundary_token] + inject_ids, dtype=torch.long, device=device)
+                        prefill_positions = torch.arange(
+                            new_seq_len,
+                            new_seq_len + len(prefill_input),
+                            dtype=torch.long, device=device,
+                        ) + position_offsets[i]
+
+                        inject_logits = _run_prefill(
+                            model, prefill_input, prefill_positions,
+                            seq_len=new_seq_len + len(prefill_input),
+                            block_ids=per_seq_blocks[i],
+                            block_size=block_size,
+                            attn_layer_names=attn_layer_names,
+                            vllm_config=vllm_config,
+                            device=device,
+                            prefill_start=new_seq_len,
+                            prefill_len=len(prefill_input),
+                        )
+
+                        seed_val = len(all_token_ids[i]) + len(inject_ids)
+                        first_tok, first_lp = _sample_token(
+                            inject_logits[-1:], temperature, top_p, rng, seed=seed_val)
+
+                        inject_start = len(all_token_ids[i])
+                        all_token_ids[i].extend(inject_ids)
+                        all_logprobs[i].extend([0.0] * len(inject_ids))
+                        inject_ranges[i].append((inject_start, inject_start + len(inject_ids)))
+                        injected_counts[i] += len(inject_ids)
+
+                        all_token_ids[i].append(first_tok.item())
+                        all_logprobs[i].append(first_lp.item())
+
+                        current_seq_lens[i] = new_seq_len + 1 + len(inject_ids) + 1
+                        last_tokens[i] = first_tok
+                    else:
+                        current_seq_lens[i] = new_seq_len + 1
 
                     compact_time = time.time() - t_compact
                     new_assistant_len = compacted_prefix_len + suffix_len
@@ -789,6 +945,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     "total_time": round(total_time, 3),
                     "compaction_events": compaction_events[i],
                     "segment_boundaries": segment_boundaries[i],
+                    "inject_ranges": inject_ranges[i],
                     "final_position_offset": int(position_offsets[i].item()),
                     "mean_logprob": sum(all_logprobs[i]) / max(len(all_logprobs[i]), 1),
                 },
