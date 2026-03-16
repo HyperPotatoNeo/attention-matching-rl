@@ -101,6 +101,139 @@ Both models generate ~20% fewer tokens with budget injection, leading to
 proportionally faster wall times. The model learns to terminate earlier when
 reminded of its remaining budget.
 
+## Qualitative Examples
+
+### Example 1: Budget message as "snap out of it" signal (zebra_puzzles, idx=0)
+
+This zebra puzzle asks for the person in House 1. Clue 8 directly states "Eric is in
+the first house" — but the model must recognize this among 20+ clues.
+
+**Base, no budget (FAIL, 8192 tokens):** The model starts reasoning about all 7 houses,
+exploring every constraint. It gets lost in a combinatorial search — trying placements
+for Carol, checking animal assignments, testing lunch combinations. After 8192 tokens
+it's still mid-sentence:
+
+> *...the remaining lunches for houses 4 and 7 are stir fry and spaghetti.
+> If house 4's lunch is stir fry, then the drink is boba tea (clue 5). Or if it's spaghetti, then no.
+> Alternatively, if house 7's lunch*
+
+The model exhausted its entire token budget without ever extracting the direct answer
+from clue 8.
+
+**Base, with budget (OK, 2462 tokens):** The model starts the same way — exploring
+constraints about houses and Carol's placement. After 2048 tokens, the budget message
+interrupts:
+
+> *But house 4 is Bob. So Carol can't be in house 4, because Bob is there*
+>
+> **user: Budget: 2048/8192 tokens generated. ~6144 tokens remaining.**
+>
+> *Okay, let's try to figure this out step by step. The user is asking for the name
+> of the person in House 1, and from clue 8, it's directly stated that Eric is in
+> House 1. But maybe there's a trick here? Let me check all the clues again...*
+>
+> *Clue 8: Eric is in the first house. That seems straightforward... There's no
+> conflict here.*
+>
+> **\<answer\>Eric\</answer\>**
+
+The budget message acts as a **reset signal**. The model stops its exhaustive search,
+re-reads the question, and immediately identifies the direct answer from clue 8.
+
+**Step 600, no budget (OK, 161 tokens):** The RL-trained model goes straight to the point:
+
+> *Let's try to figure out who lives in House 1. Let's start by looking at the clues
+> that directly mention House 1. Clue 4 says the person who loves grilled cheese is
+> in the first house. Clue 8 states Eric is in the first house. So that means...
+> the answer is Eric.*
+>
+> **\<answer\>Eric\</answer\>**
+
+RL training taught the model to check direct clues first rather than attempting a
+full constraint propagation. Budget injection is unnecessary — the model already
+learned the efficient strategy.
+
+### Example 2: Budget injection enables reasoning on stuck generations (zebra_puzzles, idx=21)
+
+Both models generate just `<think>` (2 tokens) and stop in baseline mode — an immediate
+EOS after opening the thinking tag. This is a stochastic failure mode at temperature=0.6.
+
+With budget injection, the `/inject_generate` endpoint's token-by-token decode loop
+avoids this failure mode. Both models produce correct, substantive reasoning:
+
+**Base with budget (OK, 1166 tokens):**
+> *Let me check if there's any other clue that could affect this... clue 19 says
+> Prince is in House 1. So David's cigar is Prince. That's allowed. So unless there's
+> a contradiction, David is in House 1.*
+
+**Step 600 with budget (OK, 190 tokens):**
+> *Clue 14 says David is in House 1. So David is the one who smokes Prince. That
+> doesn't conflict... So I think the answer is David.*
+
+The RL model reaches the answer in 190 tokens vs the base model's 1166 — a 6x
+efficiency gain from training, even in inject mode.
+
+### Example 3: Budget message interrupts multi-step reasoning (cryptarithm, idx=36)
+
+Cryptarithm requires sustained arithmetic reasoning — exploring digit assignments
+column by column. Here, budget injection helps the base model but hurts the RL model.
+
+**Base with budget (OK, 6279 tokens):** The model explores digit assignments for 6144
+tokens across 3 budget messages. On the third message ("~2048 tokens remaining"),
+it immediately closes `</think>` and outputs an answer — and gets it right.
+
+> *...since they are digits, and S can't be 5, and Y*
+>
+> **user: Budget: 6144/8192 tokens generated. ~2048 tokens remaining.**
+>
+> *\</think\>*
+>
+> **\<answer\>K=6,Z=2,I=0,D=1,Y=5,S=3,N=4,Q=8\</answer\>**
+
+The "~2048 remaining" message created urgency — the model committed to its best
+candidate rather than continuing to explore.
+
+**Step 600 with budget (FAIL, 3031 tokens):** The RL model finds a candidate solution
+after just one budget message, verifies it column by column ("All columns check out"),
+and commits. But the solution is wrong — the model verified `I=0` which violates the
+constraint that `I` appears in the leading position of `KZII` (it doesn't, but the
+model's verification was superficial). The budget pressure caused premature commitment
+to an incorrect candidate.
+
+### Example 4: Inject rescues degenerate whitespace generation (sokoban, idx=10)
+
+Both models produce **degenerate output** in baseline mode — 8192 tokens of whitespace
+inside `<think>` tags, with only 14 non-whitespace characters total:
+
+> `<think><think>\n        \n        \n        \n...` (8192 tokens)
+
+This is a failure mode where the model enters a whitespace repetition loop.
+
+**Step 600 with budget (OK, 2588 tokens):** Inject mode avoids this degenerate state.
+The model reasons about the sokoban grid, traces a solution path, and verifies it:
+
+> *Player moves right to (1,3), then right to (1,4). Now at (1,4). Move down: pushes
+> box from (2,4) to (3,4). Move down again: pushes box from (3,4) to (4,4). Now the
+> box is on the goal. So the answer is "RRDD".*
+
+### Summary of Qualitative Findings
+
+1. **Budget messages act as attention resets**: When the base model is lost in exhaustive
+   search, the budget message causes it to re-read the question and find direct answers
+   (Example 1).
+
+2. **RL training subsumes the budget injection benefit**: The RL model already learned
+   to check direct clues first, making budget messages unnecessary for the "attention
+   reset" effect (Examples 1, 2).
+
+3. **Budget pressure can hurt multi-step reasoning**: For tasks requiring sustained
+   arithmetic exploration (cryptarithm), budget messages can cause premature commitment
+   to unverified solutions (Example 3).
+
+4. **Inject endpoint avoids degenerate generation modes**: The `/inject_generate`
+   token-by-token decode loop prevents whitespace repetition loops and immediate EOS
+   failures that occur stochastically in baseline mode (Examples 2, 4).
+
 ## Reproduction
 
 ```bash
