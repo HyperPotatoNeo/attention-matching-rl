@@ -60,6 +60,15 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
             f"routed_experts: {len(routed_experts)}, input_ids: {len(input_ids)}"
         )
 
+    # A single segment boundary means no compaction occurred — the entire
+    # completion is one segment.  Normalize to None so the sample can be
+    # packed and goes through the standard (non-segmented) forward pass.
+    seg_bounds = training_example.segment_boundaries
+    compact_idx = training_example.compaction_indices
+    if seg_bounds is not None and len(seg_bounds) <= 1:
+        seg_bounds = None
+        compact_idx = None
+
     return MicroBatch(
         input_ids=input_ids,
         advantages=advantages,
@@ -69,8 +78,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         teacher_logprobs=teacher_logprobs,
         temperatures=temperatures,
         routed_experts=routed_experts,
-        segment_boundaries=training_example.segment_boundaries,
-        compaction_indices=training_example.compaction_indices,
+        segment_boundaries=seg_bounds,
+        compaction_indices=compact_idx,
         # Multimodal fields (Qwen3-VL) - passed through without modification
         pixel_values=training_example.pixel_values,
         pixel_values_shape=training_example.pixel_values_shape,
