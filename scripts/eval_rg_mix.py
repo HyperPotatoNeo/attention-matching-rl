@@ -316,6 +316,8 @@ def main():
     parser.add_argument("--inject-budget-every", type=int, default=2048,
                         help="Inject budget message every N tokens (inject mode)")
     parser.add_argument("--output", default=None)
+    parser.add_argument("--save-text", action="store_true",
+                        help="Save full response text + question in output JSON")
     args = parser.parse_args()
 
     ports = [int(p) for p in args.ports.split(",")]
@@ -421,7 +423,7 @@ def main():
                         total_correct += int(correct)
                         total_tokens += gen["tokens"]
 
-                        results.append({
+                        entry = {
                             "idx": idx,
                             "task": prob["task"],
                             "correct": correct,
@@ -431,7 +433,11 @@ def main():
                             "n_compactions": n_actual_compacts,
                             "mean_logprob": gen["mean_logprob"],
                             "diagnostics": gen["diagnostics"],
-                        })
+                        }
+                        if args.save_text:
+                            entry["text"] = gen["text"]
+                            entry["question"] = prob["question"]
+                        results.append(entry)
 
                         status = "OK" if correct else "FAIL"
                         print(
@@ -477,7 +483,7 @@ def main():
                     total_correct += int(correct)
                     total_tokens += gen["tokens"]
 
-                    results.append({
+                    entry = {
                         "idx": idx,
                         "task": prob["task"],
                         "correct": correct,
@@ -487,7 +493,11 @@ def main():
                         "n_compactions": n_actual_compacts,
                         "mean_logprob": gen["mean_logprob"],
                         "diagnostics": gen["diagnostics"],
-                    })
+                    }
+                    if args.save_text:
+                        entry["text"] = gen["text"]
+                        entry["question"] = prob["question"]
+                    results.append(entry)
 
                     status = "OK" if correct else "FAIL"
                     print(
@@ -531,7 +541,7 @@ def main():
                     total_tokens += gen["tokens"]
 
                     n_injects = len(gen["diagnostics"].get("inject_events", []))
-                    results.append({
+                    entry = {
                         "idx": idx,
                         "task": prob["task"],
                         "correct": correct,
@@ -542,7 +552,11 @@ def main():
                         "n_injects": n_injects,
                         "mean_logprob": gen["mean_logprob"],
                         "diagnostics": gen["diagnostics"],
-                    })
+                    }
+                    if args.save_text:
+                        entry["text"] = gen["text"]
+                        entry["question"] = prob["question"]
+                    results.append(entry)
 
                     status = "OK" if correct else "FAIL"
                     print(
@@ -586,7 +600,7 @@ def main():
                     total_correct += int(correct)
                     total_tokens += gen["tokens"]
 
-                    results.append({
+                    entry = {
                         "idx": idx,
                         "task": prob["task"],
                         "correct": correct,
@@ -596,7 +610,11 @@ def main():
                         "n_compactions": 0,
                         "mean_logprob": 0,
                         "diagnostics": {},
-                    })
+                    }
+                    if args.save_text:
+                        entry["text"] = gen["text"]
+                        entry["question"] = prob["question"]
+                    results.append(entry)
 
                     status = "OK" if correct else "FAIL"
                     print(
