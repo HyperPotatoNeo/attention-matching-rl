@@ -248,9 +248,46 @@ def run_baseline_one(problem, port, model_name, args):
     }
 
 
+def run_inject_one(problem, port, tokenizer, args):
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": problem["question"]},
+    ]
+    result = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True,
+    )
+    prompt_ids = list(result["input_ids"]) if hasattr(result, "keys") else list(result)
+
+    max_total = args.max_tokens_per_segment * (args.n_compacts + 1)
+    inject_every = getattr(args, "inject_budget_every", 2048)
+
+    t0 = time.time()
+    client = httpx.Client(base_url=f"http://localhost:{port}", timeout=600.0)
+    body = {
+        "prompt_ids": prompt_ids,
+        "max_total_tokens": max_total,
+        "inject_budget_every": inject_every,
+        "temperature": 0.6,
+        "top_p": 0.95,
+    }
+    resp = client.post("/inject_generate", json=body)
+    elapsed = time.time() - t0
+    resp.raise_for_status()
+    data = resp.json()
+
+    return {
+        "text": data["final_text"],
+        "tokens": len(data["all_token_ids"]),
+        "time": elapsed,
+        "diagnostics": data.get("diagnostics", {}),
+        "mean_logprob": data.get("diagnostics", {}).get("mean_logprob", 0),
+        "logprobs": data["all_logprobs"],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["baseline", "compaction"], required=True)
+    parser.add_argument("--mode", choices=["baseline", "compaction", "inject"], required=True)
     parser.add_argument("--n", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model", default="Qwen/Qwen3-4B")
@@ -276,6 +313,8 @@ def main():
                         help="Skip first N problems (for resuming partial runs)")
     parser.add_argument("--inject-budget-message", action="store_true",
                         help="Inject user budget messages after each compaction")
+    parser.add_argument("--inject-budget-every", type=int, default=2048,
+                        help="Inject budget message every N tokens (inject mode)")
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
@@ -313,6 +352,9 @@ def main():
                   f"{args.n_compacts} compactions")
         print(f"  ratio={args.compact_ratio}, window={args.compact_window}")
         print(f"  suffix_queries={args.use_suffix_queries}")
+        print(f"  DP={len(ports)} (ports: {ports})")
+    elif args.mode == "inject":
+        print(f"  inject_budget_every={args.inject_budget_every}")
         print(f"  DP={len(ports)} (ports: {ports})")
     else:
         print(f"  DP={len(ports)} (ports: {ports})")
@@ -457,6 +499,62 @@ def main():
                         f"acc={total_correct}/{len(results)} "
                         f"({total_correct/len(results):.1%})"
                     )
+    elif args.mode == "inject":
+        # Inject: parallel on multiple servers (DP), uses /inject_generate endpoint
+        per_server_bs = args.batch_size if args.batch_size > 1 else 1
+        batch_size = per_server_bs * len(ports)
+        print(f"  Inject DP: {per_server_bs} per server, {batch_size} concurrent")
+        for batch_start in range(0, len(problems), batch_size):
+            batch = problems[batch_start:batch_start + batch_size]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as ex:
+                futures = {}
+                for j, prob in enumerate(batch):
+                    port = ports[j % len(ports)]
+                    f = ex.submit(run_inject_one, prob, port, tokenizer, args)
+                    futures[f] = (batch_start + j, prob)
+
+                for f in concurrent.futures.as_completed(futures):
+                    idx, prob = futures[f]
+                    try:
+                        gen = f.result()
+                    except Exception as e:
+                        print(f"[{len(results)+1:3d}/{args.n}] ERROR task={prob['task']:20s} {e}")
+                        results.append({
+                            "idx": idx, "task": prob["task"], "correct": False,
+                            "score": 0.0, "tokens": 0, "time": 0.0,
+                            "n_compactions": 0, "mean_logprob": 0, "diagnostics": {},
+                        })
+                        continue
+                    score = score_problem(prob, gen["text"])
+                    correct = score >= 0.5
+                    total_correct += int(correct)
+                    total_tokens += gen["tokens"]
+
+                    n_injects = len(gen["diagnostics"].get("inject_events", []))
+                    results.append({
+                        "idx": idx,
+                        "task": prob["task"],
+                        "correct": correct,
+                        "score": score,
+                        "tokens": gen["tokens"],
+                        "time": round(gen["time"], 2),
+                        "n_compactions": 0,
+                        "n_injects": n_injects,
+                        "mean_logprob": gen["mean_logprob"],
+                        "diagnostics": gen["diagnostics"],
+                    })
+
+                    status = "OK" if correct else "FAIL"
+                    print(
+                        f"[{len(results):3d}/{args.n}] {status} "
+                        f"task={prob['task']:20s} "
+                        f"tokens={gen['tokens']:5d} "
+                        f"injects={n_injects} "
+                        f"time={gen['time']:.1f}s "
+                        f"acc={total_correct}/{len(results)} "
+                        f"({total_correct/len(results):.1%})"
+                    )
+
     else:
         # Baseline: parallel on multiple servers (DP), batch_size requests per server
         per_server_bs = args.batch_size if args.batch_size > 1 else 1
