@@ -11,7 +11,7 @@ the full technical walkthrough.
 | File | Purpose |
 |------|---------|
 | `src/prime_rl/inference/compaction/worker.py` | Generation + compaction logic (single & batch) |
-| `src/prime_rl/inference/compaction/routes.py` | `/compact_generate` endpoint + auto-batching |
+| `src/prime_rl/inference/compaction/routes.py` | `/compact_generate` + `/inject_generate` endpoints + auto-batching |
 | `src/prime_rl/inference/compaction/algorithm.py` | Attention Matching + NNLS beta solver (suffix queries + forced indices by default) |
 | `src/prime_rl/inference/compaction/beta_attention.py` | BetaState mirrors + SDPA decode with per-token bias |
 | `src/prime_rl/trainer/rl/compaction.py` | Beta training hooks + deterministic compaction replay + query capture hooks + forced indices |
@@ -22,14 +22,14 @@ the full technical walkthrough.
 
 | Config | Purpose |
 |--------|---------|
-| `configs/compaction/qwen3_4b_fullft_suffix_queries.toml` | **Default** — 4+4 layout, suffix queries + forced indices, no beta |
-| `configs/compaction/qwen3_4b_fullft_determ_nobeta.toml` | Random queries, deterministic compaction, no beta |
-| `configs/compaction/qwen3_4b_fullft_determ_suffix.toml` | Deterministic random queries + prompt keys |
-| `configs/compaction/qwen3_4b_fullft_fixed_1024q.toml` | 1024 random queries |
-| `configs/compaction/qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic, legacy) |
+| `configs/compaction/qwen3_4b_fullft_suffix_queries.toml` | **Default** — suffix queries + forced indices, no beta |
+| `configs/compaction/qwen3_4b_fullft_baseline.toml` | Baseline (no compaction, standard vLLM) |
+| `configs/compaction/qwen3_4b_fullft_baseline_inject.toml` | Baseline + budget injection every 2048 tokens |
+| `configs/compaction/qwen3_4b_fullft_inject_budget.toml` | Compaction + budget injection after each compaction |
+| `configs/compaction/qwen3_4b_fullft_inject_budget_suffix.toml` | Compaction + budget injection + suffix queries |
 | `configs/compaction/qwen3_4b_beta_test.toml` | Beta attention test config |
-| `configs/compaction/qwen3_4b_fullft_baseline.toml` | Baseline (no compaction) |
-| `configs/compaction/qwen3_4b_serve_tp1.toml` | TP=1 inference server |
+| `configs/compaction/qwen3_4b_serve_tp1.toml` | TP=1 compaction server |
+| `configs/compaction/qwen3_4b_serve_tp1_baseline.toml` | TP=1 baseline server (no compaction) |
 
 ### How it works
 
@@ -70,8 +70,14 @@ suffix through the model with hooks on vLLM's inner `Attention` class to capture
 queries at every layer. Model-agnostic (works for any architecture using vLLM's Attention).
 +3% accuracy over random probes at ~20% slower wall time (extra prefill per compaction event).
 
-**Auto-batching**: Individual `/compact_generate` requests are transparently batched into
-`compact_generate_batch` calls (B=8) by `_RequestBatcher` in routes.py.
+**Budget injection**: Two modes for injecting a user message with remaining token budget:
+- With compaction (`inject_budget_message=true`): injects after each compaction event
+- Without compaction (`inject_only=true` in env): injects every `inject_budget_every` tokens
+  via `/inject_generate` endpoint. No KV compression, positions stay continuous.
+Injected tokens get `completion_mask=0` (excluded from loss) and `logprobs=0.0`.
+
+**Auto-batching**: Individual `/compact_generate` and `/inject_generate` requests are
+transparently batched by `_RequestBatcher` and `_InjectBatcher` in routes.py (up to B=32).
 
 ### Critical invariants
 

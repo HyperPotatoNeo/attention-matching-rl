@@ -1,22 +1,22 @@
-# Compaction Full FT Training — No Beta Bias (4-4 config)
-# 2-node: Node 1 = 4 inference (TP=1), Node 2 = 4 trainer (FSDP2)
+# Baseline Full FT + Budget Injection (no compaction)
+# 2-node: Node 1 = 4 inference (TP=1, compaction server), Node 2 = 4 trainer (FSDP2)
+# Uses /inject_generate endpoint for periodic budget injection without KV compaction.
 #
 # __INFERENCE_NODE__ is replaced by the launch script.
 
 max_steps = 600
 seq_len = 9216
-output_dir = "outputs/compaction-fullft-nobeta"
+output_dir = "outputs/rg-mix-baseline-inject"
 
 [model]
 name = "Qwen/Qwen3-4B"
 
 [wandb]
 project = "compaction-rl"
-name = "compaction-fullft-nobeta"
+name = "rg-mix-baseline-inject"
 
 [ckpt]
-interval = 50
-resume_step = -1
+interval = 30
 
 [deployment]
 num_train_gpus = 4
@@ -24,8 +24,6 @@ num_infer_gpus = 0
 
 [trainer]
 dist_timeout_seconds = 3600
-compact_target_ratio = 0.25
-compact_window = 1024
 
 [trainer.model]
 impl = "auto"
@@ -47,7 +45,7 @@ type = "default"
 batch_size = 256
 rollouts_per_example = 8
 
-# 4 inference servers on Node 1
+# 4 inference servers on Node 1 (compaction server for /inject_generate)
 [orchestrator.client]
 base_url = [
     "http://__INFERENCE_NODE__:8000/v1",
@@ -61,5 +59,5 @@ max_tokens = 8192
 
 [[orchestrator.env]]
 id = "compaction_env"
-name = "compaction-rg-mix"
-args = { gym = "rg_mix_env", max_seq_len = 9216, max_kv_len = 2048, max_total_tokens = 8192, compact_target_ratio = 0.25, compact_window = 1024, n_compacts = 99, dataset_path = "/pscratch/sd/s/siddart2/datasets/rg_mix_7500", num_train_examples = 7500, num_eval_examples = 100 }
+name = "baseline-inject"
+args = { gym = "rg_mix_env", inject_only = true, inject_budget_every = 2048, max_total_tokens = 8192, max_seq_len = 9216, dataset_path = "/pscratch/sd/s/siddart2/datasets/rg_mix_7500", num_train_examples = 7500, num_eval_examples = 100 }

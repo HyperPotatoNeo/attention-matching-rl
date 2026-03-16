@@ -953,6 +953,495 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             for i in range(B)
         ]
 
+    def inject_only_generate(
+        self,
+        prompt_ids: list[int],
+        max_total_tokens: int,
+        inject_budget_every: int,
+        temperature: float,
+        top_p: float,
+        eos_token_id: int,
+        budget_message_template: str = "Budget: {used}/{total} tokens generated. ~{remaining} tokens remaining.",
+    ) -> dict:
+        """Generate text with periodic budget injection (no KV compaction).
+
+        Every inject_budget_every effective tokens, injects a user message with
+        the remaining token budget. Positions are continuous (no compaction offset).
+        """
+        t_start = time.time()
+        model = self._get_model()
+        device = self._get_device()
+        vllm_config = self.model_runner.vllm_config
+
+        kv_caches = self.model_runner.kv_caches
+        num_layers = len(kv_caches)
+        kv_shape = kv_caches[0].shape
+        num_total_blocks = kv_shape[1]
+        block_size = kv_shape[2]
+
+        tokenizer = self._get_tokenizer()
+        max_injections = max_total_tokens // inject_budget_every
+        # Total KV: prompt + generated + inject overhead (boundary + inject tokens per injection)
+        max_possible_len = len(prompt_ids) + max_total_tokens + max_injections * (_MAX_INJECT_TOKENS + 1)
+
+        inject_ranges: list[tuple[int, int]] = []
+        injected_count = 0
+
+        logger.info(
+            "inject_only_generate: prompt_len=%d, max_total=%d, inject_every=%d, "
+            "temp=%.2f, top_p=%.2f",
+            len(prompt_ids), max_total_tokens, inject_budget_every,
+            temperature, top_p,
+        )
+
+        my_blocks = self._find_free_blocks(num_total_blocks)
+        max_blocks_needed = (max_possible_len + block_size - 1) // block_size
+        assert len(my_blocks) >= max_blocks_needed, (
+            f"Need {max_blocks_needed} blocks, only {len(my_blocks)} free"
+        )
+        my_blocks = my_blocks[:max_blocks_needed]
+
+        attn_layer_names = self._get_attn_layer_names(model)
+
+        decode_ctx = _DecodeContext.create(
+            block_ids=my_blocks, block_size=block_size,
+            attn_layer_names=attn_layer_names, vllm_config=vllm_config, device=device,
+        )
+        rng = torch.Generator(device=device)
+
+        # --- Prefill ---
+        input_ids_t = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+        positions_t = torch.arange(len(prompt_ids), dtype=torch.long, device=device)
+        logits = _run_prefill(
+            model, input_ids_t, positions_t,
+            seq_len=len(prompt_ids), block_ids=my_blocks, block_size=block_size,
+            attn_layer_names=attn_layer_names, vllm_config=vllm_config, device=device,
+        )
+
+        current_seq_len = len(prompt_ids)
+        first_token, first_logprob = _sample_token(logits[-1:], temperature, top_p, rng, seed=0)
+        all_token_ids = [first_token.item()]
+        all_logprobs = [first_logprob.item()]
+        current_seq_len += 1
+        last_token_gpu = first_token.view(1)
+
+        # CUDA graph (TP=1 only)
+        use_cuda_graph = (vllm_config.parallel_config.tensor_parallel_size == 1)
+        decode_graph = None
+        logits_buf = None
+
+        if use_cuda_graph:
+            decode_ctx.metadata.max_seq_len = max_possible_len
+            _update_decode_state(last_token_gpu, current_seq_len - 1, current_seq_len, decode_ctx)
+            with set_forward_context(
+                decode_ctx.attn_metadata_dict, decode_ctx.vllm_config,
+                virtual_engine=0, num_tokens=1,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                slot_mapping=decode_ctx.slot_mapping_ctx,
+            ):
+                for _ in range(3):
+                    hidden = model(input_ids=decode_ctx.input_ids, positions=decode_ctx.positions)
+                    logits_buf = model.compute_logits(hidden)
+                torch.cuda.synchronize()
+                decode_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(decode_graph):
+                    hidden = model(input_ids=decode_ctx.input_ids, positions=decode_ctx.positions)
+                    logits_buf = model.compute_logits(hidden)
+
+        seg_token_ids = torch.zeros(inject_budget_every, dtype=torch.long, device=device)
+        seg_logprobs = torch.zeros(inject_budget_every, dtype=torch.float32, device=device)
+
+        segment_boundaries = []
+        eos_check_interval = 64
+        injected_last_segment = False
+
+        for segment in range(max_injections + 1):
+            tokens_in_segment = 1 if (segment == 0 or injected_last_segment) else 0
+            injected_last_segment = False
+            eos_hit = (all_token_ids[-1] == eos_token_id)
+            seg_count = 0
+
+            with set_forward_context(
+                decode_ctx.attn_metadata_dict, decode_ctx.vllm_config,
+                virtual_engine=0, num_tokens=1,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                slot_mapping=decode_ctx.slot_mapping_ctx,
+            ):
+                while tokens_in_segment < inject_budget_every and not eos_hit:
+                    _update_decode_state(
+                        last_token_gpu, current_seq_len - 1, current_seq_len, decode_ctx,
+                    )
+                    if decode_graph is not None:
+                        decode_graph.replay()
+                        decode_logits = logits_buf
+                    else:
+                        decode_logits = _run_decode_step(model, decode_ctx)
+
+                    seed = len(all_token_ids) + seg_count
+                    token, logprob = _sample_token(decode_logits, temperature, top_p, rng, seed=seed)
+                    seg_token_ids[seg_count] = token
+                    seg_logprobs[seg_count] = logprob
+                    seg_count += 1
+                    last_token_gpu = token.view(1)
+                    current_seq_len += 1
+                    tokens_in_segment += 1
+
+                    if seg_count % eos_check_interval == 0:
+                        eos_positions = (seg_token_ids[:seg_count] == eos_token_id).nonzero(as_tuple=False)
+                        if len(eos_positions) > 0:
+                            first_eos = eos_positions[0].item()
+                            extra = seg_count - first_eos - 1
+                            seg_count = first_eos + 1
+                            current_seq_len -= extra
+                            tokens_in_segment -= extra
+                            eos_hit = True
+
+            # Final EOS check
+            if not eos_hit and seg_count > 0:
+                eos_positions = (seg_token_ids[:seg_count] == eos_token_id).nonzero(as_tuple=False)
+                if len(eos_positions) > 0:
+                    first_eos = eos_positions[0].item()
+                    extra = seg_count - first_eos - 1
+                    seg_count = first_eos + 1
+                    current_seq_len -= extra
+                    eos_hit = True
+
+            if seg_count > 0:
+                all_token_ids.extend(seg_token_ids[:seg_count].tolist())
+                all_logprobs.extend(seg_logprobs[:seg_count].tolist())
+            segment_boundaries.append(len(all_token_ids))
+
+            if eos_hit:
+                break
+            effective_tokens = len(all_token_ids) - injected_count
+            if effective_tokens >= max_total_tokens:
+                break
+            if segment == max_injections:
+                break
+
+            # --- Inject budget message (no compaction) ---
+            kv_len = current_seq_len - 1
+            asst_tokens_generated = len(all_token_ids) - injected_count
+            remaining = max(0, max_total_tokens - asst_tokens_generated)
+            msg = budget_message_template.format(
+                used=asst_tokens_generated, total=max_total_tokens, remaining=remaining)
+            inject_ids = _build_inject_tokens(tokenizer, msg)
+
+            boundary_token = all_token_ids[-1]
+            prefill_input = torch.tensor(
+                [boundary_token] + inject_ids, dtype=torch.long, device=device)
+            prefill_positions = torch.arange(
+                kv_len, kv_len + len(prefill_input), dtype=torch.long, device=device)
+
+            inject_logits = _run_prefill(
+                model, prefill_input, prefill_positions,
+                seq_len=kv_len + len(prefill_input),
+                block_ids=my_blocks, block_size=block_size,
+                attn_layer_names=attn_layer_names, vllm_config=vllm_config, device=device,
+                prefill_start=kv_len, prefill_len=len(prefill_input),
+            )
+
+            seed_val = len(all_token_ids) + len(inject_ids)
+            first_tok, first_lp = _sample_token(
+                inject_logits[-1:], temperature, top_p, rng, seed=seed_val)
+
+            inject_start = len(all_token_ids)
+            all_token_ids.extend(inject_ids)
+            all_logprobs.extend([0.0] * len(inject_ids))
+            inject_ranges.append((inject_start, inject_start + len(inject_ids)))
+            injected_count += len(inject_ids)
+
+            all_token_ids.append(first_tok.item())
+            all_logprobs.append(first_lp.item())
+
+            current_seq_len = kv_len + len(prefill_input) + 1
+            last_token_gpu = first_tok.view(1)
+            injected_last_segment = True
+
+            logger.info(
+                "Budget inject %d: %d tokens, remaining=%d",
+                segment, len(inject_ids), remaining,
+            )
+
+        total_time = time.time() - t_start
+        logger.info(
+            "inject_only DONE: %d tokens, %d injections, %.2fs",
+            len(all_token_ids), len(inject_ranges), total_time,
+        )
+
+        return {
+            "all_token_ids": all_token_ids,
+            "all_logprobs": all_logprobs,
+            "diagnostics": {
+                "prompt_len": len(prompt_ids),
+                "total_tokens": len(all_token_ids),
+                "total_time": round(total_time, 3),
+                "compaction_events": [],
+                "segment_boundaries": segment_boundaries,
+                "inject_ranges": inject_ranges,
+                "final_position_offset": 0,
+                "mean_logprob": sum(all_logprobs) / max(len(all_logprobs), 1),
+            },
+        }
+
+    def inject_only_generate_batch(
+        self,
+        prompt_ids_list: list[list[int]],
+        max_total_tokens: int,
+        inject_budget_every: int,
+        temperature: float,
+        top_p: float,
+        eos_token_id: int,
+        budget_message_template: str = "Budget: {used}/{total} tokens generated. ~{remaining} tokens remaining.",
+    ) -> list[dict]:
+        """Batched inject-only generation. B sequences decoded in lockstep."""
+        t_start = time.time()
+        B = len(prompt_ids_list)
+        if B == 0:
+            return []
+
+        model = self._get_model()
+        device = self._get_device()
+        vllm_config = self.model_runner.vllm_config
+
+        kv_caches = self.model_runner.kv_caches
+        num_layers = len(kv_caches)
+        kv_shape = kv_caches[0].shape
+        num_total_blocks = kv_shape[1]
+        block_size = kv_shape[2]
+
+        tokenizer = self._get_tokenizer()
+        max_injections = max_total_tokens // inject_budget_every
+        max_prompt = max(len(p) for p in prompt_ids_list)
+        max_possible_len = max_prompt + max_total_tokens + max_injections * (_MAX_INJECT_TOKENS + 1)
+
+        inject_ranges: list[list[tuple[int, int]]] = [[] for _ in range(B)]
+        injected_counts = [0] * B
+
+        max_blocks_per_seq = (max_possible_len + block_size - 1) // block_size
+        free_blocks = self._find_free_blocks(num_total_blocks)
+        total_needed = max_blocks_per_seq * B
+        assert len(free_blocks) >= total_needed, (
+            f"Need {total_needed} blocks for {B} seqs, only {len(free_blocks)} free"
+        )
+        per_seq_blocks = [
+            free_blocks[i * max_blocks_per_seq:(i + 1) * max_blocks_per_seq]
+            for i in range(B)
+        ]
+
+        attn_layer_names = self._get_attn_layer_names(model)
+        rng = torch.Generator(device=device)
+
+        logger.info(
+            "inject_only_batch: B=%d, max_total=%d, inject_every=%d, blocks/seq=%d",
+            B, max_total_tokens, inject_budget_every, max_blocks_per_seq,
+        )
+
+        # --- Prefill ---
+        prompt_lens = []
+        current_seq_lens = torch.zeros(B, dtype=torch.long, device=device)
+        last_tokens = torch.zeros(B, dtype=torch.long, device=device)
+        all_token_ids: list[list[int]] = [[] for _ in range(B)]
+        all_logprobs: list[list[float]] = [[] for _ in range(B)]
+
+        for i in range(B):
+            pids = prompt_ids_list[i]
+            plen = len(pids)
+            prompt_lens.append(plen)
+
+            input_ids_t = torch.tensor(pids, dtype=torch.long, device=device)
+            positions_t = torch.arange(plen, dtype=torch.long, device=device)
+            logits = _run_prefill(
+                model, input_ids_t, positions_t,
+                seq_len=plen, block_ids=per_seq_blocks[i], block_size=block_size,
+                attn_layer_names=attn_layer_names, vllm_config=vllm_config, device=device,
+            )
+            token, logprob = _sample_token(logits[-1:], temperature, top_p, rng, seed=i)
+            all_token_ids[i].append(token.item())
+            all_logprobs[i].append(logprob.item())
+            current_seq_lens[i] = plen + 1
+            last_tokens[i] = token
+
+        # --- Batch decode context ---
+        batch_ctx = _BatchDecodeContext.create(
+            B=B, per_seq_blocks=per_seq_blocks, block_size=block_size,
+            max_blocks_per_seq=max_blocks_per_seq, attn_layer_names=attn_layer_names,
+            vllm_config=vllm_config, device=device,
+        )
+
+        use_cuda_graph = (vllm_config.parallel_config.tensor_parallel_size == 1)
+        decode_graph = None
+        logits_buf = None
+
+        if use_cuda_graph:
+            batch_ctx.input_ids[:] = last_tokens
+            batch_ctx.positions[:] = current_seq_lens - 1
+            batch_ctx.seq_lens[:] = current_seq_lens.int()
+            _update_batch_slots(batch_ctx, current_seq_lens)
+            decode_graph, logits_buf = _capture_decode_graph(
+                model, batch_ctx, B, max_possible_len)
+
+        active = [True] * B
+        segment_boundaries: list[list[int]] = [[] for _ in range(B)]
+        # Track effective tokens since last inject per sequence
+        tokens_since_inject = [1] * B  # 1 for the first token from prefill
+
+        seg_tokens = torch.zeros(B, inject_budget_every, dtype=torch.long, device=device)
+        seg_lps = torch.zeros(B, inject_budget_every, dtype=torch.float32, device=device)
+        seg_counts = [0] * B
+
+        eos_check_interval = 64
+        step = 0
+
+        batch_ctx.metadata.max_seq_len = max_possible_len
+        with set_forward_context(
+            batch_ctx.attn_metadata_dict, batch_ctx.vllm_config,
+            virtual_engine=0, num_tokens=B,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            slot_mapping=batch_ctx.slot_mapping_ctx,
+        ):
+            while any(active):
+                batch_ctx.input_ids[:] = last_tokens
+                batch_ctx.positions[:] = current_seq_lens - 1
+                batch_ctx.seq_lens[:] = current_seq_lens.int()
+                _update_batch_slots(batch_ctx, current_seq_lens)
+
+                if decode_graph is not None:
+                    decode_graph.replay()
+                    logits = logits_buf
+                else:
+                    hidden = model(input_ids=batch_ctx.input_ids, positions=batch_ctx.positions)
+                    logits = model.compute_logits(hidden)
+
+                rng.manual_seed(step)
+                tokens, lps = _sample_batch(logits, temperature, top_p, rng)
+
+                for i in range(B):
+                    if not active[i]:
+                        continue
+                    sc = seg_counts[i]
+                    seg_tokens[i, sc] = tokens[i]
+                    seg_lps[i, sc] = lps[i]
+                    seg_counts[i] = sc + 1
+                    last_tokens[i] = tokens[i]
+                    current_seq_lens[i] += 1
+                    tokens_since_inject[i] += 1
+
+                step += 1
+
+                if step % eos_check_interval == 0:
+                    for i in range(B):
+                        if not active[i]:
+                            continue
+                        sc = seg_counts[i]
+                        if sc == 0:
+                            continue
+                        eos_pos = (seg_tokens[i, :sc] == eos_token_id).nonzero(as_tuple=False)
+                        if len(eos_pos) > 0:
+                            first_eos = eos_pos[0].item()
+                            current_seq_lens[i] -= (sc - first_eos - 1)
+                            seg_counts[i] = first_eos + 1
+                            _flush_seg(i, all_token_ids, all_logprobs,
+                                       seg_tokens, seg_lps, seg_counts, segment_boundaries)
+                            active[i] = False
+
+                # Check inject triggers
+                for i in range(B):
+                    if not active[i]:
+                        continue
+                    if tokens_since_inject[i] < inject_budget_every:
+                        continue
+
+                    # Flush segment buffer
+                    _flush_seg(i, all_token_ids, all_logprobs,
+                               seg_tokens, seg_lps, seg_counts, segment_boundaries)
+
+                    # Check termination
+                    effective_tokens_i = len(all_token_ids[i]) - injected_counts[i]
+                    if effective_tokens_i >= max_total_tokens:
+                        active[i] = False
+                        continue
+
+                    # Inject budget message
+                    kv_len = int(current_seq_lens[i].item()) - 1
+                    remaining = max(0, max_total_tokens - effective_tokens_i)
+                    msg = budget_message_template.format(
+                        used=effective_tokens_i, total=max_total_tokens, remaining=remaining)
+                    inject_ids = _build_inject_tokens(tokenizer, msg)
+
+                    boundary_token = all_token_ids[i][-1]
+                    prefill_input = torch.tensor(
+                        [boundary_token] + inject_ids, dtype=torch.long, device=device)
+                    prefill_positions = torch.arange(
+                        kv_len, kv_len + len(prefill_input), dtype=torch.long, device=device)
+
+                    inject_logits = _run_prefill(
+                        model, prefill_input, prefill_positions,
+                        seq_len=kv_len + len(prefill_input),
+                        block_ids=per_seq_blocks[i], block_size=block_size,
+                        attn_layer_names=attn_layer_names, vllm_config=vllm_config,
+                        device=device, prefill_start=kv_len, prefill_len=len(prefill_input),
+                    )
+
+                    seed_val = len(all_token_ids[i]) + len(inject_ids)
+                    first_tok, first_lp = _sample_token(
+                        inject_logits[-1:], temperature, top_p, rng, seed=seed_val)
+
+                    inject_start = len(all_token_ids[i])
+                    all_token_ids[i].extend(inject_ids)
+                    all_logprobs[i].extend([0.0] * len(inject_ids))
+                    inject_ranges[i].append((inject_start, inject_start + len(inject_ids)))
+                    injected_counts[i] += len(inject_ids)
+
+                    all_token_ids[i].append(first_tok.item())
+                    all_logprobs[i].append(first_lp.item())
+
+                    current_seq_lens[i] = kv_len + len(prefill_input) + 1
+                    last_tokens[i] = first_tok
+                    tokens_since_inject[i] = 1  # reset (1 for the new assistant token)
+
+        # Final flush
+        for i in range(B):
+            sc = seg_counts[i]
+            if sc > 0:
+                eos_pos = (seg_tokens[i, :sc] == eos_token_id).nonzero(as_tuple=False)
+                if len(eos_pos) > 0:
+                    current_seq_lens[i] -= (sc - eos_pos[0].item() - 1)
+                    seg_counts[i] = eos_pos[0].item() + 1
+                _flush_seg(i, all_token_ids, all_logprobs,
+                           seg_tokens, seg_lps, seg_counts, segment_boundaries)
+
+        total_time = time.time() - t_start
+        total_tokens = sum(len(t) for t in all_token_ids)
+        logger.info(
+            "inject_only BATCH DONE: %d seqs, %d tokens, %.2fs",
+            B, total_tokens, total_time,
+        )
+
+        torch.cuda.synchronize()
+        del batch_ctx, seg_tokens, seg_lps
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return [
+            {
+                "all_token_ids": all_token_ids[i],
+                "all_logprobs": all_logprobs[i],
+                "diagnostics": {
+                    "prompt_len": prompt_lens[i],
+                    "total_tokens": len(all_token_ids[i]),
+                    "total_time": round(total_time, 3),
+                    "compaction_events": [],
+                    "segment_boundaries": segment_boundaries[i],
+                    "inject_ranges": inject_ranges[i],
+                    "final_position_offset": 0,
+                    "mean_logprob": sum(all_logprobs[i]) / max(len(all_logprobs[i]), 1),
+                },
+            }
+            for i in range(B)
+        ]
+
     def _get_model(self) -> Module:
         model = self.model_runner.model
         if hasattr(model, "runnable"):

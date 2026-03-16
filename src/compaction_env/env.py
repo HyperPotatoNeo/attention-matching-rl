@@ -43,6 +43,8 @@ class CompactionEnv(vf.SingleTurnEnv):
         use_suffix_queries: bool = True,
         inject_budget_message: bool = False,
         budget_message_template: str = "Budget: {used}/{total} tokens generated. ~{remaining} tokens remaining.",
+        inject_only: bool = False,
+        inject_budget_every: int = 2048,
         **kwargs,
     ):
         self.inner_env = inner_env
@@ -57,6 +59,8 @@ class CompactionEnv(vf.SingleTurnEnv):
         self.use_suffix_queries = use_suffix_queries
         self.inject_budget_message = inject_budget_message
         self.budget_message_template = budget_message_template
+        self.inject_only = inject_only
+        self.inject_budget_every = inject_budget_every
         self._last_segment_boundaries: list[int] | None = None
         self._last_compaction_indices: list | None = None
         self._last_inject_ranges: list[tuple[int, int]] | None = None
@@ -118,32 +122,44 @@ class CompactionEnv(vf.SingleTurnEnv):
             temperature = sampling_args.get("temperature", 0.7)
             top_p = sampling_args.get("top_p", 0.95)
 
-            request_body = {
-                "prompt_ids": prompt_ids,
-                "max_seq_len": self.compact_max_seq_len,
-                "compact_target_ratio": self.compact_target_ratio,
-                "n_compacts": self.n_compacts,
-                "temperature": temperature,
-                "top_p": top_p,
-            }
-            if self.compact_max_tokens_per_segment is not None:
-                request_body["max_tokens_per_segment"] = self.compact_max_tokens_per_segment
-            if self.compact_window is not None:
-                request_body["compact_window"] = self.compact_window
-            if self.compact_max_kv_len is not None:
-                request_body["max_kv_len"] = self.compact_max_kv_len
-            if self.compact_max_total_tokens is not None:
-                request_body["max_total_tokens"] = self.compact_max_total_tokens
-            if self.compute_beta:
-                request_body["compute_beta"] = True
-            if self.use_suffix_queries:
-                request_body["use_suffix_queries"] = True
-            if self.inject_budget_message:
-                request_body["inject_budget_message"] = True
-                request_body["budget_message_template"] = self.budget_message_template
+            if self.inject_only:
+                request_body = {
+                    "prompt_ids": prompt_ids,
+                    "max_total_tokens": self.compact_max_total_tokens or 8192,
+                    "inject_budget_every": self.inject_budget_every,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "budget_message_template": self.budget_message_template,
+                }
+                endpoint = "/inject_generate"
+            else:
+                request_body = {
+                    "prompt_ids": prompt_ids,
+                    "max_seq_len": self.compact_max_seq_len,
+                    "compact_target_ratio": self.compact_target_ratio,
+                    "n_compacts": self.n_compacts,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                }
+                if self.compact_max_tokens_per_segment is not None:
+                    request_body["max_tokens_per_segment"] = self.compact_max_tokens_per_segment
+                if self.compact_window is not None:
+                    request_body["compact_window"] = self.compact_window
+                if self.compact_max_kv_len is not None:
+                    request_body["max_kv_len"] = self.compact_max_kv_len
+                if self.compact_max_total_tokens is not None:
+                    request_body["max_total_tokens"] = self.compact_max_total_tokens
+                if self.compute_beta:
+                    request_body["compute_beta"] = True
+                if self.use_suffix_queries:
+                    request_body["use_suffix_queries"] = True
+                if self.inject_budget_message:
+                    request_body["inject_budget_message"] = True
+                    request_body["budget_message_template"] = self.budget_message_template
+                endpoint = "/compact_generate"
 
             resp = await http_client.post(
-                f"{server_url}/compact_generate",
+                f"{server_url}{endpoint}",
                 json=request_body,
             )
             resp.raise_for_status()
@@ -224,11 +240,14 @@ def load_environment(
     use_suffix_queries: bool = True,
     inject_budget_message: bool = False,
     budget_message_template: str = "Budget: {used}/{total} tokens generated. ~{remaining} tokens remaining.",
+    inject_only: bool = False,
+    inject_budget_every: int = 2048,
     **inner_env_kwargs,
 ) -> CompactionEnv:
     """Load a CompactionEnv wrapping the specified gym environment.
 
     Called by verifiers' load_environment() when env_id="compaction_env".
+    When inject_only=True, routes to /inject_generate (no compaction).
     """
     inner_env = vf.load_environment(gym, **inner_env_kwargs)
     return CompactionEnv(
@@ -244,4 +263,6 @@ def load_environment(
         use_suffix_queries=use_suffix_queries,
         inject_budget_message=inject_budget_message,
         budget_message_template=budget_message_template,
+        inject_only=inject_only,
+        inject_budget_every=inject_budget_every,
     )

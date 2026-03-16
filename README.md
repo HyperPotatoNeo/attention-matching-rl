@@ -14,9 +14,18 @@ The `CompactionWorker` drives model forward passes inside vLLM's `collective_rpc
 4. **Inject** `[prompt | C1/C2 | suffix]` back into paged blocks
 5. **Continue** generating until `max_total_tokens` or EOS
 
-Compaction uses deterministic seeded random queries (`seed + layer_idx`) to ensure identical results between inference and training replay, reducing Mismatch KL by ~6x.
+By default, suffix queries (real attention patterns from generated tokens) score key importance, with forced indices passed to the trainer for deterministic replay.
 
 With `compute_beta=true`, an additive per-key bias corrects the softmax partition function mismatch after compaction. This uses contiguous KV mirrors (BetaState) alongside vLLM's paged cache, with SDPA decode replacing FlashAttention for the bias-corrected path.
+
+### Budget Injection
+
+Budget injection tells the model how many tokens remain. Two modes:
+
+- **With compaction** (`inject_budget_message=true`): injects a user message after each compaction event
+- **Without compaction** (`inject_only=true`): injects every `inject_budget_every` tokens during standard generation (no KV compression)
+
+Injected tokens get `completion_mask=0` so they don't contribute to loss. Logprobs are 0.0 at inject positions.
 
 ## Setup
 
@@ -102,7 +111,7 @@ The launch script handles container setup, config resolution (replacing `__INFER
 | `src/prime_rl/inference/compaction/worker.py` | Generation + compaction (single & batch) |
 | `src/prime_rl/inference/compaction/algorithm.py` | Attention Matching + NNLS beta solver |
 | `src/prime_rl/inference/compaction/beta_attention.py` | BetaState mirrors + SDPA decode with bias |
-| `src/prime_rl/inference/compaction/routes.py` | `/compact_generate` endpoint + auto-batching |
+| `src/prime_rl/inference/compaction/routes.py` | `/compact_generate` + `/inject_generate` endpoints + auto-batching |
 | `src/prime_rl/trainer/rl/compaction.py` | Beta training hooks + deterministic compaction replay |
 | `src/compaction_env/env.py` | CompactionEnv (verifiers wrapper) |
 | `scripts/eval_rg_mix.py` | Evaluation script |
@@ -111,12 +120,14 @@ The launch script handles container setup, config resolution (replacing `__INFER
 
 | Config | Purpose |
 |--------|---------|
-| `qwen3_4b_fullft_suffix_queries.toml` | **Default** — 4+4 layout, suffix queries + forced indices, no beta |
-| `qwen3_4b_fullft_determ_nobeta.toml` | Random queries, deterministic compaction, no beta |
-| `qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic, legacy) |
+| `qwen3_4b_fullft_suffix_queries.toml` | **Default** — suffix queries + forced indices, no beta |
+| `qwen3_4b_fullft_baseline.toml` | Baseline (no compaction, standard vLLM) |
+| `qwen3_4b_fullft_baseline_inject.toml` | Baseline + budget injection every 2048 tokens |
+| `qwen3_4b_fullft_inject_budget.toml` | Compaction + budget injection after each compaction |
+| `qwen3_4b_fullft_inject_budget_suffix.toml` | Compaction + budget injection + suffix queries |
 | `qwen3_4b_beta_test.toml` | Beta attention test (compute_beta=true) |
-| `qwen3_4b_fullft_baseline.toml` | Baseline training (no compaction) |
 | `qwen3_4b_serve_tp1.toml` | TP=1 compaction server |
+| `qwen3_4b_serve_tp1_baseline.toml` | TP=1 baseline server (no compaction) |
 
 ## Docs
 

@@ -162,12 +162,114 @@ class _RequestBatcher:
         return responses
 
 
+class InjectGenerateRequest(BaseModel):
+    prompt_ids: list[int]
+    max_total_tokens: int = 8192
+    inject_budget_every: int = 2048
+    temperature: float = 0.7
+    top_p: float = 0.95
+    budget_message_template: str = "Budget: {used}/{total} tokens generated. ~{remaining} tokens remaining."
+
+
+class _InjectBatcher:
+    """Auto-batches /inject_generate requests into inject_only_generate_batch calls."""
+
+    def __init__(self, max_batch_size: int = MAX_BATCH_SIZE, max_wait: float = MAX_WAIT_SECONDS):
+        self.max_batch_size = max_batch_size
+        self.max_wait = max_wait
+        self._queue: asyncio.Queue[tuple[InjectGenerateRequest, asyncio.Future]] = asyncio.Queue()
+        self._started = False
+
+    def _ensure_started(self, app):
+        if not self._started:
+            self._started = True
+            asyncio.create_task(self._worker(app))
+
+    async def submit(self, body: InjectGenerateRequest, app) -> dict:
+        self._ensure_started(app)
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        await self._queue.put((body, future))
+        return await future
+
+    async def _worker(self, app):
+        while True:
+            item = await self._queue.get()
+            batch = [item]
+
+            deadline = asyncio.get_event_loop().time() + self.max_wait
+            while len(batch) < self.max_batch_size:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                    batch.append(item)
+                except asyncio.TimeoutError:
+                    break
+
+            try:
+                results = await self._process_batch(app, batch)
+                for (_, future), result in zip(batch, results):
+                    if not future.done():
+                        future.set_result(result)
+            except Exception as e:
+                for _, future in batch:
+                    if not future.done():
+                        future.set_exception(e)
+
+    async def _process_batch(self, app, batch: list[tuple[InjectGenerateRequest, asyncio.Future]]) -> list[dict]:
+        engine = app.state.engine_client
+        tokenizer = engine.get_tokenizer()
+        eos_token_id = tokenizer.eos_token_id
+
+        first_body = batch[0][0]
+        prompt_ids_list = [b.prompt_ids for b, _ in batch]
+        B = len(prompt_ids_list)
+
+        logger.info("Inject auto-batch: B=%d, max_total=%d, inject_every=%d",
+                     B, first_body.max_total_tokens, first_body.inject_budget_every)
+
+        results = await engine.collective_rpc(
+            "inject_only_generate_batch",
+            args=(
+                prompt_ids_list,
+                first_body.max_total_tokens,
+                first_body.inject_budget_every,
+                first_body.temperature,
+                first_body.top_p,
+                eos_token_id,
+            ),
+            kwargs={
+                "budget_message_template": first_body.budget_message_template,
+            },
+        )
+
+        batch_results = results[0]
+        responses = []
+        for result in batch_results:
+            final_text = tokenizer.decode(result["all_token_ids"], skip_special_tokens=True)
+            responses.append({
+                "all_token_ids": result["all_token_ids"],
+                "all_logprobs": result["all_logprobs"],
+                "final_text": final_text,
+                "diagnostics": result.get("diagnostics", {}),
+            })
+        return responses
+
+
 _batcher = _RequestBatcher()
+_inject_batcher = _InjectBatcher()
 
 
 @router.post("/compact_generate")
 async def compact_generate(body: CompactGenerateRequest, request: Request):
     return await _batcher.submit(body, request.app)
+
+
+@router.post("/inject_generate")
+async def inject_generate(body: InjectGenerateRequest, request: Request):
+    return await _inject_batcher.submit(body, request.app)
 
 
 @router.post("/compact_generate_batch")

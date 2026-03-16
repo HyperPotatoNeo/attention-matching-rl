@@ -20,7 +20,7 @@ unset NCCL_SOCKET_IFNAME
 bash scripts/start_4servers.sh
 ```
 
-This starts 4 independent TP=1 vLLM servers on ports 8000-8003, each with the `CompactionWorker` extension that exposes `/compact_generate`.
+This starts 4 independent TP=1 vLLM servers on ports 8000-8003, each with the `CompactionWorker` extension that exposes `/compact_generate` and `/inject_generate`.
 
 ### 3. Run evaluation
 
@@ -97,6 +97,37 @@ Generate text with mid-sequence KV cache compaction. Requests are transparently 
 | `max_total_tokens` | `int\|null` | null | KV budget: stop after this many completion tokens |
 | `compute_beta` | `bool` | false | Compute NNLS beta bias for partition function correction |
 | `use_suffix_queries` | `bool` | true | Use suffix token attention queries instead of random probes |
+| `inject_budget_message` | `bool` | false | Inject user message with remaining budget after each compaction |
+| `budget_message_template` | `str` | `"Budget: {used}/{total}..."` | Template for budget message (`{used}`, `{total}`, `{remaining}`) |
+
+### POST `/inject_generate`
+
+Generate text with periodic budget injection but **no KV compaction**. Useful as a
+baseline to isolate the effect of budget awareness from compression. Requests are
+auto-batched (up to B=32).
+
+```json
+{
+    "prompt_ids": [1, 2, 3],
+    "max_total_tokens": 8192,
+    "inject_budget_every": 2048,
+    "temperature": 0.6,
+    "top_p": 0.95
+}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `prompt_ids` | `list[int]` | required | Tokenized prompt |
+| `max_total_tokens` | `int` | 8192 | Stop after this many effective tokens |
+| `inject_budget_every` | `int` | 2048 | Inject budget message every N effective tokens |
+| `temperature` | `float` | 0.7 | Sampling temperature |
+| `top_p` | `float` | 0.95 | Top-p sampling |
+| `budget_message_template` | `str` | `"Budget: {used}/{total}..."` | Template for budget message |
+
+Response format is identical to `/compact_generate` (with `compaction_events: []`
+and `final_position_offset: 0`). The `inject_ranges` field contains the positions
+of injected budget tokens, and `completion_mask` has 0 at those positions.
 
 **Response:**
 
@@ -151,14 +182,14 @@ Training parameters:
 
 | Config | Purpose |
 |--------|---------|
-| `qwen3_4b_fullft_suffix_queries.toml` | **Default** — 4+4 layout, suffix queries + forced indices, no beta |
-| `qwen3_4b_fullft_determ_nobeta.toml` | Random queries, deterministic compaction, no beta |
-| `qwen3_4b_fullft_determ_suffix.toml` | Deterministic random queries + prompt keys |
-| `qwen3_4b_fullft_fixed_1024q.toml` | 1024 random queries |
-| `qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic, legacy) |
+| `qwen3_4b_fullft_suffix_queries.toml` | **Default** — suffix queries + forced indices, no beta |
+| `qwen3_4b_fullft_baseline.toml` | Baseline (no compaction, standard vLLM) |
+| `qwen3_4b_fullft_baseline_inject.toml` | Baseline + budget injection every 2048 tokens |
+| `qwen3_4b_fullft_inject_budget.toml` | Compaction + budget injection after each compaction |
+| `qwen3_4b_fullft_inject_budget_suffix.toml` | Compaction + budget injection + suffix queries |
 | `qwen3_4b_beta_test.toml` | Beta attention test (compute_beta=true) |
-| `qwen3_4b_fullft_baseline.toml` | Baseline training (no compaction) |
 | `qwen3_4b_serve_tp1.toml` | TP=1 compaction server |
+| `qwen3_4b_serve_tp1_baseline.toml` | TP=1 baseline server (no compaction) |
 
 ## Scripts
 
