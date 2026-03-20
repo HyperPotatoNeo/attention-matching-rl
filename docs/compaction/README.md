@@ -125,6 +125,85 @@ Generate text with mid-sequence KV cache compaction. Requests are transparently 
 }
 ```
 
+## Session API
+
+Persistent KV-cache sessions for multi-turn generation. Each session retains its KV cache
+across steps, enabling compaction strategies that are aware of turn boundaries.
+
+### POST `/compact_session/create`
+
+Create a session and generate the first response.
+
+```json
+{
+    "session_id": "my-session-0",
+    "prompt_ids": [1, 2, 3],
+    "max_kv_len": 8192,
+    "compact_target_ratio": 0.5,
+    "compact_window": null,
+    "max_tokens": 512,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "compaction_mode": "attention_matching",
+    "n_protect_turns": 1
+}
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `session_id` | `str` | required | Unique session identifier |
+| `prompt_ids` | `list[int]` | required | Tokenized system prompt + first user message |
+| `max_kv_len` | `int` | required | KV cache capacity (tokens). Triggers KV-budget compaction when `n_protect_turns=-1`. |
+| `compact_target_ratio` | `float` | 0.3 | Fraction of the compacted window to keep |
+| `compact_window` | `int\|null` | null | Compress only first N tokens of history (null = all). Ignored when `n_protect_turns >= 0`. |
+| `max_tokens` | `int` | 512 | Max tokens per response |
+| `temperature` | `float` | 0.7 | Sampling temperature |
+| `top_p` | `float` | 0.95 | Top-p sampling |
+| `compaction_mode` | `str` | `"attention_matching"` | `"attention_matching"` or `"markovian"` |
+| `n_protect_turns` | `int` | -1 | Turn-based compaction: keep last N turns uncompacted. `-1` = disabled (KV-budget mode). |
+
+### POST `/compact_session/step`
+
+Continue a session with a new user message.
+
+```json
+{
+    "session_id": "my-session-0",
+    "new_token_ids": [42, 67, 89],
+    "max_tokens": 512
+}
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `session_id` | `str` | required | Session ID from `/compact_session/create` |
+| `new_token_ids` | `list[int]` | required | Tokenized user message (boundary token prepended automatically) |
+| `max_tokens` | `int` | 512 | Max tokens for this response |
+| `temperature` | `float` | inherited | Override sampling temperature for this step |
+| `top_p` | `float` | inherited | Override top-p for this step |
+
+**Response (both create and step):**
+
+```json
+{
+    "token_ids": [101, 203, 55],
+    "text": "decoded response...",
+    "compaction_events": [
+        {"kv_len_before": 4096, "kv_len_after": 2200}
+    ]
+}
+```
+
+### DELETE `/compact_session/{session_id}`
+
+Release KV blocks and remove session state.
+
+---
+
 ## Compaction Modes
 
 ### Attention Matching (default)
@@ -206,6 +285,87 @@ python scripts/eval_balrog_babyai.py \
 | Turn-based | after each turn completes | assistant K-vectors (lookahead) | last N turns |
 | Markovian | same trigger as KV-budget | n/a (hard delete) | nothing |
 
+## BabyAI Evaluation
+
+Multi-turn grid-world benchmark using BabyAI (MiniGrid). The model receives text
+descriptions of a grid-world state and must issue actions to complete navigation and
+manipulation tasks. Evaluates the model's ability to maintain context over many turns.
+
+### Installation
+
+`minigrid` and `gymnasium` are included in the project dependencies:
+
+```bash
+uv sync
+```
+
+No additional setup is needed — the eval script uses MiniGrid directly and does not
+require the full BALROG framework (no cmake, no NLE).
+
+### Tasks
+
+Eight BabyAI tasks spanning three difficulty levels:
+
+| Task | Difficulty | Description |
+|------|-----------|-------------|
+| `GoToObj` | easy | Navigate to a named object |
+| `GoToLocal` | easy | Navigate to a local object |
+| `PickupLoc` | easy | Pick up an object at a location |
+| `Open` | medium | Open a door |
+| `PutNextLocal` | medium | Place an object next to another |
+| `GoTo` | medium | Navigate to a goal position |
+| `Unlock` | hard | Find key and unlock door |
+| `UnlockLocal` | hard | Find and use local key |
+
+### Running Evals
+
+```bash
+# Baseline — standard generation, no compaction
+python scripts/eval_balrog_babyai.py --mode baseline --n 10
+
+# KV-budget compaction — compacts reactively when cache fills
+python scripts/eval_balrog_babyai.py --mode compaction --n 10 \
+    --max-kv-len 4096 --compact-ratio 0.5
+
+# Turn-based compaction — compacts after each turn, uses assistant K-vectors as probes
+python scripts/eval_balrog_babyai.py --mode compaction --use-sessions --n 10 \
+    --max-kv-len 8192 --compact-ratio 0.5 --n-protect-turns 1
+
+# Turn-based markovian — hard-deletes history after each turn
+python scripts/eval_balrog_babyai.py --mode markovian --use-sessions --n 10 \
+    --max-kv-len 8192 --n-protect-turns 1
+
+# Specific tasks only
+python scripts/eval_balrog_babyai.py --mode baseline --n 10 \
+    --envs GoToObj GoToLocal Unlock
+```
+
+**Key flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mode` | required | `baseline`, `compaction`, or `markovian` |
+| `--n` | 10 | Episodes per task |
+| `--max-kv-len` | none | KV cache size limit (tokens) |
+| `--compact-ratio` | 0.25 | Fraction to keep after compaction |
+| `--use-sessions` | off | Use persistent KV session API |
+| `--n-protect-turns` | -1 | Turn-based: keep last N turns intact (-1 = KV-budget mode) |
+| `--max-turns` | 64 | Max turns per episode |
+| `--max-response-tokens` | 512 | Max tokens per model response |
+| `--ports` | `8000,...,8003` | Server ports (comma-separated) |
+| `--output` | none | Save results to JSON |
+| `--save-traces` | off | Include full action traces in output |
+| `--plot` | off | Generate reward/token plots |
+
+### Notes
+
+- `--use-sessions` is required for turn-based compaction (`--n-protect-turns >= 0`).
+  KV-budget compaction works without sessions (`--use-sessions` optional).
+- When `--n-protect-turns >= 0`, `--compact-window` has no effect and a warning is logged.
+- The model (`Qwen/Qwen3-4B-Instruct-2507`) is served via `configs/compaction/qwen3_4b_serve_tp1.toml`.
+
+---
+
 ## Training
 
 Default: 2-node, 4+4 layout (4 inference + 4 trainer GPUs). Uses suffix queries for
@@ -240,9 +400,11 @@ Training parameters:
 | `qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic, legacy) |
 | `qwen3_4b_beta_test.toml` | Beta attention test (compute_beta=true) |
 | `qwen3_4b_fullft_baseline.toml` | Baseline training (no compaction) |
+| `qwen3_4b_balrog_babyai.toml` | BabyAI RL training config (balrog-bench env) |
 | `qwen3_4b_markovian_test.toml` | Markovian mode — Qwen3-4B, 50 steps |
 | `qwen3_06b_markovian_test.toml` | Markovian mode — Qwen3-0.6B, fast E2E test |
-| `qwen3_4b_serve_tp1.toml` | TP=1 compaction server (4B) |
+| `qwen3_4b_serve_tp1.toml` | TP=1 inference server with compaction (4B Instruct) |
+| `qwen3_4b_baseline_tp1.toml` | TP=1 baseline server, no compaction (4B) |
 | `qwen3_06b_serve_tp1.toml` | TP=1 compaction server (0.6B) |
 
 ## Scripts
@@ -251,7 +413,11 @@ Training parameters:
 |--------|---------|
 | `~/compaction_suffix_queries.sh` | **Default launch** — 2-node sbatch (suffix queries + forced indices) |
 | `scripts/start_4servers.sh` | 4 TP=1 servers on ports 8000-8003 |
-| `scripts/eval_rg_mix.py` | Evaluate on rg-mix-env |
+| `scripts/eval_rg_mix.py` | Evaluate on rg-mix-env (single-turn, math/reasoning) |
+| `scripts/eval_balrog_babyai.py` | BabyAI multi-turn eval (baseline, compaction, markovian) |
+| `scripts/eval_aime_rsa.py` | AIME benchmark for RSA vs baseline |
+| `scripts/viz_babyai.py` | Visualize BabyAI episode traces |
+| `scripts/viz_results.py` | Plot eval results across runs |
 
 ## Prompt Keys (Default Behavior)
 

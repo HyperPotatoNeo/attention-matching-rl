@@ -36,6 +36,7 @@ dependencies = [
     "reverse-text",
     "tilelang>=0.1.8",
     "gradio>=6.9.0",
+    "minigrid>=2.3.0",
 ]
 
 [project.scripts]
