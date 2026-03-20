@@ -35,6 +35,7 @@ dependencies = [
     "dion",
     "reverse-text",
     "tilelang>=0.1.8",
+    "gradio>=6.9.0",
 ]
 
 [project.scripts]
