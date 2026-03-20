@@ -404,6 +404,7 @@ def train(config: TrainerConfig):
                         compute_beta=getattr(config, "compute_beta", False),
                         use_suffix_queries=getattr(config, "use_suffix_queries", True),
                         compaction_indices=micro_batch.get("compaction_indices"),
+                        compaction_mode=getattr(config, "compaction_mode", "attention_matching"),
                     )
                 else:
                     out = forward(

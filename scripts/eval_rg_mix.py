@@ -227,9 +227,51 @@ def run_baseline_one(problem, port, model_name, args):
     }
 
 
+def run_rsa_one(problem, port, tokenizer, args):
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": problem["question"]},
+    ]
+    result = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True,
+    )
+    prompt_ids = list(result["input_ids"]) if hasattr(result, "keys") else list(result)
+
+    t0 = time.time()
+    client = httpx.Client(base_url=f"http://localhost:{port}", timeout=1200.0)
+    body = {
+        "prompt_ids": prompt_ids,
+        "K": args.rsa_K,
+        "T": args.rsa_T,
+        "k_peers": args.rsa_k_peers,
+        "max_tokens_per_candidate": args.rsa_max_tokens,
+        "compact_target_ratio": args.compact_ratio,
+        "probe_tokens": args.rsa_probe_tokens,
+        "temperature": 0.6,
+        "top_p": 0.95,
+    }
+    resp = client.post("/rsa_generate", json=body)
+    elapsed = time.time() - t0
+    resp.raise_for_status()
+    data = resp.json()
+
+    return {
+        "text": data["best"],
+        "populations": data["populations"],
+        "tokens": sum(
+            sum(len(c) for c in pop)
+            for pop in data.get("diagnostics", {}).get("candidate_lengths", [[]])
+        ),
+        "time": elapsed,
+        "diagnostics": data.get("diagnostics", {}),
+        "mean_logprob": 0,
+        "logprobs": [],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["baseline", "compaction"], required=True)
+    parser.add_argument("--mode", choices=["baseline", "compaction", "rsa"], required=True)
     parser.add_argument("--n", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model", default="Qwen/Qwen3-4B")
@@ -250,6 +292,14 @@ def main():
     parser.add_argument("--use-suffix-queries", action="store_true",
                         help="Use suffix queries instead of random probes for compaction")
     parser.add_argument("--output", default=None)
+    # RSA-specific args
+    parser.add_argument("--rsa-K", type=int, default=4, help="RSA population size")
+    parser.add_argument("--rsa-T", type=int, default=2, help="RSA aggregation steps")
+    parser.add_argument("--rsa-k-peers", type=int, default=2, help="RSA peers per step")
+    parser.add_argument("--rsa-probe-tokens", type=int, default=512,
+                        help="RSA probe tokens for attention patterns")
+    parser.add_argument("--rsa-max-tokens", type=int, default=2048,
+                        help="RSA max tokens per candidate")
     args = parser.parse_args()
 
     ports = [int(p) for p in args.ports.split(",")]
@@ -282,10 +332,15 @@ def main():
         print(f"  ratio={args.compact_ratio}, window={args.compact_window}")
         print(f"  suffix_queries={args.use_suffix_queries}")
         print(f"  DP={len(ports)} (ports: {ports})")
+    elif args.mode == "rsa":
+        print(f"  K={args.rsa_K}, T={args.rsa_T}, k_peers={args.rsa_k_peers}")
+        print(f"  max_tokens={args.rsa_max_tokens}, probe={args.rsa_probe_tokens}")
+        print(f"  ratio={args.compact_ratio}")
+        print(f"  DP={len(ports)} (ports: {ports})")
     print()
 
     # Health check
-    check_port = ports[0] if args.mode == "compaction" else int(
+    check_port = ports[0] if args.mode in ("compaction", "rsa") else int(
         args.server_url.rsplit(":", 1)[-1].split("/")[0]
     )
     health = httpx.get(f"http://localhost:{check_port}/health", timeout=10.0)
@@ -421,6 +476,49 @@ def main():
                         f"task={prob['task']:20s} "
                         f"tokens={gen['tokens']:5d} "
                         f"compacts={n_actual_compacts} "
+                        f"time={gen['time']:.1f}s "
+                        f"acc={total_correct}/{len(results)} "
+                        f"({total_correct/len(results):.1%})"
+                    )
+    elif args.mode == "rsa":
+        # RSA mode: one request per server (RSA uses full GPU internally)
+        batch_size = len(ports)
+        for batch_start in range(0, len(problems), batch_size):
+            batch = problems[batch_start:batch_start + batch_size]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as ex:
+                futures = {}
+                for j, prob in enumerate(batch):
+                    port = ports[j % len(ports)]
+                    f = ex.submit(run_rsa_one, prob, port, tokenizer, args)
+                    futures[f] = (batch_start + j, prob)
+
+                for f in concurrent.futures.as_completed(futures):
+                    idx, prob = futures[f]
+                    gen = f.result()
+                    score = score_problem(prob, gen["text"])
+                    correct = score >= 0.5
+                    total_correct += int(correct)
+                    total_tokens += gen["tokens"]
+
+                    results.append({
+                        "idx": idx,
+                        "task": prob["task"],
+                        "correct": correct,
+                        "score": score,
+                        "tokens": gen["tokens"],
+                        "time": round(gen["time"], 2),
+                        "n_compactions": len(
+                            gen["diagnostics"].get("compaction_events", [])
+                        ),
+                        "mean_logprob": gen["mean_logprob"],
+                        "diagnostics": gen["diagnostics"],
+                    })
+
+                    status = "OK" if correct else "FAIL"
+                    print(
+                        f"[{len(results):3d}/{args.n}] {status} "
+                        f"task={prob['task']:20s} "
+                        f"tokens={gen['tokens']:5d} "
                         f"time={gen['time']:.1f}s "
                         f"acc={total_correct}/{len(results)} "
                         f"({total_correct/len(results):.1%})"

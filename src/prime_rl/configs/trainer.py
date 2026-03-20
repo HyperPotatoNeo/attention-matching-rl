@@ -681,6 +681,10 @@ class TrainerConfig(BaseConfig):
         bool,
         Field(description="Use suffix token queries for compaction importance scoring instead of random probes."),
     ] = False
+    compaction_mode: Annotated[
+        str,
+        Field(description="Compaction mode: 'attention_matching' (default) or 'markovian' (hard-delete window)."),
+    ] = "attention_matching"
 
     memory_profiler_path: Annotated[Path | None, Field(description="Path to write memory profile to.")] = None
 

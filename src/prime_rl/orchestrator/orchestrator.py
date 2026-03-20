@@ -221,10 +221,15 @@ async def orchestrate(config: OrchestratorConfig):
     await wait_for_env_servers(train_env_clients)
     logger.success("Train environment servers ready")
 
-    # this puts all train envs into server model
+    # this puts all train envs into server mode
     # all calls to run_rollout and run_group will be routed to the server via the env client
+    # Skip env_client for CompactionEnv — it overrides get_model_response() and must
+    # run in-process to call /compact_generate on the local inference server.
     for env, env_client in zip(train_env_group.envs, train_env_clients):
-        env.env_client = env_client
+        if type(env).__name__ == "CompactionEnv":
+            logger.info("Skipping env_client for CompactionEnv (runs in-process)")
+        else:
+            env.env_client = env_client
 
     if config.eval:
         env_ids = [strip_env_version(env.id) for env in config.eval.env]

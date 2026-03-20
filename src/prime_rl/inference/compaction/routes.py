@@ -1,10 +1,13 @@
-"""FastAPI routes for KV cache compaction generation.
+"""FastAPI routes for KV cache compaction generation and RSA.
 
 Provides /compact_generate endpoint that generates text with mid-sequence
 KV compaction via the CompactionWorker's collective_rpc method.
 
 Individual /compact_generate requests are transparently batched into
 compact_generate_batch calls for higher GPU utilization.
+
+Also provides /rsa_generate for Recursive Self-Aggregation with persistent
+compacted memory.
 """
 
 import asyncio
@@ -219,3 +222,62 @@ async def compact_generate_batch(body: CompactGenerateBatchRequest, request: Req
         })
 
     return {"results": responses}
+
+
+DEFAULT_AGG_TEMPLATE = (
+    "\n\nHere are some previous attempts at solving this problem. "
+    "Review them carefully and provide an improved solution:\n\n"
+    "{peer_cots}\n\n"
+    "Now provide your improved solution:"
+)
+
+
+class RsaGenerateRequest(BaseModel):
+    prompt_ids: list[int]
+    K: int = 4
+    N: int | None = None
+    T: int = 2
+    k_peers: int = 2
+    max_tokens_per_candidate: int = 2048
+    compact_target_ratio: float = 0.25
+    probe_tokens: int = 512
+    agg_template: str = DEFAULT_AGG_TEMPLATE
+    temperature: float = 0.7
+    top_p: float = 0.95
+    selection_strategy: str = "random"
+
+
+@router.post("/rsa_generate")
+async def rsa_generate(body: RsaGenerateRequest, request: Request):
+    engine = request.app.state.engine_client
+    tokenizer = engine.get_tokenizer()
+    eos_token_id = tokenizer.eos_token_id
+
+    result = await engine.collective_rpc(
+        "rsa_generate",
+        args=(
+            body.prompt_ids,
+            body.K,
+            body.T,
+            body.k_peers,
+            body.max_tokens_per_candidate,
+            body.compact_target_ratio,
+            body.probe_tokens,
+            body.agg_template,
+            body.temperature,
+            body.top_p,
+            eos_token_id,
+        ),
+        kwargs={"selection_strategy": body.selection_strategy, "N": body.N},
+    )
+
+    rsa_result = result[0]
+
+    # Decode populations to text (they're already text from _batch_generate)
+    populations = rsa_result["populations"]
+
+    return {
+        "populations": populations,
+        "best": rsa_result["best"],
+        "diagnostics": rsa_result["diagnostics"],
+    }

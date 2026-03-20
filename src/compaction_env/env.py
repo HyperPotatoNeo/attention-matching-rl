@@ -5,7 +5,9 @@ The entire generate->compact->continue loop happens server-side via /compact_gen
 From the trainer's perspective, this produces a standard rollout with a single
 TrajectoryStep containing all tokens across all segments.
 
-The inner env (e.g. countdown, math) provides dataset and scoring rubric.
+The inner env (e.g. countdown, math, balrog-bench) provides dataset, scoring rubric,
+and multi-turn game logic. CompactionEnv wraps any Environment (single- or multi-turn)
+and replaces model calls with /compact_generate requests.
 """
 import logging
 import time
@@ -26,8 +28,14 @@ from verifiers.types import (
 logger = logging.getLogger(__name__)
 
 
-class CompactionEnv(vf.SingleTurnEnv):
-    """Environment that routes generation through /compact_generate."""
+class CompactionEnv(vf.MultiTurnEnv):
+    """Environment that routes generation through /compact_generate.
+
+    Wraps any verifiers Environment (single- or multi-turn) and overrides
+    get_model_response to call /compact_generate instead of the standard
+    OpenAI chat completions API. Multi-turn behavior (env_response,
+    setup_state, stop conditions) is delegated to the inner env.
+    """
 
     def __init__(
         self,
@@ -41,6 +49,7 @@ class CompactionEnv(vf.SingleTurnEnv):
         max_total_tokens: int | None = None,
         compute_beta: bool = False,
         use_suffix_queries: bool = True,
+        compaction_mode: str = "attention_matching",
         **kwargs,
     ):
         self.inner_env = inner_env
@@ -53,17 +62,38 @@ class CompactionEnv(vf.SingleTurnEnv):
         self.compact_max_total_tokens = max_total_tokens
         self.compute_beta = compute_beta
         self.use_suffix_queries = use_suffix_queries
+        self.compaction_mode = compaction_mode
         self._last_segment_boundaries: list[int] | None = None
         self._last_compaction_indices: list | None = None
 
+        inner_max_turns = getattr(inner_env, "max_turns", 1)
+
         super().__init__(
+            max_turns=inner_max_turns,
             dataset=inner_env.dataset,
             eval_dataset=getattr(inner_env, "eval_dataset", None),
             system_prompt=inner_env.system_prompt,
             parser=inner_env.parser,
             rubric=inner_env.rubric,
+            tool_defs=getattr(inner_env, "tool_defs", None),
             **kwargs,
         )
+
+    async def setup_state(self, state: State) -> State:
+        return await self.inner_env.setup_state(state)
+
+    async def env_response(
+        self, messages: Messages, state: State, **kwargs
+    ) -> Messages | str:
+        return await self.inner_env.env_response(messages, state, **kwargs)
+
+    @vf.stop
+    async def inner_env_done(self, state: State, **kwargs) -> bool:
+        """Proxy stop conditions from the inner env."""
+        for condition in self.inner_env._stop_conditions:
+            if await condition(state):
+                return True
+        return False
 
     async def get_model_response(
         self,
@@ -133,6 +163,8 @@ class CompactionEnv(vf.SingleTurnEnv):
                 request_body["compute_beta"] = True
             if self.use_suffix_queries:
                 request_body["use_suffix_queries"] = True
+            if self.compaction_mode != "attention_matching":
+                request_body["compaction_mode"] = self.compaction_mode
 
             resp = await http_client.post(
                 f"{server_url}/compact_generate",
@@ -206,6 +238,7 @@ def load_environment(
     max_total_tokens: int | None = None,
     compute_beta: bool = False,
     use_suffix_queries: bool = True,
+    compaction_mode: str = "attention_matching",
     **inner_env_kwargs,
 ) -> CompactionEnv:
     """Load a CompactionEnv wrapping the specified gym environment.
@@ -224,4 +257,5 @@ def load_environment(
         max_total_tokens=max_total_tokens,
         compute_beta=compute_beta,
         use_suffix_queries=use_suffix_queries,
+        compaction_mode=compaction_mode,
     )

@@ -726,6 +726,16 @@ class RLConfig(BaseConfig):
                 break
         return self
 
+    @model_validator(mode="after")
+    def auto_setup_compaction_mode(self):
+        """Sync compaction_mode from env args to trainer config."""
+        for env in self.orchestrator.env:
+            mode = env.args.get("compaction_mode")
+            if mode is not None and mode != "attention_matching":
+                self.trainer.compaction_mode = mode
+                break
+        return self
+
     ### Warnings
 
     @model_validator(mode="after")

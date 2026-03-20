@@ -273,6 +273,7 @@ def segmented_forward(
     compute_beta: bool = False,
     use_suffix_queries: bool = True,
     compaction_indices: list | None = None,
+    compaction_mode: str = "attention_matching",
 ) -> dict[str, Tensor]:
     """Run segmented forward passes with compaction replay between segments.
 
@@ -368,8 +369,9 @@ def segmented_forward(
             saved_lora_num_tokens[0] = seg_len
 
         # Register query capture hooks for non-last segments when using suffix queries
+        # (not needed for markovian mode — no importance scoring)
         is_last_segment = (seg_idx == len(seg_input_ranges) - 1)
-        if use_suffix_queries and not is_last_segment and not query_capture_hooks:
+        if use_suffix_queries and compaction_mode != "markovian" and not is_last_segment and not query_capture_hooks:
             attn_modules = _find_attention_modules(model)
             for layer_idx, module in enumerate(attn_modules):
                 handle = module.register_forward_pre_hook(
@@ -432,18 +434,24 @@ def segmented_forward(
                         for layer_indices in seg_ci
                     ]
 
-            compact_seed = prompt_len * 10000 + seg_idx
-            c1_list, c2_list, beta_list, _ = compact_kv(
-                keys, values, prompt_len, compact_target_ratio,
-                num_kv_heads, head_size, device,
-                compact_window=window,
-                compute_beta=compute_beta,
-                seed=compact_seed,
-                suffix_queries=suffix_queries,
-                forced_indices=seg_forced_indices,
-            )
-
-            compacted_prefix_len = c1_list[0].shape[0]
+            if compaction_mode == "markovian":
+                kv_dim = (0, num_kv_heads, head_size)
+                c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in range(num_layers)]
+                c2_list = [torch.empty(kv_dim, dtype=values[0].dtype, device=device) for _ in range(num_layers)]
+                beta_list = None
+                compacted_prefix_len = 0
+            else:
+                compact_seed = prompt_len * 10000 + seg_idx
+                c1_list, c2_list, beta_list, _ = compact_kv(
+                    keys, values, prompt_len, compact_target_ratio,
+                    num_kv_heads, head_size, device,
+                    compact_window=window,
+                    compute_beta=compute_beta,
+                    seed=compact_seed,
+                    suffix_queries=suffix_queries,
+                    forced_indices=seg_forced_indices,
+                )
+                compacted_prefix_len = c1_list[0].shape[0]
             suffix_len = asst_len - window
 
             compacted_cache = DynamicCache()
