@@ -14,6 +14,7 @@ import logging
 import math
 import random as pyrandom
 import time
+from dataclasses import dataclass
 
 import torch
 from torch.nn import Module
@@ -31,12 +32,50 @@ from prime_rl.inference.vllm.worker.filesystem import FileSystemWeightUpdateWork
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class SessionState:
+    block_ids: list[int]
+    current_seq_len: int
+    prompt_len: int
+    position_offset: int
+    max_kv_len: int
+    compact_target_ratio: float
+    compact_window: int | None
+    compaction_mode: str
+    temperature: float
+    top_p: float
+    eos_token_id: int
+    use_suffix_queries: bool
+    turn_user_lens: list[int]
+    turn_asst_lens: list[int]
+    n_protect_turns: int  # -1 = disabled (use KV-budget mode)
+
+
 class CompactionWorker(FileSystemWeightUpdateWorker):
     """Worker extension with KV cache compaction for RL training.
 
     Inherits filesystem weight updates. Adds compact_generate() for
     generating text with mid-sequence KV cache compaction.
     """
+
+    _think_token_id: int | None = None
+
+    def _get_think_token_id(self) -> int:
+        """Get the <think> token ID, cached across calls."""
+        if self._think_token_id is None:
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(
+                self.model_runner.vllm_config.model_config.model,
+                trust_remote_code=True,
+            )
+            ids = tok.encode("<think>", add_special_tokens=False)
+            if len(ids) != 1:
+                logger.warning("<think> encodes to %d tokens, expected 1; skipping injection", len(ids))
+                self._think_token_id = -1
+            else:
+                self._think_token_id = ids[0]
+                logger.info("<think> token ID: %d", self._think_token_id)
+        return self._think_token_id
 
     def compact_generate(
         self,
@@ -51,6 +90,9 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         max_kv_len: int | None = None,
         max_total_tokens: int | None = None,
         compute_beta: bool = False,
+        compaction_mode: str = "attention_matching",
+        carryover_ratio: float = 0.5,
+        use_suffix_queries: bool = True,
     ) -> dict:
         """Generate text with KV cache compaction between segments.
 
@@ -62,6 +104,9 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         - KV budget mode (max_kv_len set): each segment generates until
           current_seq_len reaches max_kv_len, then compacts. Stops when
           total completion tokens reach max_total_tokens.
+
+        compaction_mode: "attention_matching" (default) or "markovian" (keep last m tokens).
+        carryover_ratio: fraction of assistant tokens to keep in markovian mode (default 0.5).
 
         Returns dict with all_token_ids, all_logprobs, and diagnostics.
         """
@@ -81,10 +126,17 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         kv_budget_mode = max_kv_len is not None
         if kv_budget_mode:
             max_total_tokens = max_total_tokens or max_kv_len * 2
-            # In KV budget mode, KV cache never exceeds max_kv_len
-            max_possible_len = max_kv_len
+            # Prompt may exceed max_kv_len in multi-turn sessions; +2 because after
+            # one ineffective compaction current_seq_len = prompt_len+2 (one step grows
+            # it past max_kv_len, compaction restores to prompt_len+1, next step = +2).
+            max_possible_len = max(max_kv_len, len(prompt_ids) + 2)
         else:
             max_possible_len = len(prompt_ids) + max_tokens_per_segment * (n_compacts + 1)
+
+        # <think> injection disabled — forced tokens get very low logprobs
+        # which cause KL explosion during training (importance ratio exp(40+))
+        think_token_id = -1
+        inject_think = False
 
         logger.info(
             "compact_generate: prompt_len=%d, max_tokens_per_seg=%d, n_compacts=%d, "
@@ -160,7 +212,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
 
             _update_decode_state(last_token_gpu, current_seq_len - 1,
                                  current_seq_len, decode_ctx)
-            with set_forward_context(
+            with torch.inference_mode(), set_forward_context(
                 decode_ctx.attn_metadata_dict, decode_ctx.vllm_config,
                 virtual_engine=0, num_tokens=1,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
@@ -229,10 +281,17 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     else:
                         decode_logits = _run_decode_step(model, decode_ctx)
 
-                    seed = len(all_token_ids) + seg_count
-                    token, logprob = _sample_token(
-                        decode_logits, temperature, top_p, rng, seed=seed,
-                    )
+                    if inject_think and think_token_id > 0:
+                        logits_f = decode_logits.float().squeeze(0) / temperature
+                        log_probs_all = torch.log_softmax(logits_f, dim=-1)
+                        token = torch.tensor(think_token_id, device=device)
+                        logprob = log_probs_all[think_token_id]
+                        inject_think = False
+                    else:
+                        seed = len(all_token_ids) + seg_count
+                        token, logprob = _sample_token(
+                            decode_logits, temperature, top_p, rng, seed=seed,
+                        )
 
                     seg_token_ids[seg_count] = token
                     seg_logprobs[seg_count] = logprob
@@ -302,18 +361,27 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
 
             t_algo = time.time()
             asst_len = kv_len - prompt_len
+
             window = min(compact_window or asst_len, asst_len)
             suffix_len = asst_len - window
 
-            c1_list, c2_list, _ = compact_kv(
-                keys, values, prompt_len, compact_target_ratio,
-                num_kv_heads, head_size, device,
-                compact_window=window,
-                compute_beta=compute_beta,
-            )
-            algo_time = time.time() - t_algo
+            if compaction_mode == "markovian":
+                # Drop the window entirely, keep only the suffix
+                kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
+                c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
+                c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
+                compacted_prefix_len = 0
+                inject_think = True
+            else:
+                c1_list, c2_list, _ = compact_kv(
+                    keys, values, prompt_len, compact_target_ratio,
+                    num_kv_heads, head_size, device,
+                    compact_window=window,
+                    compute_beta=compute_beta,
+                )
+                compacted_prefix_len = c1_list[0].shape[0]
 
-            compacted_prefix_len = c1_list[0].shape[0]
+            algo_time = time.time() - t_algo
             new_seq_len = prompt_len + compacted_prefix_len + suffix_len
 
             t_inject = time.time()
@@ -394,12 +462,11 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         max_kv_len: int | None = None,
         max_total_tokens: int | None = None,
         compute_beta: bool = False,
+        compaction_mode: str = "attention_matching",
+        carryover_ratio: float = 0.5,
+        use_suffix_queries: bool = True,
     ) -> list[dict]:
-        """Generate B sequences simultaneously with KV compaction.
-
-        Same interface as compact_generate but processes a batch of prompts
-        in each forward pass for higher GPU utilization.
-        """
+        """Generate B sequences simultaneously with KV compaction."""
         t_start = time.time()
         B = len(prompt_ids_list)
         if B == 0:
@@ -420,10 +487,17 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         kv_budget_mode = max_kv_len is not None
         if kv_budget_mode:
             max_total_tokens = max_total_tokens or max_kv_len * 2
-            max_possible_len = max_kv_len
+            max_prompt = max(len(p) for p in prompt_ids_list)
+            # +2: after one ineffective compaction current_seq_len = max_prompt+2;
+            # need enough blocks so _update_batch_slots doesn't go OOB.
+            max_possible_len = max(max_kv_len, max_prompt + 2)
         else:
             max_prompt = max(len(p) for p in prompt_ids_list)
             max_possible_len = max_prompt + max_tokens_per_segment * (n_compacts + 1)
+
+        # <think> injection disabled — forced tokens cause KL explosion
+        think_token_id = -1
+        inject_think = [False] * B
 
         max_blocks_per_seq = (max_possible_len + block_size - 1) // block_size
 
@@ -573,6 +647,16 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 rng.manual_seed(step)
                 tokens, lps = _sample_batch(logits, temperature, top_p, rng)
 
+                # Override with <think> for sequences that just had markovian compaction
+                if think_token_id > 0:
+                    for i in range(B):
+                        if inject_think[i]:
+                            logits_f = logits[i].float() / temperature
+                            log_probs_all = torch.log_softmax(logits_f, dim=-1)
+                            tokens[i] = think_token_id
+                            lps[i] = log_probs_all[think_token_id]
+                            inject_think[i] = False
+
                 # Per-sequence updates
                 for i in range(B):
                     if not active[i]:
@@ -640,17 +724,25 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     )
 
                     asst_len = kv_len - prompt_lens[i]
+
                     window = min(compact_window or asst_len, asst_len)
-
-                    c1_list, c2_list, beta_list = compact_kv(
-                        keys, values, prompt_lens[i], compact_target_ratio,
-                        num_kv_heads, head_size, device,
-                        compact_window=window,
-                        compute_beta=compute_beta,
-                    )
-
-                    compacted_prefix_len = c1_list[0].shape[0]
                     suffix_len = asst_len - window
+
+                    if compaction_mode == "markovian":
+                        kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
+                        c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
+                        c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
+                        beta_list = None
+                        compacted_prefix_len = 0
+                        inject_think[i] = True
+                    else:
+                        c1_list, c2_list, beta_list = compact_kv(
+                            keys, values, prompt_lens[i], compact_target_ratio,
+                            num_kv_heads, head_size, device,
+                            compact_window=window,
+                            compute_beta=compute_beta,
+                        )
+                        compacted_prefix_len = c1_list[0].shape[0]
                     new_seq_len = prompt_lens[i] + compacted_prefix_len + suffix_len
 
                     _inject_compacted_kv(
@@ -756,15 +848,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         selection_strategy: str = "random",
         N: int | None = None,
     ) -> dict:
-        """RSA V2: Recursive Self-Aggregation with persistent compacted memory.
-
-        Step 0: Prefill prompt, fork into N candidates (K branches × N/K samples), generate.
-        Steps 1..T: Select peers, build aggregation prompt, append-prefill,
-        generate probe for attention patterns, compact aggregation region,
-        fork and generate N new candidates.
-
-        N is the total population size per step (default: K, i.e. one sample per branch).
-        """
+        """RSA V2: Recursive Self-Aggregation with persistent compacted memory."""
         if N is None:
             N = K
         t_start = time.time()
@@ -1065,6 +1149,402 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             },
         }
 
+    def compact_session_create(
+        self,
+        session_id: str,
+        prompt_ids: list[int],
+        max_kv_len: int,
+        max_response_tokens: int,
+        eos_token_id: int,
+        compact_target_ratio: float = 0.25,
+        compact_window: int | None = None,
+        temperature: float = 0.6,
+        top_p: float = 0.95,
+        compaction_mode: str = "attention_matching",
+        use_suffix_queries: bool = True,
+        n_protect_turns: int = -1,
+    ) -> dict:
+        """Create a persistent KV session, prefill prompt, generate first response."""
+        if not hasattr(self, "_sessions"):
+            self._sessions = {}
+        assert session_id not in self._sessions, f"Session {session_id!r} already exists"
+        if n_protect_turns >= 0 and compact_window is not None:
+            logger.warning(
+                "compact_window=%d is ignored when n_protect_turns is set. "
+                "Turn-based compaction always compacts the full history before the protected turns.",
+                compact_window,
+            )
+
+        model = self._get_model()
+        device = self._get_device()
+        vllm_config = self.model_runner.vllm_config
+
+        kv_caches = self.model_runner.kv_caches
+        num_layers = len(kv_caches)
+        kv_shape = kv_caches[0].shape
+        num_total_blocks = kv_shape[1]
+        block_size = kv_shape[2]
+        num_kv_heads = kv_shape[3]
+        head_size = kv_shape[4]
+
+        # Allocate a fixed block budget covering max_kv_len + max_response_tokens
+        max_possible_len = max_kv_len + max_response_tokens
+        blocks_needed = math.ceil(max_possible_len / block_size)
+        free_blocks = self._find_free_blocks(num_total_blocks)
+        assert len(free_blocks) >= blocks_needed, (
+            f"Session create needs {blocks_needed} blocks, only {len(free_blocks)} free"
+        )
+        my_blocks = free_blocks[:blocks_needed]
+
+        attn_layer_names = self._get_attn_layer_names(model)
+        rng = torch.Generator(device=device)
+
+        prompt_len = len(prompt_ids)
+        input_ids_t = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+        positions_t = torch.arange(prompt_len, dtype=torch.long, device=device)
+
+        logits = _run_prefill(
+            model, input_ids_t, positions_t,
+            seq_len=prompt_len,
+            block_ids=my_blocks,
+            block_size=block_size,
+            attn_layer_names=attn_layer_names,
+            vllm_config=vllm_config,
+            device=device,
+        )
+
+        current_seq_len = prompt_len
+        position_offset = 0
+
+        first_token, first_logprob = _sample_token(logits[-1:], temperature, top_p, rng, seed=0)
+        all_token_ids = [first_token.item()]
+        current_seq_len += 1
+        last_token_gpu = first_token.view(1)
+
+        decode_ctx = _DecodeContext.create(
+            block_ids=my_blocks,
+            block_size=block_size,
+            attn_layer_names=attn_layer_names,
+            vllm_config=vllm_config,
+            device=device,
+        )
+        decode_ctx.metadata.max_seq_len = max_possible_len
+
+        compaction_events = []
+
+        with set_forward_context(
+            decode_ctx.attn_metadata_dict, decode_ctx.vllm_config,
+            virtual_engine=0, num_tokens=1,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            slot_mapping=decode_ctx.slot_mapping_ctx,
+        ):
+            seg_count = 0
+            while len(all_token_ids) < max_response_tokens:
+                if all_token_ids[-1] == eos_token_id:
+                    break
+
+                if current_seq_len - 1 >= max_kv_len:
+                    kv_len = current_seq_len - 1
+                    asst_len = kv_len - prompt_len
+                    window = min(compact_window or asst_len, asst_len)
+                    suffix_len = asst_len - window
+
+                    keys, values = _extract_kv(kv_caches, my_blocks, kv_len, block_size, num_layers)
+
+                    if compaction_mode == "markovian":
+                        kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
+                        c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
+                        c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
+                        compacted_prefix_len = 0
+                    else:
+                        c1_list, c2_list, _ = compact_kv(
+                            keys, values, prompt_len, compact_target_ratio,
+                            num_kv_heads, head_size, device,
+                            compact_window=window,
+                        )
+                        compacted_prefix_len = c1_list[0].shape[0]
+
+                    new_seq_len = prompt_len + compacted_prefix_len + suffix_len
+                    _inject_compacted_kv(
+                        kv_caches, keys, values, c1_list, c2_list,
+                        my_blocks, block_size, prompt_len, num_layers,
+                        old_seq_len=kv_len, compact_window=window,
+                    )
+                    position_offset += kv_len - new_seq_len
+                    current_seq_len = new_seq_len + 1
+                    compaction_events.append({
+                        "kv_len_before": kv_len, "kv_len_after": new_seq_len,
+                    })
+
+                position = current_seq_len - 1 + position_offset
+                _update_decode_state(last_token_gpu, position, current_seq_len, decode_ctx)
+                decode_logits = _run_decode_step(model, decode_ctx)
+
+                seed = seg_count
+                token, logprob = _sample_token(decode_logits, temperature, top_p, rng, seed=seed)
+                all_token_ids.append(token.item())
+                last_token_gpu = token.view(1)
+                current_seq_len += 1
+                seg_count += 1
+
+        self._sessions[session_id] = SessionState(
+            block_ids=my_blocks,
+            current_seq_len=current_seq_len,
+            prompt_len=prompt_len,
+            position_offset=position_offset,
+            max_kv_len=max_kv_len,
+            compact_target_ratio=compact_target_ratio,
+            compact_window=compact_window,
+            compaction_mode=compaction_mode,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            use_suffix_queries=use_suffix_queries,
+            turn_user_lens=[0],
+            turn_asst_lens=[len(all_token_ids)],
+            n_protect_turns=n_protect_turns,
+        )
+
+        logger.info(
+            "compact_session_create: session=%s, prompt_len=%d, response_tokens=%d, "
+            "current_seq_len=%d, compactions=%d",
+            session_id, prompt_len, len(all_token_ids),
+            current_seq_len, len(compaction_events),
+        )
+
+        return {
+            "session_id": session_id,
+            "all_token_ids": all_token_ids,
+            "current_seq_len": current_seq_len,
+            "diagnostics": {"compaction_events": compaction_events},
+        }
+
+    def compact_session_step(
+        self,
+        session_id: str,
+        new_token_ids: list[int],
+        max_response_tokens: int,
+    ) -> dict:
+        """Append new_token_ids to existing session KV and generate a response.
+
+        new_token_ids = [boundary_token_from_prev_step] + [new_user_turn_tokens]
+        """
+        state = self._sessions[session_id]
+
+        model = self._get_model()
+        device = self._get_device()
+        vllm_config = self.model_runner.vllm_config
+
+        kv_caches = self.model_runner.kv_caches
+        num_layers = len(kv_caches)
+        kv_shape = kv_caches[0].shape
+        block_size = kv_shape[2]
+        num_kv_heads = kv_shape[3]
+        head_size = kv_shape[4]
+
+        attn_layer_names = self._get_attn_layer_names(model)
+        rng = torch.Generator(device=device)
+
+        # existing_seq_len is the position where boundary token's KV will be written
+        existing_seq_len = state.current_seq_len - 1
+        new_ids_t = torch.tensor(new_token_ids, dtype=torch.long, device=device)
+
+        logits = _prefill_append(
+            model, new_ids_t,
+            existing_seq_len=existing_seq_len,
+            position_offset=state.position_offset,
+            block_ids=state.block_ids,
+            block_size=block_size,
+            attn_layer_names=attn_layer_names,
+            vllm_config=vllm_config,
+            device=device,
+        )
+
+        current_seq_len = existing_seq_len + len(new_token_ids)
+        position_offset = state.position_offset
+
+        # Sample boundary token for start of generation
+        boundary_token, _ = _sample_token(logits[-1:], state.temperature, state.top_p, rng, seed=0)
+        all_token_ids = [boundary_token.item()]
+        current_seq_len += 1
+        last_token_gpu = boundary_token.view(1)
+
+        decode_ctx = _DecodeContext.create(
+            block_ids=state.block_ids,
+            block_size=block_size,
+            attn_layer_names=attn_layer_names,
+            vllm_config=vllm_config,
+            device=device,
+        )
+        max_possible_len = state.max_kv_len + max_response_tokens
+        decode_ctx.metadata.max_seq_len = max_possible_len
+
+        compaction_events = []
+
+        # Pre-decode compaction: compact if already over budget after append
+        if state.n_protect_turns < 0 and current_seq_len - 1 >= state.max_kv_len:
+            kv_len = current_seq_len - 1
+            asst_len = kv_len - state.prompt_len
+            window = min(state.compact_window or asst_len, asst_len)
+            suffix_len = asst_len - window
+
+            keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
+
+            if state.compaction_mode == "markovian":
+                kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
+                c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
+                c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
+                compacted_prefix_len = 0
+            else:
+                c1_list, c2_list, _ = compact_kv(
+                    keys, values, state.prompt_len, state.compact_target_ratio,
+                    num_kv_heads, head_size, device,
+                    compact_window=window,
+                )
+                compacted_prefix_len = c1_list[0].shape[0]
+
+            new_seq_len = state.prompt_len + compacted_prefix_len + suffix_len
+            _inject_compacted_kv(
+                kv_caches, keys, values, c1_list, c2_list,
+                state.block_ids, block_size, state.prompt_len, num_layers,
+                old_seq_len=kv_len, compact_window=window,
+            )
+            position_offset += kv_len - new_seq_len
+            current_seq_len = new_seq_len + 1
+            compaction_events.append({"kv_len_before": kv_len, "kv_len_after": new_seq_len})
+
+        with set_forward_context(
+            decode_ctx.attn_metadata_dict, decode_ctx.vllm_config,
+            virtual_engine=0, num_tokens=1,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            slot_mapping=decode_ctx.slot_mapping_ctx,
+        ):
+            seg_count = 0
+            while len(all_token_ids) < max_response_tokens:
+                if all_token_ids[-1] == state.eos_token_id:
+                    break
+
+                if state.n_protect_turns < 0 and current_seq_len - 1 >= state.max_kv_len:
+                    kv_len = current_seq_len - 1
+                    asst_len = kv_len - state.prompt_len
+                    window = min(state.compact_window or asst_len, asst_len)
+                    suffix_len = asst_len - window
+
+                    keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
+
+                    if state.compaction_mode == "markovian":
+                        kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
+                        c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
+                        c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
+                        compacted_prefix_len = 0
+                    else:
+                        c1_list, c2_list, _ = compact_kv(
+                            keys, values, state.prompt_len, state.compact_target_ratio,
+                            num_kv_heads, head_size, device,
+                            compact_window=window,
+                        )
+                        compacted_prefix_len = c1_list[0].shape[0]
+
+                    new_seq_len = state.prompt_len + compacted_prefix_len + suffix_len
+                    _inject_compacted_kv(
+                        kv_caches, keys, values, c1_list, c2_list,
+                        state.block_ids, block_size, state.prompt_len, num_layers,
+                        old_seq_len=kv_len, compact_window=window,
+                    )
+                    position_offset += kv_len - new_seq_len
+                    current_seq_len = new_seq_len + 1
+                    compaction_events.append({"kv_len_before": kv_len, "kv_len_after": new_seq_len})
+
+                position = current_seq_len - 1 + position_offset
+                _update_decode_state(last_token_gpu, position, current_seq_len, decode_ctx)
+                decode_logits = _run_decode_step(model, decode_ctx)
+
+                seed = seg_count
+                token, logprob = _sample_token(decode_logits, state.temperature, state.top_p, rng, seed=seed)
+                all_token_ids.append(token.item())
+                last_token_gpu = token.view(1)
+                current_seq_len += 1
+                seg_count += 1
+
+        # Record completed turn
+        user_len = len(new_token_ids) - 1  # minus boundary token
+        asst_len = len(all_token_ids)
+        state.turn_user_lens.append(user_len)
+        state.turn_asst_lens.append(asst_len)
+
+        # Turn-based compaction: fires when we have more turns than n_protect_turns
+        if state.n_protect_turns >= 0 and len(state.turn_asst_lens) > state.n_protect_turns:
+            kv_len = current_seq_len - 1  # boundary token not yet in KV
+
+            n_protect = state.n_protect_turns
+            protected_total = (
+                sum(state.turn_user_lens[-n_protect:]) + sum(state.turn_asst_lens[-n_protect:])
+                if n_protect > 0 else 0
+            )
+            compact_end = kv_len - protected_total
+
+            if compact_end > state.prompt_len:
+                keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
+
+                if state.compaction_mode == "markovian":
+                    kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
+                    c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
+                    c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
+                    compacted_prefix_len = 0
+                else:
+                    # Use K-vectors of the most recent assistant response as importance queries.
+                    # Subtract 1 from asst_len because EOS is counted in turn_asst_lens but
+                    # not yet written to KV (it's the boundary token for the next step).
+                    asst_len_in_kv = state.turn_asst_lens[-1] - 1
+                    asst_start = kv_len - asst_len_in_kv
+                    query_vecs = [k[asst_start:kv_len].permute(1, 0, 2) for k in keys]
+
+                    c1_list, c2_list, _ = compact_kv_range(
+                        keys, values,
+                        compact_start=state.prompt_len,
+                        compact_end=compact_end,
+                        target_ratio=state.compact_target_ratio,
+                        num_kv_heads=num_kv_heads,
+                        head_size=head_size,
+                        device=device,
+                        query_vecs=query_vecs,
+                    )
+                    compacted_prefix_len = c1_list[0].shape[0]
+                new_seq_len = state.prompt_len + compacted_prefix_len + (kv_len - compact_end)
+
+                _inject_compacted_kv(
+                    kv_caches, keys, values, c1_list, c2_list,
+                    state.block_ids, block_size, state.prompt_len, num_layers,
+                    old_seq_len=kv_len,
+                    compact_window=compact_end - state.prompt_len,
+                )
+                position_offset += kv_len - new_seq_len
+                current_seq_len = new_seq_len + 1
+                compaction_events.append({"kv_len_before": kv_len, "kv_len_after": new_seq_len})
+
+            state.turn_user_lens = state.turn_user_lens[-n_protect:] if n_protect > 0 else []
+            state.turn_asst_lens = state.turn_asst_lens[-n_protect:] if n_protect > 0 else []
+
+        state.current_seq_len = current_seq_len
+        state.position_offset = position_offset
+
+        logger.info(
+            "compact_session_step: session=%s, new_tokens=%d, response_tokens=%d, "
+            "current_seq_len=%d, compactions=%d",
+            session_id, len(new_token_ids), len(all_token_ids),
+            current_seq_len, len(compaction_events),
+        )
+
+        return {
+            "all_token_ids": all_token_ids,
+            "current_seq_len": current_seq_len,
+            "diagnostics": {"compaction_events": compaction_events},
+        }
+
+    def compact_session_delete(self, session_id: str) -> None:
+        """Free session blocks by removing the session state."""
+        getattr(self, "_sessions", {}).pop(session_id, None)
+
     def _get_model(self) -> Module:
         model = self.model_runner.model
         if hasattr(model, "runnable"):
@@ -1080,6 +1560,8 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         for req in self.model_runner.requests.values():
             for group_block_ids in req.block_ids:
                 used.update(group_block_ids)
+        for state in getattr(self, "_sessions", {}).values():
+            used.update(state.block_ids)
         return sorted(b for b in range(num_total_blocks) if b not in used)
 
     @staticmethod
@@ -1275,7 +1757,7 @@ def _run_prefill(
     ):
         hidden_states = model(input_ids=input_ids, positions=positions)
 
-    return model.compute_logits(hidden_states)
+    return model.compute_logits(hidden_states[-1:])
 
 
 def _update_decode_state(
@@ -1350,6 +1832,7 @@ def _update_batch_slots(ctx: _BatchDecodeContext, current_seq_lens: torch.Tensor
     ctx.slot_mapping[:] = block_ids * ctx.block_size + offsets
 
 
+@torch.inference_mode()
 def _capture_decode_graph(
     model: Module,
     batch_ctx: _BatchDecodeContext,

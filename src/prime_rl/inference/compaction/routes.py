@@ -37,6 +37,8 @@ class CompactGenerateRequest(BaseModel):
     max_total_tokens: int | None = None
     compute_beta: bool = False
     use_suffix_queries: bool = True
+    compaction_mode: str = "attention_matching"
+    carryover_ratio: float = 0.5
 
 
 class CompactGenerateBatchRequest(BaseModel):
@@ -52,6 +54,8 @@ class CompactGenerateBatchRequest(BaseModel):
     max_total_tokens: int | None = None
     compute_beta: bool = False
     use_suffix_queries: bool = True
+    compaction_mode: str = "attention_matching"
+    carryover_ratio: float = 0.5
 
 
 class _RequestBatcher:
@@ -143,6 +147,8 @@ class _RequestBatcher:
                 "max_total_tokens": first_body.max_total_tokens,
                 "compute_beta": first_body.compute_beta,
                 "use_suffix_queries": first_body.use_suffix_queries,
+                "compaction_mode": first_body.compaction_mode,
+                "carryover_ratio": first_body.carryover_ratio,
             },
         )
 
@@ -205,6 +211,8 @@ async def compact_generate_batch(body: CompactGenerateBatchRequest, request: Req
             "max_kv_len": body.max_kv_len,
             "max_total_tokens": body.max_total_tokens,
             "use_suffix_queries": body.use_suffix_queries,
+            "compaction_mode": body.compaction_mode,
+            "carryover_ratio": body.carryover_ratio,
         },
     )
 
@@ -222,6 +230,109 @@ async def compact_generate_batch(body: CompactGenerateBatchRequest, request: Req
         })
 
     return {"results": responses}
+
+
+class SessionCreateRequest(BaseModel):
+    session_id: str
+    prompt_ids: list[int]
+    max_kv_len: int
+    max_response_tokens: int = 512
+    compact_target_ratio: float = 0.25
+    compact_window: int | None = None
+    temperature: float = 0.6
+    top_p: float = 0.95
+    compaction_mode: str = "attention_matching"
+    use_suffix_queries: bool = True
+    n_protect_turns: int = -1
+
+
+class SessionStepRequest(BaseModel):
+    session_id: str
+    new_token_ids: list[int]
+    max_response_tokens: int = 512
+
+
+@router.post("/compact_session/create")
+async def compact_session_create(body: SessionCreateRequest, request: Request):
+    engine = request.app.state.engine_client
+    tokenizer = engine.get_tokenizer()
+    eos_token_id = tokenizer.eos_token_id
+
+    logger.info(
+        "/compact_session/create: session=%s, prompt_len=%d, max_kv_len=%d",
+        body.session_id, len(body.prompt_ids), body.max_kv_len,
+    )
+
+    result = await engine.collective_rpc(
+        "compact_session_create",
+        args=(
+            body.session_id,
+            body.prompt_ids,
+            body.max_kv_len,
+            body.max_response_tokens,
+            eos_token_id,
+        ),
+        kwargs={
+            "compact_target_ratio": body.compact_target_ratio,
+            "compact_window": body.compact_window,
+            "temperature": body.temperature,
+            "top_p": body.top_p,
+            "compaction_mode": body.compaction_mode,
+            "use_suffix_queries": body.use_suffix_queries,
+            "n_protect_turns": body.n_protect_turns,
+        },
+    )
+
+    data = result[0]
+    final_text = tokenizer.decode(data["all_token_ids"], skip_special_tokens=True)
+    return {
+        "session_id": data["session_id"],
+        "all_token_ids": data["all_token_ids"],
+        "final_text": final_text,
+        "current_seq_len": data["current_seq_len"],
+        "diagnostics": data.get("diagnostics", {}),
+    }
+
+
+@router.post("/compact_session/step")
+async def compact_session_step(body: SessionStepRequest, request: Request):
+    engine = request.app.state.engine_client
+    tokenizer = engine.get_tokenizer()
+
+    logger.info(
+        "/compact_session/step: session=%s, new_tokens=%d",
+        body.session_id, len(body.new_token_ids),
+    )
+
+    result = await engine.collective_rpc(
+        "compact_session_step",
+        args=(
+            body.session_id,
+            body.new_token_ids,
+            body.max_response_tokens,
+        ),
+    )
+
+    data = result[0]
+    final_text = tokenizer.decode(data["all_token_ids"], skip_special_tokens=True)
+    return {
+        "all_token_ids": data["all_token_ids"],
+        "final_text": final_text,
+        "current_seq_len": data["current_seq_len"],
+        "diagnostics": data.get("diagnostics", {}),
+    }
+
+
+@router.delete("/compact_session/{session_id}")
+async def compact_session_delete(session_id: str, request: Request):
+    engine = request.app.state.engine_client
+
+    await engine.collective_rpc(
+        "compact_session_delete",
+        args=(session_id,),
+    )
+
+    return {"deleted": session_id}
 
 
 DEFAULT_AGG_TEMPLATE = (

@@ -76,6 +76,7 @@ def compact_kv_range(
     num_queries: int = 64,
     compute_beta: bool = False,
     beta_nnls_iters: int = 50,
+    query_vecs: list[torch.Tensor] | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor] | None]:
     """Compact a specific range of KV cache via Attention Matching.
 
@@ -92,10 +93,12 @@ def compact_kv_range(
         num_kv_heads: Number of KV heads
         head_size: Dimension per head
         device: CUDA device
-        num_queries: Number of random query probes
+        num_queries: Number of random query probes (used only when query_vecs is None)
         compute_beta: If True, compute NNLS beta bias for partition function
             correction. Returns per-layer beta tensors as the third element.
         beta_nnls_iters: Number of projected gradient descent iterations for NNLS.
+        query_vecs: Per-layer query tensors (num_kv_heads, num_q, head_size). When
+            provided, used instead of random Gaussian probes for importance scoring.
 
     Returns:
         c1[layer]: (target_len, num_kv_heads, head_size) - compacted keys
@@ -125,9 +128,11 @@ def compact_kv_range(
         Rk_h = K_h[:, compact_start:compact_end, :]
         Rv_h = V_h[:, compact_start:compact_end, :]
 
-        # Random queries: (H, num_queries, D)
-        Q = torch.randn(num_kv_heads, num_queries, head_size,
-                         device=device, dtype=torch.float32)
+        if query_vecs is not None:
+            Q = query_vecs[layer_idx].float()
+        else:
+            Q = torch.randn(num_kv_heads, num_queries, head_size,
+                             device=device, dtype=torch.float32)
 
         # Full attention over all keys: (H, Q, seq_len)
         full_scores = torch.bmm(Q, K_h.transpose(1, 2)) * scale
@@ -196,6 +201,7 @@ def compact_kv(
     compact_window: int | None = None,
     compute_beta: bool = False,
     beta_nnls_iters: int = 50,
+    query_vecs: list[torch.Tensor] | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor] | None]:
     """Compact assistant KV prefix via Attention Matching (backward-compatible wrapper).
 
@@ -210,11 +216,13 @@ def compact_kv(
         num_kv_heads: Number of KV heads
         head_size: Dimension per head
         device: CUDA device
-        num_queries: Number of random query probes
+        num_queries: Number of random query probes (used only when query_vecs is None)
         compact_window: If set, only compress first N assistant tokens
         compute_beta: If True, compute NNLS beta bias for partition function
             correction. Returns per-layer beta tensors as the third element.
         beta_nnls_iters: Number of projected gradient descent iterations for NNLS.
+        query_vecs: Per-layer query tensors (num_kv_heads, num_q, head_size). When
+            provided, used instead of random Gaussian probes for importance scoring.
 
     Returns:
         c1[layer]: (target_len, num_kv_heads, head_size) - compacted prefix keys
@@ -234,4 +242,5 @@ def compact_kv(
         num_queries=num_queries,
         compute_beta=compute_beta,
         beta_nnls_iters=beta_nnls_iters,
+        query_vecs=query_vecs,
     )
