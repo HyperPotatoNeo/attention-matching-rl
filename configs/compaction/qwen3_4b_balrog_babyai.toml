@@ -1,0 +1,70 @@
+# BabyAI Training — Qwen3-4B (baseline, multi-turn via balrog-bench)
+# Grid-world RL: model navigates, picks up objects, unlocks doors.
+# 2-node: Node 1 = 4 inference (TP=1), Node 2 = 4 trainer (FSDP2)
+#
+# Requires: `uv run prime env install prime-community/balrog-bench`
+# plus the full BALROG framework (cmake + NLE) for BalrogEnv.
+#
+# For compaction evaluation (no training), use:
+#   python scripts/eval_balrog_babyai.py --mode compaction --n 10
+# which uses minigrid directly (lighter, no NLE needed).
+#
+# __INFERENCE_NODE__ is replaced by the launch script.
+
+max_steps = 200
+seq_len = 4096
+output_dir = "outputs/balrog-babyai"
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[wandb]
+project = "balrog-rl"
+name = "balrog-babyai-baseline"
+
+[ckpt]
+interval = 10
+resume_step = -1
+
+[deployment]
+num_train_gpus = 4
+num_infer_gpus = 0
+
+[trainer]
+dist_timeout_seconds = 3600
+
+[trainer.model]
+impl = "auto"
+optim_cpu_offload = true
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+
+[trainer.loss]
+type = "default"
+
+[orchestrator]
+batch_size = 64
+rollouts_per_example = 4
+
+[orchestrator.client]
+base_url = [
+    "http://__INFERENCE_NODE__:8000/v1",
+    "http://__INFERENCE_NODE__:8001/v1",
+    "http://__INFERENCE_NODE__:8002/v1",
+    "http://__INFERENCE_NODE__:8003/v1",
+]
+
+[orchestrator.sampling]
+max_tokens = 4096
+
+[[orchestrator.env]]
+id = "balrog-bench"
+name = "balrog-babyai"
+args = { environments = ["babyai"], max_text_history = 16 }

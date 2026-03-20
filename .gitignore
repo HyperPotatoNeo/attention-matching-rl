@@ -208,3 +208,15 @@ server_gpu*.log
 server.log
 *.output
 skills/multinode/
+
+*.toml
+*.json
+*.png
+*.md
+*.sbatch
+*.sh
+
+# Allow tracked source configs and scripts
+!configs/**/*.toml
+!scripts/*.sbatch
+!scripts/*.sh

@@ -1,0 +1,5 @@
+[model]
+name = "Qwen/Qwen3-4B"
+
+[parallel]
+tp = 1

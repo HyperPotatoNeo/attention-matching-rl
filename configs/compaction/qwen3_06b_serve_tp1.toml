@@ -1,0 +1,14 @@
+gpu_memory_utilization = 0.95
+
+[server]
+host = "0.0.0.0"
+
+[model]
+name = "Qwen/Qwen3-0.6B"
+enforce_eager = true
+
+[parallel]
+tp = 1
+
+[vllm_extra]
+enable_compaction = true

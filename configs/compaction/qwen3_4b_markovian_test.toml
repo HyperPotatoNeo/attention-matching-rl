@@ -1,0 +1,62 @@
+# Compaction Markovian Test — Qwen3-4B (single-node, 4 GPU)
+# 2 inference (TP=1, DP=2) + 2 trainer (FSDP2)
+# Markovian mode: hard-deletes compaction window, no attention matching.
+
+max_steps = 50
+seq_len = 4096
+output_dir = "../scratch/ckpts/compaction-markovian-4b"
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[wandb]
+project = "compaction-rl"
+name = "compaction-markovian-4b"
+
+[ckpt]
+interval = 25
+resume_step = -1
+
+[deployment]
+num_train_gpus = 2
+num_infer_gpus = 0
+
+[trainer]
+dist_timeout_seconds = 3600
+compact_target_ratio = 0.25
+compact_window = 1024
+compaction_mode = "markovian"
+
+[trainer.model]
+impl = "auto"
+optim_cpu_offload = true
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+
+[trainer.loss]
+type = "default"
+
+[orchestrator]
+batch_size = 16
+rollouts_per_example = 2
+
+[orchestrator.client]
+base_url = [
+    "http://localhost:8000/v1",
+    "http://localhost:8001/v1",
+]
+
+[orchestrator.sampling]
+max_tokens = 3072
+
+[[orchestrator.env]]
+id = "compaction_env"
+name = "compaction-math"
+args = { gym = "math_env", max_seq_len = 4096, max_kv_len = 2048, max_total_tokens = 3072, compact_target_ratio = 0.25, compact_window = 1024, n_compacts = 99, use_suffix_queries = false, compaction_mode = "markovian" }
