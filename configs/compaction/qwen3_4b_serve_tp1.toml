@@ -1,11 +1,12 @@
-gpu_memory_utilization = 0.95
+gpu_memory_utilization = 0.85
 
 [server]
 host = "0.0.0.0"
 
 [model]
-name = "Qwen/Qwen3-4B"
+name = "Qwen/Qwen3-4B-Instruct-2507"
 enforce_eager = true
+max_model_len = 32768
 
 [parallel]
 tp = 1
