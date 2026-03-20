@@ -97,6 +97,7 @@ Generate text with mid-sequence KV cache compaction. Requests are transparently 
 | `max_total_tokens` | `int\|null` | null | KV budget: stop after this many completion tokens |
 | `compute_beta` | `bool` | false | Compute NNLS beta bias for partition function correction |
 | `use_suffix_queries` | `bool` | true | Use suffix token attention queries instead of random probes |
+| `compaction_mode` | `str` | `"attention_matching"` | `"attention_matching"` or `"markovian"` (hard-delete window) |
 
 **Response:**
 
@@ -123,6 +124,87 @@ Generate text with mid-sequence KV cache compaction. Requests are transparently 
     }
 }
 ```
+
+## Compaction Modes
+
+### Attention Matching (default)
+
+Compresses the KV window using Attention Matching: select top-k keys by importance (C1),
+solve least-squares for replacement values (C2). The compacted cache is
+`[prompt | C1/C2 | suffix]`. Optionally uses NNLS beta for partition function correction.
+
+### Markovian (Delethink)
+
+Hard-deletes the compaction window entirely, keeping only `[prompt | suffix]`. No
+compressed keys, no importance scoring, no C2 solve. Set `compaction_mode = "markovian"`
+in both the env args and trainer config (auto-synced via model validator).
+
+This is useful for training "Markovian thinkers" that learn to reason in segments where
+earlier thinking can be discarded. The model learns to produce self-contained reasoning
+within each segment.
+
+```bash
+# Inference request
+curl -X POST http://localhost:8000/compact_generate -d '{
+    "prompt_ids": [1, 2, 3],
+    "max_kv_len": 2048,
+    "max_total_tokens": 8192,
+    "compact_window": 1024,
+    "n_compacts": 99,
+    "compaction_mode": "markovian"
+}'
+
+# Training config
+[trainer]
+compaction_mode = "markovian"
+
+[[orchestrator.env]]
+args = { ..., compaction_mode = "markovian", use_suffix_queries = false }
+```
+
+### Turn-Based Compaction (`n_protect_turns`)
+
+Fires compaction **after each complete assistant response**, not reactively when the KV
+fills. The last `n_protect_turns` turns are kept verbatim; everything older is compacted.
+
+The importance queries come from the **most recent assistant response's K-vectors** — a
+lookahead that grounds importance scoring in what the model actually attended to, rather
+than random Gaussian probes.
+
+KV structure after each step:
+```
+[system prompt] | [compacted turns 1..N-n] | [user_{N-n+1}][asst_{N-n+1}] … [user_N][asst_N]
+```
+
+Set `n_protect_turns >= 0` on the session endpoint. Default is `-1` (disabled — old
+KV-budget behavior unchanged).
+
+```python
+# Session API
+client.post("/compact_session/create", json={
+    "session_id": "...",
+    "prompt_ids": [...],
+    "max_kv_len": 8192,
+    "compact_target_ratio": 0.5,
+    "n_protect_turns": 1,   # compact all but the most recent turn after each step
+})
+```
+
+```bash
+# Eval script
+python scripts/eval_balrog_babyai.py \
+    --mode compaction --use-sessions \
+    --max-kv-len 8192 --compact-ratio 0.5 \
+    --n-protect-turns 1
+```
+
+**Comparison of compaction triggers:**
+
+| Mode | Trigger | Queries | Protects |
+|------|---------|---------|---------|
+| KV-budget | `seq_len >= max_kv_len` (mid-generation) | random Gaussian | nothing |
+| Turn-based | after each turn completes | assistant K-vectors (lookahead) | last N turns |
+| Markovian | same trigger as KV-budget | n/a (hard delete) | nothing |
 
 ## Training
 
@@ -158,7 +240,10 @@ Training parameters:
 | `qwen3_4b_fullft_nobeta.toml` | 4+4 layout, no beta (pre-deterministic, legacy) |
 | `qwen3_4b_beta_test.toml` | Beta attention test (compute_beta=true) |
 | `qwen3_4b_fullft_baseline.toml` | Baseline training (no compaction) |
-| `qwen3_4b_serve_tp1.toml` | TP=1 compaction server |
+| `qwen3_4b_markovian_test.toml` | Markovian mode — Qwen3-4B, 50 steps |
+| `qwen3_06b_markovian_test.toml` | Markovian mode — Qwen3-0.6B, fast E2E test |
+| `qwen3_4b_serve_tp1.toml` | TP=1 compaction server (4B) |
+| `qwen3_06b_serve_tp1.toml` | TP=1 compaction server (0.6B) |
 
 ## Scripts
 

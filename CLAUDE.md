@@ -17,10 +17,15 @@ the full technical walkthrough.
 | `src/compaction_env/env.py` | CompactionEnv (verifiers SingleTurnEnv wrapper) |
 | `scripts/eval_rg_mix.py` | rg-mix-env evaluation (compaction, baseline, and RSA modes) |
 | `scripts/eval_aime_rsa.py` | AIME benchmark for RSA vs baseline comparison |
+| `scripts/eval_balrog_babyai.py` | BabyAI (MiniGrid) multi-turn eval (compaction, baseline, markovian) |
+| `configs/compaction/qwen3_4b_balrog_babyai.toml` | BabyAI baseline training config |
 | `scripts/start_4servers.sh` | Launch 4 TP=1 servers for DP=4 |
 | `configs/compaction/qwen3_4b_fullft_train.toml` | **Default training config** — 2-node, mixed-mode |
 | `configs/compaction/qwen3_4b_beta_test.toml` | Beta attention test config |
+| `configs/compaction/qwen3_4b_markovian_test.toml` | Markovian mode — Qwen3-4B, 50 steps |
+| `configs/compaction/qwen3_06b_markovian_test.toml` | Markovian mode — Qwen3-0.6B, fast E2E test |
 | `configs/compaction/qwen3_4b_serve_tp1.toml` | TP=1 server config (compaction) |
+| `configs/compaction/qwen3_06b_serve_tp1.toml` | TP=1 server config (0.6B) |
 
 ### How it works
 
@@ -35,6 +40,11 @@ that correct the partition function mismatch between full and compacted attentio
 `BetaState` maintains contiguous KV mirrors alongside paged cache. Decode switches from
 FlashAttention to SDPA+beta via monkey-patched attention layers. Two separate CUDA graph
 captures handle pre-compaction (FlashAttention) and post-compaction (SDPA+beta) phases.
+
+**Markovian mode**: When `compaction_mode="markovian"`, the window is hard-deleted instead
+of compressed. The cache becomes `[prompt | suffix]` with no C1/C2. Supported in both
+inference (`worker.py`) and trainer (`segmented_forward`). Config field `compaction_mode`
+is auto-synced from env args to trainer config.
 
 **Auto-batching**: Individual `/compact_generate` requests are transparently batched into
 `compact_generate_batch` calls (B=8) by `_RequestBatcher` in routes.py.
@@ -87,7 +97,20 @@ python scripts/eval_rg_mix.py --mode baseline --n 100
 python scripts/eval_rg_mix.py --mode rsa --n 100 \
     --rsa-K 4 --rsa-T 2 --rsa-k-peers 2 --rsa-probe-tokens 512
 
+# Markovian mode
+python scripts/eval_rg_mix.py --mode compaction --n 100 \
+    --max-kv-len 2048 --max-total-tokens 8192 \
+    --n-compacts 99 --compact-window 1024 \
+    --compaction-mode markovian
+
 # AIME benchmark
 python scripts/eval_aime_rsa.py --mode rsa --n 30 --rsa-K 4 --rsa-T 2
 python scripts/eval_aime_rsa.py --mode baseline --n 30
+
+# BabyAI multi-turn grid-world (via minigrid)
+python scripts/eval_balrog_babyai.py --mode baseline --n 10
+python scripts/eval_balrog_babyai.py --mode compaction --n 10 \
+    --max-kv-len 2048 --compact-ratio 0.25
+python scripts/eval_balrog_babyai.py --mode markovian --n 10 \
+    --max-kv-len 2048
 ```

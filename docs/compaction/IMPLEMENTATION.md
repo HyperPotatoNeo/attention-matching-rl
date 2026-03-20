@@ -54,8 +54,24 @@ Only the first `compact_window` assistant tokens are compressed. The suffix is p
 Before:  [prompt | ========= 2048 assistant tokens =========]
                    ^ window=512 ^     ^ suffix=1536          ^
 
-After:   [prompt | C1/C2 (128) | ---- suffix (1536) --------|
+After (attention_matching):
+         [prompt | C1/C2 (128) | ---- suffix (1536) --------|
+
+After (markovian):
+         [prompt | ---- suffix (1536) ----------------------|
 ```
+
+### Markovian Mode (`compaction_mode="markovian"`)
+
+Hard-deletes the compaction window entirely. No importance scoring, no C2 solve — the
+window tokens are simply dropped. The resulting cache is `[prompt | suffix]`.
+
+In both inference (`worker.py`) and trainer (`compaction.py`), markovian mode creates
+empty C1/C2 tensors with shape `(0, num_kv_heads, head_size)`, so the standard
+`torch.cat([prompt, c1, suffix])` path produces `[prompt | suffix]` without branching
+the injection logic.
+
+Suffix query hooks and forced indices are skipped since there's no importance scoring.
 
 Full-context scoring: the softmax denominator includes prompt keys, window keys, and suffix
 keys, so importance scores reflect each window key's true contribution relative to the
@@ -233,6 +249,16 @@ NCCL deadlock.
 Fix: all-reduce MAX segment count, pad with dummy forwards (`result * 0` to preserve
 autograd graph for FSDP backward hooks). `empty_cache()` between segments prevents OOM
 from CUDA memory fragmentation.
+
+### Markovian mode in trainer
+
+`segmented_forward` accepts `compaction_mode` (default `"attention_matching"`). When
+`"markovian"`, the compaction replay between segments skips `compact_kv()` entirely and
+produces empty C1/C2 tensors, resulting in `[prompt | suffix]` cache — matching inference.
+
+The `compaction_mode` field in `TrainerConfig` is auto-synced from env args via the
+`auto_setup_compaction_mode` model validator in `RLConfig`, so setting it in the env args
+TOML is sufficient.
 
 ## Performance (Qwen3-4B, A100-80GB)
 
