@@ -35,6 +35,25 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
             teacher_logprobs = teacher_logprobs[:seq_len]
         if routed_experts is not None:
             routed_experts = routed_experts[:seq_len]
+        if training_example.segment_boundaries is not None:
+            prompt_len = len(training_example.prompt_ids)
+            max_completion = seq_len - prompt_len
+            orig_len = len(training_example.segment_boundaries)
+            trimmed = [b for b in training_example.segment_boundaries if b <= max_completion]
+            n_kept = len(trimmed)
+            if not trimmed or trimmed[-1] != max_completion:
+                trimmed.append(max_completion)
+            training_example.segment_boundaries = trimmed if len(trimmed) > 1 else None
+            # Trim compaction metadata to match (one entry per compaction, i.e. N-1 segments)
+            if training_example.segment_boundaries is None:
+                training_example.compaction_indices = None
+                training_example.compact_windows = None
+            else:
+                n_compactions = n_kept - 1 if n_kept > 0 else 0
+                if training_example.compaction_indices is not None:
+                    training_example.compaction_indices = training_example.compaction_indices[:n_compactions]
+                if training_example.compact_windows is not None:
+                    training_example.compact_windows = training_example.compact_windows[:n_compactions]
 
     assert (
         len(input_ids)
@@ -65,6 +84,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         routed_experts=routed_experts,
         segment_boundaries=training_example.segment_boundaries,
         compaction_indices=training_example.compaction_indices,
+        compact_windows=training_example.compact_windows,
         # Multimodal fields (Qwen3-VL) - passed through without modification
         pixel_values=training_example.pixel_values,
         pixel_values_shape=training_example.pixel_values_shape,

@@ -31,6 +31,11 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # Shape: compaction_indices[event_idx][layer_idx] = list[list[int]] (H × target_len)
     compaction_indices: list | None = None
 
+    # Compaction training: per-event compact_window used in inference.
+    # Lets the trainer match the exact compaction range (important for turn-based mode
+    # where protected turns narrow the window).
+    compact_windows: list[int] | None = None
+
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A batch of training examples with metadata for transport."""
@@ -59,6 +64,9 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
 
     # Compaction training: per-event top-k indices from inference
     compaction_indices: list | None = None
+
+    # Compaction training: per-event compact_window from inference
+    compact_windows: list[int] | None = None
 
     # Multimodal fields (Qwen3-VL) — pixel_values stored as raw float32 bytes for efficient serialization
     pixel_values: bytes | None = None

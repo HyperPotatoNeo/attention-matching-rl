@@ -32,6 +32,9 @@ from prime_rl.inference.vllm.worker.filesystem import FileSystemWeightUpdateWork
 logger = logging.getLogger(__name__)
 
 
+SESSION_TTL_SECONDS = 180
+
+
 @dataclass
 class SessionState:
     block_ids: list[int]
@@ -48,7 +51,10 @@ class SessionState:
     use_suffix_queries: bool
     turn_user_lens: list[int]
     turn_asst_lens: list[int]
-    n_protect_turns: int  # -1 = disabled (use KV-budget mode)
+    n_max_turns: int       # -1 = disabled (use KV-budget mode)
+    n_preserved_turns: int  # turns to keep verbatim after compaction fires
+    compaction_count: int = 0
+    last_access: float = 0.0
 
 
 class CompactionWorker(FileSystemWeightUpdateWorker):
@@ -365,6 +371,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             window = min(compact_window or asst_len, asst_len)
             suffix_len = asst_len - window
 
+            indices_list = None
             if compaction_mode == "markovian":
                 # Drop the window entirely, keep only the suffix
                 kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
@@ -373,7 +380,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 compacted_prefix_len = 0
                 inject_think = True
             else:
-                c1_list, c2_list, _ = compact_kv(
+                c1_list, c2_list, _, indices_list = compact_kv(
                     keys, values, prompt_len, compact_target_ratio,
                     num_kv_heads, head_size, device,
                     compact_window=window,
@@ -415,6 +422,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 "algo_time": round(algo_time, 3),
                 "inject_time": round(inject_time, 3),
                 "total_time": round(compact_time, 3),
+                "compaction_indices": [idx.cpu().tolist() for idx in indices_list] if indices_list else None,
             }
             compaction_events.append(event)
 
@@ -728,6 +736,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     window = min(compact_window or asst_len, asst_len)
                     suffix_len = asst_len - window
 
+                    indices_list = None
                     if compaction_mode == "markovian":
                         kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
                         c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
@@ -736,7 +745,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                         compacted_prefix_len = 0
                         inject_think[i] = True
                     else:
-                        c1_list, c2_list, beta_list = compact_kv(
+                        c1_list, c2_list, beta_list, indices_list = compact_kv(
                             keys, values, prompt_lens[i], compact_target_ratio,
                             num_kv_heads, head_size, device,
                             compact_window=window,
@@ -783,6 +792,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                         "extract_time": 0.0,
                         "inject_time": 0.0,
                         "total_time": round(compact_time, 3),
+                        "compaction_indices": [idx.cpu().tolist() for idx in indices_list] if indices_list else None,
                     })
 
         # Final flush for remaining tokens
@@ -1039,7 +1049,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 agg_end = agg_start + len(agg_ids)
 
                 t_algo = time.time()
-                c1_list, c2_list, _ = compact_kv_range(
+                c1_list, c2_list, _, _ = compact_kv_range(
                     keys, values,
                     compact_start=agg_start,
                     compact_end=agg_end,
@@ -1162,16 +1172,20 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         top_p: float = 0.95,
         compaction_mode: str = "attention_matching",
         use_suffix_queries: bool = True,
-        n_protect_turns: int = -1,
+        n_max_turns: int = -1,
+        n_preserved_turns: int = 0,
     ) -> dict:
         """Create a persistent KV session, prefill prompt, generate first response."""
         if not hasattr(self, "_sessions"):
             self._sessions = {}
         assert session_id not in self._sessions, f"Session {session_id!r} already exists"
-        if n_protect_turns >= 0 and compact_window is not None:
+        assert n_max_turns == -1 or n_preserved_turns < n_max_turns, (
+            f"n_preserved_turns ({n_preserved_turns}) must be < n_max_turns ({n_max_turns})"
+        )
+        if n_max_turns >= 0 and compact_window is not None:
             logger.warning(
-                "compact_window=%d is ignored when n_protect_turns is set. "
-                "Turn-based compaction always compacts the full history before the protected turns.",
+                "compact_window=%d is ignored when n_max_turns is set. "
+                "Turn-based compaction always compacts the full history before the preserved turns.",
                 compact_window,
             )
 
@@ -1191,8 +1205,12 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         max_possible_len = max_kv_len + max_response_tokens
         blocks_needed = math.ceil(max_possible_len / block_size)
         free_blocks = self._find_free_blocks(num_total_blocks)
+        if len(free_blocks) < blocks_needed:
+            self._expire_stale_sessions()
+            free_blocks = self._find_free_blocks(num_total_blocks)
         assert len(free_blocks) >= blocks_needed, (
-            f"Session create needs {blocks_needed} blocks, only {len(free_blocks)} free"
+            f"Session create needs {blocks_needed} blocks, only {len(free_blocks)} free "
+            f"({len(getattr(self, '_sessions', {}))} active sessions)"
         )
         my_blocks = free_blocks[:blocks_needed]
 
@@ -1218,6 +1236,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
 
         first_token, first_logprob = _sample_token(logits[-1:], temperature, top_p, rng, seed=0)
         all_token_ids = [first_token.item()]
+        all_logprobs = [first_logprob.item()]
         current_seq_len += 1
         last_token_gpu = first_token.view(1)
 
@@ -1257,7 +1276,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                         c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
                         compacted_prefix_len = 0
                     else:
-                        c1_list, c2_list, _ = compact_kv(
+                        c1_list, c2_list, _, _ = compact_kv(
                             keys, values, prompt_len, compact_target_ratio,
                             num_kv_heads, head_size, device,
                             compact_window=window,
@@ -1283,6 +1302,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 seed = seg_count
                 token, logprob = _sample_token(decode_logits, temperature, top_p, rng, seed=seed)
                 all_token_ids.append(token.item())
+                all_logprobs.append(logprob.item())
                 last_token_gpu = token.view(1)
                 current_seq_len += 1
                 seg_count += 1
@@ -1302,7 +1322,9 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             use_suffix_queries=use_suffix_queries,
             turn_user_lens=[0],
             turn_asst_lens=[len(all_token_ids)],
-            n_protect_turns=n_protect_turns,
+            n_max_turns=n_max_turns,
+            n_preserved_turns=n_preserved_turns,
+            last_access=time.monotonic(),
         )
 
         logger.info(
@@ -1315,6 +1337,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         return {
             "session_id": session_id,
             "all_token_ids": all_token_ids,
+            "all_logprobs": all_logprobs,
             "current_seq_len": current_seq_len,
             "diagnostics": {"compaction_events": compaction_events},
         }
@@ -1330,6 +1353,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         new_token_ids = [boundary_token_from_prev_step] + [new_user_turn_tokens]
         """
         state = self._sessions[session_id]
+        state.last_access = time.monotonic()
 
         model = self._get_model()
         device = self._get_device()
@@ -1364,8 +1388,9 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         position_offset = state.position_offset
 
         # Sample boundary token for start of generation
-        boundary_token, _ = _sample_token(logits[-1:], state.temperature, state.top_p, rng, seed=0)
+        boundary_token, boundary_logprob = _sample_token(logits[-1:], state.temperature, state.top_p, rng, seed=0)
         all_token_ids = [boundary_token.item()]
+        all_logprobs = [boundary_logprob.item()]
         current_seq_len += 1
         last_token_gpu = boundary_token.view(1)
 
@@ -1382,7 +1407,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         compaction_events = []
 
         # Pre-decode compaction: compact if already over budget after append
-        if state.n_protect_turns < 0 and current_seq_len - 1 >= state.max_kv_len:
+        if state.n_max_turns < 0 and current_seq_len - 1 >= state.max_kv_len:
             kv_len = current_seq_len - 1
             asst_len = kv_len - state.prompt_len
             window = min(state.compact_window or asst_len, asst_len)
@@ -1390,18 +1415,22 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
 
             keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
 
+            indices_list = None
             if state.compaction_mode == "markovian":
                 kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
                 c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
                 c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
                 compacted_prefix_len = 0
             else:
-                c1_list, c2_list, _ = compact_kv(
+                compact_seed = state.prompt_len * 10000 + state.compaction_count
+                c1_list, c2_list, _, indices_list = compact_kv(
                     keys, values, state.prompt_len, state.compact_target_ratio,
                     num_kv_heads, head_size, device,
                     compact_window=window,
+                    seed=compact_seed,
                 )
                 compacted_prefix_len = c1_list[0].shape[0]
+            state.compaction_count += 1
 
             new_seq_len = state.prompt_len + compacted_prefix_len + suffix_len
             _inject_compacted_kv(
@@ -1411,7 +1440,11 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             )
             position_offset += kv_len - new_seq_len
             current_seq_len = new_seq_len + 1
-            compaction_events.append({"kv_len_before": kv_len, "kv_len_after": new_seq_len})
+            compaction_events.append({
+                "kv_len_before": kv_len,
+                "kv_len_after": new_seq_len,
+                "compaction_indices": [idx.cpu().tolist() for idx in indices_list] if indices_list else None,
+            })
 
         with set_forward_context(
             decode_ctx.attn_metadata_dict, decode_ctx.vllm_config,
@@ -1424,7 +1457,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 if all_token_ids[-1] == state.eos_token_id:
                     break
 
-                if state.n_protect_turns < 0 and current_seq_len - 1 >= state.max_kv_len:
+                if state.n_max_turns < 0 and current_seq_len - 1 >= state.max_kv_len:
                     kv_len = current_seq_len - 1
                     asst_len = kv_len - state.prompt_len
                     window = min(state.compact_window or asst_len, asst_len)
@@ -1432,18 +1465,22 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
 
                     keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
 
+                    indices_list = None
                     if state.compaction_mode == "markovian":
                         kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
                         c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
                         c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
                         compacted_prefix_len = 0
                     else:
-                        c1_list, c2_list, _ = compact_kv(
+                        compact_seed = state.prompt_len * 10000 + state.compaction_count
+                        c1_list, c2_list, _, indices_list = compact_kv(
                             keys, values, state.prompt_len, state.compact_target_ratio,
                             num_kv_heads, head_size, device,
                             compact_window=window,
+                            seed=compact_seed,
                         )
                         compacted_prefix_len = c1_list[0].shape[0]
+                    state.compaction_count += 1
 
                     new_seq_len = state.prompt_len + compacted_prefix_len + suffix_len
                     _inject_compacted_kv(
@@ -1453,7 +1490,11 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     )
                     position_offset += kv_len - new_seq_len
                     current_seq_len = new_seq_len + 1
-                    compaction_events.append({"kv_len_before": kv_len, "kv_len_after": new_seq_len})
+                    compaction_events.append({
+                        "kv_len_before": kv_len,
+                        "kv_len_after": new_seq_len,
+                        "compaction_indices": [idx.cpu().tolist() for idx in indices_list] if indices_list else None,
+                    })
 
                 position = current_seq_len - 1 + position_offset
                 _update_decode_state(last_token_gpu, position, current_seq_len, decode_ctx)
@@ -1462,6 +1503,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 seed = seg_count
                 token, logprob = _sample_token(decode_logits, state.temperature, state.top_p, rng, seed=seed)
                 all_token_ids.append(token.item())
+                all_logprobs.append(logprob.item())
                 last_token_gpu = token.view(1)
                 current_seq_len += 1
                 seg_count += 1
@@ -1472,11 +1514,11 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         state.turn_user_lens.append(user_len)
         state.turn_asst_lens.append(asst_len)
 
-        # Turn-based compaction: fires when we have more turns than n_protect_turns
-        if state.n_protect_turns >= 0 and len(state.turn_asst_lens) > state.n_protect_turns:
+        # Turn-based compaction: fires when accumulated turns reach n_max_turns
+        if state.n_max_turns >= 0 and len(state.turn_asst_lens) >= state.n_max_turns:
             kv_len = current_seq_len - 1  # boundary token not yet in KV
 
-            n_protect = state.n_protect_turns
+            n_protect = state.n_preserved_turns
             protected_total = (
                 sum(state.turn_user_lens[-n_protect:]) + sum(state.turn_asst_lens[-n_protect:])
                 if n_protect > 0 else 0
@@ -1485,7 +1527,9 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
 
             if compact_end > state.prompt_len:
                 keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
+                turn_compact_window = compact_end - state.prompt_len
 
+                indices_list = None
                 if state.compaction_mode == "markovian":
                     kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
                     c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
@@ -1499,7 +1543,8 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     asst_start = kv_len - asst_len_in_kv
                     query_vecs = [k[asst_start:kv_len].permute(1, 0, 2) for k in keys]
 
-                    c1_list, c2_list, _ = compact_kv_range(
+                    compact_seed = state.prompt_len * 10000 + state.compaction_count
+                    c1_list, c2_list, _, indices_list = compact_kv_range(
                         keys, values,
                         compact_start=state.prompt_len,
                         compact_end=compact_end,
@@ -1507,20 +1552,27 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                         num_kv_heads=num_kv_heads,
                         head_size=head_size,
                         device=device,
-                        query_vecs=query_vecs,
+                        suffix_queries=query_vecs,
+                        seed=compact_seed,
                     )
                     compacted_prefix_len = c1_list[0].shape[0]
+                state.compaction_count += 1
                 new_seq_len = state.prompt_len + compacted_prefix_len + (kv_len - compact_end)
 
                 _inject_compacted_kv(
                     kv_caches, keys, values, c1_list, c2_list,
                     state.block_ids, block_size, state.prompt_len, num_layers,
                     old_seq_len=kv_len,
-                    compact_window=compact_end - state.prompt_len,
+                    compact_window=turn_compact_window,
                 )
                 position_offset += kv_len - new_seq_len
                 current_seq_len = new_seq_len + 1
-                compaction_events.append({"kv_len_before": kv_len, "kv_len_after": new_seq_len})
+                compaction_events.append({
+                    "kv_len_before": kv_len,
+                    "kv_len_after": new_seq_len,
+                    "compaction_indices": [idx.cpu().tolist() for idx in indices_list] if indices_list else None,
+                    "compact_window": turn_compact_window,
+                })
 
             state.turn_user_lens = state.turn_user_lens[-n_protect:] if n_protect > 0 else []
             state.turn_asst_lens = state.turn_asst_lens[-n_protect:] if n_protect > 0 else []
@@ -1537,6 +1589,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
 
         return {
             "all_token_ids": all_token_ids,
+            "all_logprobs": all_logprobs,
             "current_seq_len": current_seq_len,
             "diagnostics": {"compaction_events": compaction_events},
         }
@@ -1544,6 +1597,15 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
     def compact_session_delete(self, session_id: str) -> None:
         """Free session blocks by removing the session state."""
         getattr(self, "_sessions", {}).pop(session_id, None)
+
+    def _expire_stale_sessions(self) -> None:
+        """Remove sessions that haven't been accessed within SESSION_TTL_SECONDS."""
+        sessions = getattr(self, "_sessions", {})
+        now = time.monotonic()
+        stale = [sid for sid, s in sessions.items() if now - s.last_access > SESSION_TTL_SECONDS]
+        for sid in stale:
+            logger.info("Expiring stale session %s (idle %.0fs)", sid, now - sessions[sid].last_access)
+            del sessions[sid]
 
     def _get_model(self) -> Module:
         model = self.model_runner.model

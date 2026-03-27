@@ -11,6 +11,7 @@ from prime_rl.utils.act_offloading import maybe_activation_offloading
 import torch
 import torch.distributed as dist
 import torch.distributed.nn as dist_nn
+from torch import Tensor
 from torch.profiler import profile, ProfilerActivity, record_function
 from prime_rl.trainer.ckpt import setup_ckpt_managers
 from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
@@ -374,62 +375,153 @@ def train(config: TrainerConfig):
             if cp_enabled:
                 temperatures = shard_for_cp(temperatures, cp_rank=cp_rank, cp_world_size=cp_size)
 
-            # Check for compaction segment boundaries
+            # Normalize segment boundaries and compaction indices
             seg_boundaries = micro_batch.get("segment_boundaries")
+            if seg_boundaries is not None:
+                if isinstance(seg_boundaries, torch.Tensor):
+                    seg_boundaries = seg_boundaries.tolist()
+                else:
+                    seg_boundaries = list(seg_boundaries)
+                if len(seg_boundaries) == 0:
+                    seg_boundaries = None
 
-            # Sync segment count across FSDP ranks: segmented_forward calls
-            # model.forward() once per segment, triggering FSDP all-gather each time.
-            # Different samples have different segment counts, so ranks must pad
-            # with dummy forward passes to avoid NCCL deadlock.
-            n_forwards = len(seg_boundaries) if seg_boundaries is not None else 1
+            # Validate boundaries fit within the actual sequence.
+            # Turn compaction boundaries are cumulative completion token counts.
+            # If the last boundary exceeds seq_len, the prompt_len would be negative
+            # and all segment ranges become invalid.
+            if seg_boundaries is not None and seg_boundaries[-1] > input_ids.shape[1]:
+                logger.warning(
+                    f"Dropping segment boundaries: last boundary {seg_boundaries[-1]} "
+                    f"> seq_len {input_ids.shape[1]} (boundaries={seg_boundaries})"
+                )
+                seg_boundaries = None
+
+            compaction_indices = micro_batch.get("compaction_indices")
+            compact_windows = micro_batch.get("compact_windows")
+            if seg_boundaries is None:
+                compaction_indices = None
+                compact_windows = None
+            else:
+                if isinstance(compaction_indices, torch.Tensor):
+                    compaction_indices = compaction_indices.tolist()
+                if isinstance(compact_windows, torch.Tensor):
+                    compact_windows = compact_windows.tolist()
+
+            # Sync across DP ranks: report 0 if no boundaries, else segment count.
+            # If any rank has segments, ALL ranks must use segmented_forward to
+            # avoid autograd graph divergence that causes FSDP reduce-scatter deadlocks.
+            n_forwards = len(seg_boundaries) if seg_boundaries is not None else 0
             max_forwards_t = torch.tensor([n_forwards], device="cuda", dtype=torch.int32)
             dist.all_reduce(max_forwards_t, op=dist.ReduceOp.MAX)
-            max_forwards = max_forwards_t.item()
+            max_forwards = int(max_forwards_t.item())
 
-            # Forward pass with per-token temperatures
-            with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
-                if seg_boundaries is not None:
-                    # Segmented forward with compaction replay
-                    prompt_len = input_ids.shape[1] - seg_boundaries[-1]
-                    out = segmented_forward(
-                        model,
-                        input_ids,
-                        forward_position_ids,
-                        segment_boundaries=seg_boundaries,
-                        prompt_len=prompt_len,
-                        compact_target_ratio=getattr(config, "compact_target_ratio", 0.25),
-                        compact_window=getattr(config, "compact_window", None),
-                        temperature=temperatures,
-                        max_forward_passes=max_forwards,
-                        compute_beta=getattr(config, "compute_beta", False),
-                        use_suffix_queries=getattr(config, "use_suffix_queries", True),
-                        compaction_indices=micro_batch.get("compaction_indices"),
-                        compaction_mode=getattr(config, "compaction_mode", "attention_matching"),
-                    )
+            if max_forwards > 0:
+                # At least one DP rank has compaction — all ranks use segmented_forward
+                if seg_boundaries is None:
+                    seg_boundaries = [input_ids.shape[1]]
+                    prompt_len = 0
+                    compaction_indices = None
+                    compact_windows = None
                 else:
-                    out = forward(
-                        model,
-                        input_ids,
-                        forward_position_ids,
-                        labels=labels,
-                        temperature=temperatures,
-                        pixel_values=pixel_values,
-                        image_grid_thw=image_grid_thw,
-                        routed_experts=routed_experts,
+                    prompt_len = input_ids.shape[1] - seg_boundaries[-1]
+
+                vocab_size = getattr(model.config, "vocab_size", None) or model.config.text_config.vocab_size
+                logprob_pad = torch.log(torch.tensor(1.0 / vocab_size)).item()
+                entropy_pad = torch.log(torch.tensor(float(vocab_size))).item()
+
+                # Accumulate per-segment stats for logging
+                _seg_trainer_probs: list[Tensor] = []
+                _seg_entropies: list[Tensor] = []
+                _seg_losses: list[Tensor] = []
+                _seg_loss_tensors: dict[str, list[Tensor]] = {}
+                # Carry the last unshifted logprob/entropy across segments so the
+                # boundary token gets the real value instead of a uniform-distribution pad.
+                _prev_logprob_pad = [logprob_pad]
+                _prev_entropy_pad = [entropy_pad]
+
+                def _segment_loss_fn(seg_logits: Tensor, token_start: int, token_end: int) -> dict:
+                    seg_labels = labels[:, token_start:token_end]
+                    seg_logprobs = selective_log_softmax(seg_logits, seg_labels)
+                    seg_entropy = compute_entropy(seg_logits)
+                    # Save last unshifted values for the next segment's boundary
+                    _prev_logprob_pad[0], next_lp = seg_logprobs[:, -1].item(), _prev_logprob_pad[0]
+                    _prev_entropy_pad[0], next_ep = seg_entropy[:, -1].item(), _prev_entropy_pad[0]
+                    seg_logprobs = shift_tensor_right(seg_logprobs, pad_value=next_lp)
+                    seg_entropy = shift_tensor_right(seg_entropy, pad_value=next_ep)
+
+                    seg_inf = inference_logprobs[:, token_start:token_end]
+                    seg_adv = advantages[:, token_start:token_end]
+                    seg_mask = loss_mask[:, token_start:token_end]
+                    seg_teacher = teacher_logprobs[:, token_start:token_end] if teacher_logprobs is not None else None
+
+                    seg_loss, seg_lt = compute_loss(
+                        trainer_logprobs=[seg_logprobs.squeeze()],
+                        inference_logprobs=[seg_inf.squeeze()],
+                        teacher_logprobs=[seg_teacher.squeeze()] if seg_teacher is not None else None,
+                        advantages=[seg_adv.squeeze()],
+                        loss_mask=[seg_mask.squeeze()],
+                        loss_fn=loss_fn,
+                        loss_scale=loss_scale,
                     )
-                    # Pad with dummy forward passes if other ranks need more
-                    if max_forwards > 1:
-                        dummy_sum = torch.tensor(0.0, device=input_ids.device)
-                        for _ in range(max_forwards - 1):
-                            d_out = model(
-                                input_ids=input_ids[:, :1],
-                                position_ids=forward_position_ids[:, :1],
-                            )
-                            d_logits = d_out["logits"] if isinstance(d_out, dict) else d_out.logits
-                            if isinstance(d_logits, dict):
-                                d_logits = d_logits["logits"]
-                            dummy_sum = dummy_sum + d_logits.float().mean()
-                        out["logits"] = out["logits"] + (dummy_sum * 0).to(out["logits"].dtype)
+                    torch.cuda.empty_cache()
+                    seg_loss.backward()
+
+                    _seg_trainer_probs.append(torch.exp(seg_logprobs)[seg_mask].detach().cpu())
+                    _seg_entropies.append(seg_entropy[seg_mask].detach().cpu())
+                    _seg_losses.append(seg_loss.detach().cpu())
+                    for k, v in seg_lt.items():
+                        _seg_loss_tensors.setdefault(k, []).append(v.detach().cpu())
+                    return {}
+
+                out = segmented_forward(
+                    model,
+                    input_ids,
+                    forward_position_ids,
+                    segment_boundaries=seg_boundaries,
+                    prompt_len=prompt_len,
+                    compact_target_ratio=config.compact_target_ratio,
+                    compact_window=config.compact_window,
+                    temperature=temperatures,
+                    max_forward_passes=max_forwards,
+                    compute_beta=config.compute_beta,
+                    use_suffix_queries=config.use_suffix_queries,
+                    compaction_indices=compaction_indices,
+                    compaction_mode=config.compaction_mode,
+                    compact_windows=compact_windows,
+                    segment_loss_fn=_segment_loss_fn,
+                )
+
+                # Aggregate per-segment stats for logging
+                tensors["trainer_probs"].append(torch.cat(_seg_trainer_probs) if _seg_trainer_probs else torch.tensor([]))
+                tensors["inference_probs"].append(torch.exp(inference_logprobs)[loss_mask].detach().cpu())
+                tensors["entropy"].append(torch.cat(_seg_entropies) if _seg_entropies else torch.tensor([]))
+                loss = torch.stack(_seg_losses).sum()
+                tensors["loss"].append(loss.unsqueeze(0))
+                for key, vals in _seg_loss_tensors.items():
+                    if vals[0].dim() == 0:
+                        tensors[key].append(torch.stack(vals))
+                    else:
+                        tensors[key].append(torch.cat(vals))
+
+                micro_step_message = f"Micro Step {micro_step}/{len(micro_batches)} | Loss: {loss.item():.4f}"
+                if _seg_entropies:
+                    micro_step_message += f" | Entropy: {torch.cat(_seg_entropies).mean().item():.4f}"
+                if "mismatch_kl" in _seg_loss_tensors:
+                    micro_step_message += f" | Mismatch KL: {torch.cat(_seg_loss_tensors['mismatch_kl']).mean().item():.4f}"
+                logger.debug(micro_step_message)
+                continue
+
+            else:
+                out = forward(
+                    model,
+                    input_ids,
+                    forward_position_ids,
+                    labels=labels,
+                    temperature=temperatures,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    routed_experts=routed_experts,
+                )
 
             if out.get("logprobs") is None:
                 # VanillaOutputLinear was used or segmented forward - compute logprobs from logits

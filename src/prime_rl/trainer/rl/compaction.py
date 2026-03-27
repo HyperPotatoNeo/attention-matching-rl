@@ -23,6 +23,7 @@ beta at compacted positions achieves identical behavior.
 """
 
 import logging
+from collections.abc import Callable
 
 import torch
 from torch import Tensor
@@ -32,6 +33,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import Checkpoi
 
 from prime_rl.inference.compaction.algorithm import compact_kv
 from prime_rl.trainer.models.layers.lora import base as lora_base
+from prime_rl.trainer.models.layers.lora import MultiLoRALinear
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +151,7 @@ def _make_query_capture_hook(layer_idx: int, buffer: dict[int, Tensor]):
 
     def hook(module, args, kwargs):
         hidden_states = args[0] if args else kwargs.get('hidden_states')
-        if hidden_states is None:
+        if hidden_states is None or hidden_states.shape[1] == 0:
             return
 
         head_dim = module.head_dim
@@ -274,6 +276,8 @@ def segmented_forward(
     use_suffix_queries: bool = True,
     compaction_indices: list | None = None,
     compaction_mode: str = "attention_matching",
+    compact_windows: list[int] | None = None,
+    segment_loss_fn: Callable[[Tensor, int, int], dict] | None = None,
 ) -> dict[str, Tensor]:
     """Run segmented forward passes with compaction replay between segments.
 
@@ -295,9 +299,17 @@ def segmented_forward(
         compact_target_ratio: Fraction of prefix keys to keep
         compact_window: If set, only compress first N assistant tokens per compaction
         temperature: Per-token temperatures [1, seq_len]
+        segment_loss_fn: If provided, called per segment as
+            ``segment_loss_fn(seg_logits, token_start, token_end) -> dict``
+            where *seg_logits* is ``[1, L, vocab]`` temperature-scaled logits and
+            *token_start:token_end* is the slice in the full input_ids that these
+            logits correspond to.  The callback must compute loss and call
+            ``.backward()`` before returning.  Activations are freed between
+            segments, keeping peak memory proportional to a single segment.
 
     Returns:
-        Dict with "logits" key containing [1, seq_len, vocab] temperature-scaled logits
+        Dict with "logits" key containing [1, seq_len, vocab] temperature-scaled logits,
+        or ``{"segment_results": [...]}`` when *segment_loss_fn* is used.
     """
     device = input_ids.device
     assert input_ids.shape[0] == 1, "Segmented forward only supports batch_size=1"
@@ -328,6 +340,8 @@ def segmented_forward(
         prev_boundary = boundary
 
     all_logits_pieces = []
+    segment_results = []
+    logit_offset = 0
     past_key_values = None
     position_offset = 0
 
@@ -335,18 +349,23 @@ def segmented_forward(
     beta_state: _BetaTrainingState | None = None
     beta_hooks: list = []
 
-    # Save reference to the LoRA num_tokens tensor and its original value.
-    # MultiLoRALinear instances hold a direct reference to this tensor,
-    # so we must modify it in-place (not replace it).
-    saved_lora_num_tokens = lora_base.LORA_NUM_TOKENS
+    # Check if LoRA modules are actually present on the model.
+    # MultiRunManager always sets LORA_NUM_TOKENS, so the global tensor alone
+    # is not a reliable indicator of LoRA being active.
+    has_lora = any(isinstance(m, MultiLoRALinear) for m in backbone.modules())
+
+    saved_lora_num_tokens = lora_base.LORA_NUM_TOKENS if has_lora else None
     original_lora_value = saved_lora_num_tokens[0].item() if saved_lora_num_tokens is not None else None
 
-    # Disable activation checkpointing only when LoRA is active.
-    # AC recomputes forward during backward, but LoRA offsets are global state
-    # that changes per-segment, causing offset mismatches during recomputation.
-    # For Full FT (no LoRA), AC is safe and critical for memory.
+    # Disable activation checkpointing when there are multiple segments.
+    # AC recomputes forward during backward. With use_cache=True (multi-segment),
+    # the recomputation sees different past_key_values state, causing a tensor
+    # count mismatch (CheckpointError). Single-segment keeps AC enabled — it
+    # doesn't use KV cache, and each segment is the full sequence so AC is
+    # critical for memory. LoRA also requires AC off due to global offset state.
+    needs_ac_disable = has_lora or len(seg_input_ranges) > 1
     saved_checkpoint_fns = {}
-    if saved_lora_num_tokens is not None:
+    if needs_ac_disable:
         for name, module in backbone.named_modules():
             if isinstance(module, CheckpointWrapper):
                 saved_checkpoint_fns[name] = module.checkpoint_fn
@@ -355,6 +374,17 @@ def segmented_forward(
     # Query capture for suffix queries (lazy-initialized)
     query_capture_hooks: list = []
     query_buffer: dict[int, Tensor] = {}
+
+    # Guard: skip zero-length segments
+    valid_ranges = [(s, e) for s, e in seg_input_ranges if e > s]
+    if len(valid_ranges) != len(seg_input_ranges):
+        logger.warning(
+            "Dropped %d zero-length segment(s): boundaries=%s, prompt_len=%d, "
+            "input_len=%d, ranges=%s",
+            len(seg_input_ranges) - len(valid_ranges),
+            segment_boundaries, prompt_len, input_ids.shape[1], seg_input_ranges,
+        )
+    seg_input_ranges = valid_ranges
 
     for seg_idx, (seg_start, seg_end) in enumerate(seg_input_ranges):
         seg_ids = input_ids[:, seg_start:seg_end]
@@ -380,11 +410,14 @@ def segmented_forward(
                 )
                 query_capture_hooks.append(handle)
 
+        # Only use KV cache when there are multiple segments (compaction needed).
+        # Single-segment traces skip use_cache to avoid ~1.7GB KV allocation.
+        needs_cache = len(seg_input_ranges) > 1
         out = model(
             input_ids=seg_ids,
             position_ids=seg_positions,
-            past_key_values=past_key_values,
-            use_cache=True,
+            past_key_values=past_key_values if needs_cache else None,
+            use_cache=needs_cache,
         )
 
         raw_logits = out["logits"] if isinstance(out, dict) else out.logits
@@ -396,11 +429,21 @@ def segmented_forward(
         is_last_segment = (seg_idx == len(seg_input_ranges) - 1)
 
         if is_last_segment:
-            all_logits_pieces.append(scaled_seg_logits)
+            logits_for_loss = scaled_seg_logits
         else:
             # Drop last logit — it will be recomputed post-compaction
             # by the next segment's forward pass (boundary token overlap)
-            all_logits_pieces.append(scaled_seg_logits[:, :-1, :])
+            logits_for_loss = scaled_seg_logits[:, :-1, :]
+
+        if segment_loss_fn is not None:
+            token_end = logit_offset + logits_for_loss.shape[1]
+            result = segment_loss_fn(logits_for_loss, logit_offset, token_end)
+            segment_results.append(result)
+            logit_offset = token_end
+            del logits_for_loss, scaled_seg_logits, seg_logits, raw_logits, out
+            torch.cuda.empty_cache()
+        else:
+            all_logits_pieces.append(logits_for_loss)
 
         if seg_idx < len(seg_input_ranges) - 1:
             kv_cache = captured_kv.get('past_key_values')
@@ -412,17 +455,13 @@ def segmented_forward(
             kv_seq_len = keys[0].shape[0]
 
             asst_len = kv_seq_len - prompt_len
-            window = min(compact_window or asst_len, asst_len)
-
-            # Extract suffix queries from captured buffer
-            suffix_queries = None
-            if use_suffix_queries and query_buffer:
-                suffix_start_in_seg = prompt_len + window - seg_start
-                suffix_queries = _extract_suffix_queries_from_buffer(
-                    query_buffer, num_layers, suffix_start_in_seg,
-                    num_kv_heads, head_size, device,
-                )
-                query_buffer.clear()
+            # Use per-segment window from inference if available (turn-based mode
+            # narrows the window to exclude protected turns)
+            seg_window = None
+            if compact_windows is not None and seg_idx < len(compact_windows):
+                seg_window = compact_windows[seg_idx]
+            effective_window = seg_window or compact_window
+            window = min(effective_window or asst_len, asst_len)
 
             # Convert inference indices to forced_indices tensors if available
             seg_forced_indices = None
@@ -433,6 +472,16 @@ def segmented_forward(
                         torch.tensor(layer_indices, dtype=torch.int64, device=device)
                         for layer_indices in seg_ci
                     ]
+
+            # Extract suffix queries from captured buffer
+            suffix_queries = None
+            if use_suffix_queries and query_buffer:
+                suffix_start_in_seg = prompt_len + window - seg_start
+                suffix_queries = _extract_suffix_queries_from_buffer(
+                    query_buffer, num_layers, suffix_start_in_seg,
+                    num_kv_heads, head_size, device,
+                )
+            query_buffer.clear()
 
             if compaction_mode == "markovian":
                 kv_dim = (0, num_kv_heads, head_size)
@@ -509,8 +558,6 @@ def segmented_forward(
     model.config.use_cache = False
 
     torch.cuda.empty_cache()
-    full_logits = torch.cat(all_logits_pieces, dim=1)
-    del all_logits_pieces
 
     # Pad with dummy forward passes to keep FSDP ranks synchronized.
     # segmented_forward calls model.forward() once per segment; different
@@ -518,6 +565,25 @@ def segmented_forward(
     # on NCCL all-gather counts, causing deadlock.
     actual_passes = len(seg_input_ranges)
     target_passes = max_forward_passes or actual_passes
+
+    if segment_loss_fn is not None:
+        # Per-segment backward: each dummy must do its own forward-backward pair
+        # to match the real rank's F→B interleaving (FSDP reduce-scatter sync).
+        for _ in range(target_passes - actual_passes):
+            d_out = model(
+                input_ids=input_ids[:, :1],
+                position_ids=position_ids[:, :1],
+            )
+            d_logits = d_out["logits"] if isinstance(d_out, dict) else d_out.logits
+            if isinstance(d_logits, dict):
+                d_logits = d_logits["logits"]
+            (d_logits.float().mean() * 0).backward()
+
+        return {"segment_results": segment_results}
+
+    full_logits = torch.cat(all_logits_pieces, dim=1)
+    del all_logits_pieces
+
     if target_passes > actual_passes:
         dummy_sum = torch.tensor(0.0, device=device)
         for _ in range(target_passes - actual_passes):
@@ -528,8 +594,6 @@ def segmented_forward(
             d_logits = d_out["logits"] if isinstance(d_out, dict) else d_out.logits
             if isinstance(d_logits, dict):
                 d_logits = d_logits["logits"]
-            # Use float().mean() to prevent bf16 sum overflow → Inf.
-            # Inf * 0 = NaN (IEEE 754), which would corrupt gradients.
             dummy_sum = dummy_sum + d_logits.float().mean()
         # Multiply by 0 to zero out gradient values while preserving the
         # autograd graph so FSDP backward hooks (reduce-scatter) still fire.

@@ -20,6 +20,47 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+def _get_dp_engines(engine):
+    """Resolve the list of DP engine identities from the top-level engine."""
+    client = getattr(engine, "engine_core", engine)
+    dp_engines = getattr(client, "core_engines", None)
+    if dp_engines and len(dp_engines) > 1:
+        return client, dp_engines
+    return None, None
+
+
+_dp_counter = 0
+_session_dp_map: dict[str, int] = {}
+
+
+async def _session_rpc(engine, method: str, session_id: str, args: tuple = (), kwargs: dict | None = None):
+    """Route a session RPC to a specific DP engine based on session_id.
+
+    With DP > 1, collective_rpc broadcasts to ALL engines, causing every
+    session to allocate KV blocks on every GPU.  This pins each session to
+    a single DP rank so the block budget is split across engines.
+    Round-robin assignment guarantees even distribution.
+    """
+    global _dp_counter
+    client, dp_engines = _get_dp_engines(engine)
+    if dp_engines is not None:
+        if method == "compact_session_create":
+            dp_rank = _dp_counter % len(dp_engines)
+            _dp_counter += 1
+            _session_dp_map[session_id] = dp_rank
+        elif session_id in _session_dp_map:
+            dp_rank = _session_dp_map[session_id]
+            if method == "compact_session_delete":
+                del _session_dp_map[session_id]
+        else:
+            dp_rank = hash(session_id) % len(dp_engines)
+        return await client._call_utility_async(
+            "collective_rpc", method, None, args, kwargs or {},
+            engine=dp_engines[dp_rank],
+        )
+    return await engine.collective_rpc(method, args=args, kwargs=kwargs)
+
 MAX_BATCH_SIZE = 32
 MAX_WAIT_SECONDS = 1.0
 
@@ -243,7 +284,8 @@ class SessionCreateRequest(BaseModel):
     top_p: float = 0.95
     compaction_mode: str = "attention_matching"
     use_suffix_queries: bool = True
-    n_protect_turns: int = -1
+    n_max_turns: int = -1
+    n_preserved_turns: int = 0
 
 
 class SessionStepRequest(BaseModel):
@@ -263,8 +305,8 @@ async def compact_session_create(body: SessionCreateRequest, request: Request):
         body.session_id, len(body.prompt_ids), body.max_kv_len,
     )
 
-    result = await engine.collective_rpc(
-        "compact_session_create",
+    result = await _session_rpc(
+        engine, "compact_session_create", body.session_id,
         args=(
             body.session_id,
             body.prompt_ids,
@@ -279,7 +321,8 @@ async def compact_session_create(body: SessionCreateRequest, request: Request):
             "top_p": body.top_p,
             "compaction_mode": body.compaction_mode,
             "use_suffix_queries": body.use_suffix_queries,
-            "n_protect_turns": body.n_protect_turns,
+            "n_max_turns": body.n_max_turns,
+            "n_preserved_turns": body.n_preserved_turns,
         },
     )
 
@@ -288,6 +331,7 @@ async def compact_session_create(body: SessionCreateRequest, request: Request):
     return {
         "session_id": data["session_id"],
         "all_token_ids": data["all_token_ids"],
+        "all_logprobs": data.get("all_logprobs", []),
         "final_text": final_text,
         "current_seq_len": data["current_seq_len"],
         "diagnostics": data.get("diagnostics", {}),
@@ -304,8 +348,8 @@ async def compact_session_step(body: SessionStepRequest, request: Request):
         body.session_id, len(body.new_token_ids),
     )
 
-    result = await engine.collective_rpc(
-        "compact_session_step",
+    result = await _session_rpc(
+        engine, "compact_session_step", body.session_id,
         args=(
             body.session_id,
             body.new_token_ids,
@@ -317,6 +361,7 @@ async def compact_session_step(body: SessionStepRequest, request: Request):
     final_text = tokenizer.decode(data["all_token_ids"], skip_special_tokens=True)
     return {
         "all_token_ids": data["all_token_ids"],
+        "all_logprobs": data.get("all_logprobs", []),
         "final_text": final_text,
         "current_seq_len": data["current_seq_len"],
         "diagnostics": data.get("diagnostics", {}),
@@ -327,8 +372,8 @@ async def compact_session_step(body: SessionStepRequest, request: Request):
 async def compact_session_delete(session_id: str, request: Request):
     engine = request.app.state.engine_client
 
-    await engine.collective_rpc(
-        "compact_session_delete",
+    await _session_rpc(
+        engine, "compact_session_delete", session_id,
         args=(session_id,),
     )
 

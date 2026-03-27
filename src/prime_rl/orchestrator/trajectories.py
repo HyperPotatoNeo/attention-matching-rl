@@ -92,6 +92,7 @@ def interleave_rollout(
         extras = step.get("extras", {})
         segment_boundaries = extras.get("segment_boundaries")
         compaction_indices = extras.get("compaction_indices")
+        compact_windows = extras.get("compact_windows")
 
         return TrainingSample(
             prompt_ids=list(tokens["prompt_ids"]),
@@ -105,6 +106,7 @@ def interleave_rollout(
             routed_experts=routed_experts,
             segment_boundaries=segment_boundaries,
             compaction_indices=compaction_indices,
+            compact_windows=compact_windows,
         )
 
     def extend_sample(sample: TrainingSample, step: vf.TrajectoryStep, prefix_len: int) -> None:
@@ -182,6 +184,23 @@ def interleave_rollout(
             sample.pixel_values = pv
             sample.pixel_values_shape = shape
             sample.image_grid_thw = grids
+
+    # Validate segment_boundaries against actual completion length.
+    # Boundaries are cumulative completion token counts set by TurnCompactionEnv
+    # across all turns. If the extension property broke, later turns moved to new
+    # samples but the first sample still carries boundaries for all turns.
+    for _, sample, _ in active_samples:
+        if sample.segment_boundaries is not None:
+            completion_len = len(sample.completion_ids)
+            if sample.segment_boundaries[-1] > completion_len:
+                logger.warning(
+                    f"Trimming segment_boundaries: {sample.segment_boundaries} "
+                    f"> completion_len={completion_len}"
+                )
+                trimmed = [b for b in sample.segment_boundaries if b <= completion_len]
+                if not trimmed or trimmed[-1] != completion_len:
+                    trimmed.append(completion_len)
+                sample.segment_boundaries = trimmed if len(trimmed) > 1 else None
 
     return [sample for _, sample, _ in active_samples]
 

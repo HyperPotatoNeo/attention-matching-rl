@@ -76,8 +76,10 @@ def compact_kv_range(
     num_queries: int = 64,
     compute_beta: bool = False,
     beta_nnls_iters: int = 50,
-    query_vecs: list[torch.Tensor] | None = None,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor] | None]:
+    suffix_queries: list[torch.Tensor] | None = None,
+    seed: int | None = None,
+    forced_indices: list[torch.Tensor] | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor] | None, list[torch.Tensor]]:
     """Compact a specific range of KV cache via Attention Matching.
 
     Compresses keys/values in [compact_start, compact_end). The full KV
@@ -93,17 +95,21 @@ def compact_kv_range(
         num_kv_heads: Number of KV heads
         head_size: Dimension per head
         device: CUDA device
-        num_queries: Number of random query probes (used only when query_vecs is None)
+        num_queries: Number of random query probes (used only when suffix_queries is None)
         compute_beta: If True, compute NNLS beta bias for partition function
             correction. Returns per-layer beta tensors as the third element.
         beta_nnls_iters: Number of projected gradient descent iterations for NNLS.
-        query_vecs: Per-layer query tensors (num_kv_heads, num_q, head_size). When
+        suffix_queries: Per-layer query tensors (num_kv_heads, num_q, head_size). When
             provided, used instead of random Gaussian probes for importance scoring.
+        seed: RNG seed for reproducible random probes (used only when suffix_queries is None).
+        forced_indices: Per-layer (num_kv_heads, target_len) index tensors. When provided,
+            skips importance scoring and uses these indices directly for key selection.
 
     Returns:
         c1[layer]: (target_len, num_kv_heads, head_size) - compacted keys
         c2[layer]: (target_len, num_kv_heads, head_size) - compacted values
         beta[layer] or None: (target_len, num_kv_heads) - per-key bias if compute_beta
+        indices[layer]: (num_kv_heads, target_len) - selected top-k indices per layer
     """
     num_layers = len(keys)
     dtype = keys[0].dtype
@@ -112,11 +118,16 @@ def compact_kv_range(
 
     c1_list, c2_list = [], []
     beta_list = [] if compute_beta else None
+    indices_list = []
+
+    rng = None
+    if suffix_queries is None and seed is not None:
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed)
 
     for layer_idx in range(num_layers):
         all_K = keys[layer_idx]
         all_V = values[layer_idx]
-        seq_len = all_K.shape[0]
 
         region_K = all_K[compact_start:compact_end]
         region_V = all_V[compact_start:compact_end]
@@ -128,11 +139,14 @@ def compact_kv_range(
         Rk_h = K_h[:, compact_start:compact_end, :]
         Rv_h = V_h[:, compact_start:compact_end, :]
 
-        if query_vecs is not None:
-            Q = query_vecs[layer_idx].float()
+        if suffix_queries is not None and suffix_queries[layer_idx].shape[1] > 0:
+            Q = suffix_queries[layer_idx].float()
+        elif rng is not None:
+            Q = torch.randn(num_kv_heads, num_queries, head_size,
+                            device=device, dtype=torch.float32, generator=rng)
         else:
             Q = torch.randn(num_kv_heads, num_queries, head_size,
-                             device=device, dtype=torch.float32)
+                            device=device, dtype=torch.float32)
 
         # Full attention over all keys: (H, Q, seq_len)
         full_scores = torch.bmm(Q, K_h.transpose(1, 2)) * scale
@@ -140,11 +154,16 @@ def compact_kv_range(
 
         # Importance over region only
         region_attn = full_attn[:, :, compact_start:compact_end]  # (H, Q, region_len)
-        importance = region_attn.pow(2).mean(dim=1).sqrt()  # (H, region_len)
 
-        # Top-k selection per head
-        topk_indices = importance.topk(target_len, dim=-1).indices
-        topk_indices = topk_indices.sort(dim=-1).values
+        if forced_indices is not None:
+            topk_indices = forced_indices[layer_idx].to(device=device, dtype=torch.int64)
+            topk_indices = topk_indices.sort(dim=-1).values
+        else:
+            importance = region_attn.pow(2).mean(dim=1).sqrt()  # (H, region_len)
+            topk_indices = importance.topk(target_len, dim=-1).indices
+            topk_indices = topk_indices.sort(dim=-1).values
+
+        indices_list.append(topk_indices)
 
         # Gather selected keys: (H, target_len, D)
         idx_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, head_size)
@@ -163,12 +182,11 @@ def compact_kv_range(
             X = X + layer_beta.unsqueeze(1)
         X = torch.softmax(X, dim=-1)
 
-        c2_h = torch.linalg.lstsq(X, Y).solution
-
-        nan_mask = torch.isnan(c2_h)
-        if nan_mask.any():
-            c2_fallback = torch.gather(Rv_h, 1, idx_expanded)
-            c2_h = torch.where(nan_mask, c2_fallback, c2_h)
+        # Ridge regression: (X^T X + λI) c2 = X^T Y
+        # More robust than lstsq on CUDA which throws on rank-deficient matrices.
+        XtX = torch.bmm(X.transpose(1, 2), X)
+        XtX.diagonal(dim1=-2, dim2=-1).add_(1e-3)
+        c2_h = torch.linalg.solve(XtX, torch.bmm(X.transpose(1, 2), Y))
 
         v_absmax = Rv_h.abs().max().item() * 2.0 + 1.0
         c2_h = c2_h.clamp(-v_absmax, v_absmax).to(dtype)
@@ -186,7 +204,7 @@ def compact_kv_range(
             layer_beta = torch.nan_to_num(layer_beta, nan=0.0)
             beta_list.append(layer_beta.permute(1, 0).to(torch.float32))
 
-    return c1_list, c2_list, beta_list
+    return c1_list, c2_list, beta_list, indices_list
 
 
 def compact_kv(
@@ -201,9 +219,11 @@ def compact_kv(
     compact_window: int | None = None,
     compute_beta: bool = False,
     beta_nnls_iters: int = 50,
-    query_vecs: list[torch.Tensor] | None = None,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor] | None]:
-    """Compact assistant KV prefix via Attention Matching (backward-compatible wrapper).
+    suffix_queries: list[torch.Tensor] | None = None,
+    seed: int | None = None,
+    forced_indices: list[torch.Tensor] | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor] | None, list[torch.Tensor]]:
+    """Compact assistant KV prefix via Attention Matching.
 
     Delegates to compact_kv_range with compact_start=prompt_len and
     compact_end=prompt_len + window.
@@ -216,18 +236,22 @@ def compact_kv(
         num_kv_heads: Number of KV heads
         head_size: Dimension per head
         device: CUDA device
-        num_queries: Number of random query probes (used only when query_vecs is None)
+        num_queries: Number of random query probes (used only when suffix_queries is None)
         compact_window: If set, only compress first N assistant tokens
         compute_beta: If True, compute NNLS beta bias for partition function
             correction. Returns per-layer beta tensors as the third element.
         beta_nnls_iters: Number of projected gradient descent iterations for NNLS.
-        query_vecs: Per-layer query tensors (num_kv_heads, num_q, head_size). When
+        suffix_queries: Per-layer query tensors (num_kv_heads, num_q, head_size). When
             provided, used instead of random Gaussian probes for importance scoring.
+        seed: RNG seed for reproducible random probes (used only when suffix_queries is None).
+        forced_indices: Per-layer (num_kv_heads, target_len) index tensors. When provided,
+            skips importance scoring and uses these indices directly for key selection.
 
     Returns:
         c1[layer]: (target_len, num_kv_heads, head_size) - compacted prefix keys
         c2[layer]: (target_len, num_kv_heads, head_size) - compacted prefix values
         beta[layer] or None: (target_len, num_kv_heads) - per-key bias if compute_beta
+        indices[layer]: (num_kv_heads, target_len) - selected top-k indices per layer
     """
     asst_len = keys[0].shape[0] - prompt_len
     window = min(compact_window or asst_len, asst_len)
@@ -242,5 +266,7 @@ def compact_kv(
         num_queries=num_queries,
         compute_beta=compute_beta,
         beta_nnls_iters=beta_nnls_iters,
-        query_vecs=query_vecs,
+        suffix_queries=suffix_queries,
+        seed=seed,
+        forced_indices=forced_indices,
     )

@@ -1,9 +1,22 @@
 import asyncio
+import os
 import shutil
 import time
 from pathlib import Path
 
 from prime_rl.utils.logger import get_logger
+
+
+def _flush_parent_cache(path: Path) -> None:
+    """Force a metadata refresh on network filesystems (Lustre, NFS).
+
+    Lustre clients cache directory metadata, so a file created by another
+    process may not be visible via path.exists() for tens of seconds.
+    Listing the parent directory forces the client to re-stat.
+    """
+    parent = path.parent
+    if parent.is_dir():
+        os.listdir(parent)
 
 
 def get_log_dir(output_dir: Path) -> Path:
@@ -99,6 +112,7 @@ def sync_wait_for_path(path: Path, interval: int = 1, log_interval: int = 10) ->
     wait_time = 0
     logger.debug(f"Waiting for path `{path}`")
     while True:
+        _flush_parent_cache(path)
         if path.exists():
             logger.debug(f"Found path `{path}`")
             break
@@ -113,6 +127,7 @@ async def wait_for_path(path: Path, interval: int = 1, log_interval: int = 10) -
     wait_time = 0
     logger.debug(f"Waiting for path `{path}`")
     while True:
+        _flush_parent_cache(path)
         if path.exists():
             logger.debug(f"Found path `{path}`")
             break
