@@ -31,6 +31,7 @@ import concurrent.futures
 import json
 import re
 import sys
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -233,8 +234,9 @@ def run_episode(env_name, idx, port, args, tokenizer=None, model_name=None, save
     terminated = False
     truncated = False
 
-    session_id = f"{run_id}_{idx}" if (args.mode != "baseline" and args.use_sessions) else None
+    session_id = f"{run_id}_{env_name}_{idx}" if (args.mode != "baseline" and args.use_sessions) else None
     session_token_ids = None  # actual KV token IDs (not re-encoded)
+    session_turns = 0  # turns completed in current session window
 
     for turn in range(args.max_turns):
         messages = build_messages(history, obs_text, no_thinking=args.no_thinking)
@@ -247,7 +249,23 @@ def run_episode(env_name, idx, port, args, tokenizer=None, model_name=None, save
             total_tokens += n_tokens
             turn_token_ids = tokenizer.encode(text, add_special_tokens=False) if (save_traces and tokenizer) else None
         elif session_id is not None:
-            if turn == 0:
+            # Markovian: client-side session reset with clean re-prefill.
+            # When session_turns reaches n_max_turns, delete the current session and
+            # re-create with only the preserved history as context, giving clean KV
+            # vectors that were not computed with the deleted turns.
+            if (args.mode == "markovian" and args.n_max_turns >= 0
+                    and session_turns >= args.n_max_turns):
+                client.delete(f"/compact_session/{session_id}")
+                session_id = f"{run_id}_{env_name}_{idx}_r{turn}"
+                session_token_ids = None
+                session_turns = 0
+                n_keep = args.n_preserved_turns
+                messages = build_messages(
+                    history[-n_keep:] if n_keep > 0 else [],
+                    obs_text, no_thinking=args.no_thinking,
+                )
+
+            if session_token_ids is None:
                 result = tokenizer.apply_chat_template(
                     messages, add_generation_prompt=True, tokenize=True,
                 )
@@ -263,7 +281,8 @@ def run_episode(env_name, idx, port, args, tokenizer=None, model_name=None, save
                     "top_p": 0.95,
                     "compaction_mode": "markovian" if args.mode == "markovian" else "attention_matching",
                     "use_suffix_queries": args.use_suffix_queries,
-                    "n_protect_turns": args.n_protect_turns,
+                    "n_max_turns": -1 if args.mode == "markovian" else args.n_max_turns,
+                    "n_preserved_turns": 0 if args.mode == "markovian" else args.n_preserved_turns,
                 })
                 if resp.status_code != 200:
                     raise RuntimeError(f"compact_session/create HTTP {resp.status_code}: {resp.text[:500]}")
@@ -294,6 +313,7 @@ def run_episode(env_name, idx, port, args, tokenizer=None, model_name=None, save
                 data = resp.json()
                 session_token_ids = session_token_ids + new_user_turn_tokens + data["all_token_ids"]
 
+            session_turns += 1
             text = data["final_text"]
             turn_token_ids = data["all_token_ids"] if save_traces else None
             total_tokens += len(data["all_token_ids"])
@@ -440,6 +460,55 @@ def plot_results(results_path):
     print(f"Plot saved to {plot_path}")
 
 
+def _save_results(results, episodes, args, output_path):
+    """Save current results to JSON (called incrementally)."""
+    n_total = len(results)
+    if n_total == 0:
+        return
+    total_success = sum(int(r["success"]) for r in results)
+    total_tokens = sum(r["tokens"] for r in results)
+
+    per_env = defaultdict(lambda: {"success": 0, "total": 0, "turns": [], "tokens": []})
+    for r in results:
+        per_env[r["env"]]["success"] += int(r["success"])
+        per_env[r["env"]]["total"] += 1
+        per_env[r["env"]]["turns"].append(r["turns"])
+        per_env[r["env"]]["tokens"].append(r["tokens"])
+
+    summary = {
+        "mode": args.mode,
+        "n_episodes": len(episodes),
+        "n_completed": n_total,
+        "n_per_task": args.n,
+        "success_rate": total_success / n_total,
+        "successes": total_success,
+        "total_tokens": total_tokens,
+        "avg_tokens": total_tokens / n_total,
+        "avg_turns": sum(r["turns"] for r in results) / n_total,
+        "config": {
+            "model": args.model,
+            "max_turns": args.max_turns,
+            "max_response_tokens": args.max_response_tokens,
+            "compact_ratio": args.compact_ratio,
+            "max_kv_len": args.max_kv_len,
+            "n_compacts": args.n_compacts,
+            "temperature": 0.6,
+        },
+        "per_env": {
+            env_name: {
+                "success_rate": t["success"] / t["total"],
+                "successes": t["success"],
+                "total": t["total"],
+                "avg_turns": sum(t["turns"]) / len(t["turns"]),
+                "avg_tokens": sum(t["tokens"]) / len(t["tokens"]),
+            }
+            for env_name, t in per_env.items()
+        },
+        "results": results,
+    }
+    Path(output_path).write_text(json.dumps(summary, indent=2, default=str))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate on BabyAI (MiniGrid)")
     parser.add_argument("--mode", choices=["baseline", "compaction", "markovian"], required=True)
@@ -458,8 +527,10 @@ def main():
     parser.add_argument("--use-suffix-queries", action="store_true")
     parser.add_argument("--use-sessions", action="store_true",
                         help="Use persistent KV sessions (avoids re-prefilling full history each turn)")
-    parser.add_argument("--n-protect-turns", type=int, default=-1,
-                        help="Turn-based compaction: keep last N turns uncompacted (-1 = use KV-budget mode)")
+    parser.add_argument("--n-max-turns", type=int, default=-1,
+                        help="Turn-based: trigger compaction when uncompacted turns reach this count (-1 = KV-budget mode)")
+    parser.add_argument("--n-preserved-turns", type=int, default=0,
+                        help="Turn-based: keep last N turns verbatim after compaction fires")
     parser.add_argument("--output", default=None)
     parser.add_argument("--no-thinking", action="store_true",
                         help="Disable Qwen3 thinking mode (faster, shorter responses)")
@@ -483,11 +554,13 @@ def main():
         sys.exit(1)
 
     # Build episode list: n episodes per task
+    # idx is the per-task seed (0..n-1), so the same seed produces the
+    # same MiniGrid layout regardless of which tasks are selected.
     episodes = []
     for i in range(args.n):
         for env_name, difficulty in tasks:
             episodes.append({
-                "idx": len(episodes),
+                "idx": i,
                 "env": env_name,
                 "difficulty": difficulty,
             })
@@ -510,50 +583,75 @@ def main():
     health.raise_for_status()
     print("Server health: OK\n")
 
+    # Resume: load existing results and skip completed episodes
+    output_path = args.output or f"results_babyai_{args.mode}_{len(episodes)}.json"
     results = []
-    total_success = 0
-    total_tokens = 0
-    t_total = time.time()
+    completed = set()
+    if Path(output_path).exists():
+        prev = json.loads(Path(output_path).read_text())
+        results = prev.get("results", [])
+        for r in results:
+            completed.add((r["env"], r["idx"]))
+        print(f"Resuming: {len(completed)}/{len(episodes)} episodes already done\n")
 
-    max_workers = len(ports) * 2
-    run_id = f"{args.mode}_{int(time.time())}"
+    remaining = [ep for ep in episodes if (ep["env"], ep["idx"]) not in completed]
+    if not remaining:
+        print("All episodes already completed. Nothing to do.")
+    else:
+        total_success = sum(int(r["success"]) for r in results)
+        total_tokens = sum(r["tokens"] for r in results)
+        t_total = time.time()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {}
-        for ep in episodes:
-            port = ports[ep["idx"] % len(ports)]
-            f = ex.submit(
-                run_episode,
-                ep["env"], ep["idx"], port, args, tokenizer, args.model,
-                save_traces=args.save_traces, run_id=run_id,
-            )
-            futures[f] = ep
+        max_workers = len(ports) * 2
+        run_id = f"{args.mode}_{int(time.time())}"
 
-        for f in concurrent.futures.as_completed(futures):
-            ep = futures[f]
-            result = f.result()
-            total_success += int(result["success"])
-            total_tokens += result["tokens"]
-            results.append(result)
+        results_lock = threading.Lock()
 
-            status = "OK" if result["success"] else "FAIL"
-            print(
-                f"[{len(results):3d}/{len(episodes)}] {status} "
-                f"env={result['env']:20s} "
-                f"turns={result['turns']:3d} "
-                f"tokens={result['tokens']:5d} "
-                f"time={result['time']:.1f}s "
-                f"rate={total_success}/{len(results)} "
-                f"({total_success/len(results):.1%})"
-            )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {}
+            for ep_i, ep in enumerate(remaining):
+                port = ports[ep_i % len(ports)]
+                f = ex.submit(
+                    run_episode,
+                    ep["env"], ep["idx"], port, args, tokenizer, args.model,
+                    save_traces=args.save_traces, run_id=run_id,
+                )
+                futures[f] = ep
 
-    wall_time = time.time() - t_total
-    results.sort(key=lambda r: r["idx"])
-    n_total = len(episodes)
+            for f in concurrent.futures.as_completed(futures):
+                ep = futures[f]
+                result = f.result()
+                total_success += int(result["success"])
+                total_tokens += result["tokens"]
+                results.append(result)
+
+                status = "OK" if result["success"] else "FAIL"
+                done = len(completed) + len(results) - len(completed)
+                print(
+                    f"[{len(results):3d}/{len(episodes)}] {status} "
+                    f"env={result['env']:20s} "
+                    f"turns={result['turns']:3d} "
+                    f"tokens={result['tokens']:5d} "
+                    f"time={result['time']:.1f}s "
+                    f"rate={total_success}/{len(results)} "
+                    f"({total_success/len(results):.1%})"
+                )
+
+                # Save incrementally after each episode
+                with results_lock:
+                    _save_results(results, episodes, args, output_path)
+
+    # Final save
+    results.sort(key=lambda r: (r["env"], r["idx"]))
+    _save_results(results, episodes, args, output_path)
+
+    n_total = len(results)
+    total_success = sum(int(r["success"]) for r in results)
+    total_tokens = sum(r["tokens"] for r in results)
 
     # === SUMMARY ===
     print("\n" + "=" * 70)
-    print(f"RESULTS: {args.mode.upper()} (BabyAI, {n_total} episodes)")
+    print(f"RESULTS: {args.mode.upper()} (BabyAI, {n_total}/{len(episodes)} episodes)")
     print("=" * 70)
 
     print(f"\nSuccess rate: {total_success}/{n_total} ({total_success/n_total:.1%})")
@@ -561,9 +659,7 @@ def main():
     print(f"Avg tokens/episode: {total_tokens/n_total:.0f}")
     avg_turns = sum(r["turns"] for r in results) / n_total
     print(f"Avg turns/episode: {avg_turns:.1f}")
-    print(f"Wall time: {wall_time:.1f}s ({wall_time/n_total:.1f}s/episode)")
 
-    # Per-env stats
     per_env = defaultdict(lambda: {"success": 0, "total": 0, "turns": [], "tokens": []})
     for r in results:
         per_env[r["env"]]["success"] += int(r["success"])
@@ -580,7 +676,6 @@ def main():
         avg_tok = sum(t["tokens"]) / len(t["tokens"])
         print(f"{env_name:<25} {t['success']:>8d} {t['total']:>6d} {rate:>7.1%} {avg_t:>9.1f} {avg_tok:>8.0f}")
 
-    # Per-difficulty stats
     diff_map = dict(BABYAI_TASKS)
     per_diff = defaultdict(lambda: {"success": 0, "total": 0})
     for r in results:
@@ -600,40 +695,6 @@ def main():
         print(f"\nTotal compactions: {total_compactions}")
         print(f"Avg compactions/episode: {total_compactions/n_total:.1f}")
 
-    # Save JSON
-    output_path = args.output or f"results_babyai_{args.mode}_{n_total}.json"
-    summary = {
-        "mode": args.mode,
-        "n_episodes": n_total,
-        "n_per_task": args.n,
-        "success_rate": total_success / n_total,
-        "successes": total_success,
-        "total_tokens": total_tokens,
-        "avg_tokens": total_tokens / n_total,
-        "avg_turns": avg_turns,
-        "wall_time": round(wall_time, 2),
-        "config": {
-            "model": args.model,
-            "max_turns": args.max_turns,
-            "max_response_tokens": args.max_response_tokens,
-            "compact_ratio": args.compact_ratio,
-            "max_kv_len": args.max_kv_len,
-            "n_compacts": args.n_compacts,
-            "temperature": 0.6,
-        },
-        "per_env": {
-            env_name: {
-                "success_rate": t["success"] / t["total"],
-                "successes": t["success"],
-                "total": t["total"],
-                "avg_turns": sum(t["turns"]) / len(t["turns"]),
-                "avg_tokens": sum(t["tokens"]) / len(t["tokens"]),
-            }
-            for env_name, t in per_env.items()
-        },
-        "results": results,
-    }
-    Path(output_path).write_text(json.dumps(summary, indent=2, default=str))
     print(f"\nResults saved to {output_path}")
 
     if args.plot:
