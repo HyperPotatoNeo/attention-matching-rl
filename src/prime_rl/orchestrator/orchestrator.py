@@ -631,10 +631,17 @@ async def orchestrate(config: OrchestratorConfig):
             return 0
 
         # Gather metrics in dataframes
+        def _get_subtask(rollout):
+            info = rollout.get("info")
+            if isinstance(info, dict):
+                return info.get("task")
+            return None
+
         results_df = pd.DataFrame(
             {
                 "example_id": [rollout["example_id"] for rollout in train_rollouts],
                 "task": [rollout["task"] for rollout in train_rollouts],
+                "subtask": [_get_subtask(rollout) for rollout in train_rollouts],
                 "reward": [rollout["reward"] for rollout in train_rollouts],
                 "is_truncated": [rollout["is_truncated"] for rollout in train_rollouts],
                 "error": [rollout["error"] for rollout in train_rollouts],
@@ -658,6 +665,7 @@ async def orchestrate(config: OrchestratorConfig):
                 {
                     "example_id": [rollout["example_id"] for rollout in val_outputs],
                     "task": [rollout["task"] for rollout in val_outputs],
+                    "subtask": [_get_subtask(rollout) for rollout in val_outputs],
                     "reward": [rollout["reward"] for rollout in val_outputs],
                 }
             )
@@ -778,6 +786,14 @@ async def orchestrate(config: OrchestratorConfig):
             per_env_ratio = results_df.task.value_counts(normalize=True).to_dict()
             to_log.update({f"batch/{env}": ratio for env, ratio in per_env_ratio.items()})
 
+        # Per-subtask metrics (e.g. BabyAI goto vs pickup vs open)
+        subtasks = results_df["subtask"].dropna()
+        if len(subtasks) > 0 and subtasks.nunique() > 1:
+            mask = results_df["subtask"].notna()
+            per_subtask = results_df[mask].groupby("subtask")
+            to_log.update({f"subtask_reward/{st}": r for st, r in per_subtask.reward.mean().to_dict().items()})
+            to_log.update({f"subtask_batch/{st}": r for st, r in results_df[mask].subtask.value_counts(normalize=True).to_dict().items()})
+
         # Optionally, add val metrics
         if val_results_df is not None:
             to_log.update(
@@ -796,6 +812,12 @@ async def orchestrate(config: OrchestratorConfig):
 
                 per_env_ratio = val_results_df.task.value_counts(normalize=True).to_dict()
                 to_log.update({f"val_batch/{env}": ratio for env, ratio in per_env_ratio.items()})
+
+            val_subtasks = val_results_df["subtask"].dropna()
+            if len(val_subtasks) > 0 and val_subtasks.nunique() > 1:
+                val_mask = val_results_df["subtask"].notna()
+                per_val_subtask = val_results_df[val_mask].groupby("subtask")
+                to_log.update({f"val_subtask_reward/{st}": r for st, r in per_val_subtask.reward.mean().to_dict().items()})
 
         # Log metrics to monitor(s)
         monitor.log(to_log, step=progress.step)
