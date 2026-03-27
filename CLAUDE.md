@@ -14,11 +14,13 @@ the full technical walkthrough.
 | `src/prime_rl/inference/compaction/routes.py` | `/compact_generate` endpoint + auto-batching |
 | `src/prime_rl/inference/compaction/algorithm.py` | Attention Matching + NNLS beta solver |
 | `src/prime_rl/inference/compaction/beta_attention.py` | BetaState mirrors + SDPA decode with per-token bias |
-| `src/compaction_env/env.py` | CompactionEnv (verifiers SingleTurnEnv wrapper) |
+| `src/compaction_env/env.py` | CompactionEnv + TurnCompactionEnv (verifiers env wrappers) |
+| `src/turn_compaction_env.py` | `load_environment` shim for `vf.load_environment("turn_compaction_env")` |
 | `scripts/eval_rg_mix.py` | rg-mix-env evaluation (compaction, baseline, and RSA modes) |
 | `scripts/eval_aime_rsa.py` | AIME benchmark for RSA vs baseline comparison |
 | `scripts/eval_balrog_babyai.py` | BabyAI (MiniGrid) multi-turn eval (compaction, baseline, markovian) |
 | `configs/compaction/qwen3_4b_balrog_babyai.toml` | BabyAI baseline training config |
+| `configs/compaction/qwen3_4b_turn_compaction_babyai.toml` | BabyAI turn-based compaction training config |
 | `scripts/start_4servers.sh` | Launch 4 TP=1 servers for DP=4 |
 | `configs/compaction/qwen3_4b_fullft_train.toml` | **Default training config** — 2-node, mixed-mode |
 | `configs/compaction/qwen3_4b_beta_test.toml` | Beta attention test config |
@@ -45,6 +47,17 @@ captures handle pre-compaction (FlashAttention) and post-compaction (SDPA+beta) 
 of compressed. The cache becomes `[prompt | suffix]` with no C1/C2. Supported in both
 inference (`worker.py`) and trainer (`segmented_forward`). Config field `compaction_mode`
 is auto-synced from env args to trainer config.
+
+**Turn-based compaction (TurnCompactionEnv)**: Uses `/compact_session/create` + `/compact_session/step`
+to maintain KV state across turns. Compaction fires between turns (server-side, controlled by
+`n_max_turns`/`n_preserved_turns`). `segment_boundaries` are accumulated turn-by-turn and stored
+on `trajectory[0]["extras"]` so `interleave_rollout` can reconstruct the full sequence for training.
+Turn-based mode: boundary placed after the turn whose accumulated KV triggered compaction.
+Config: `env_id="turn_compaction_env"`, trainer needs `compact_target_ratio` + `compaction_mode`.
+Three critical invariants: (1) `max_turns=n_max_turns` (not inner env's `max_turns=-1`) so verifiers
+stops at the right count; (2) `setup_state` preserves the outer EnvGroup `task` key after calling
+inner env (BalrogEnv overwrites it with the game task name, breaking buffer routing); (3) `dataset`
+falls back to `eval_dataset` when inner env has none (BalrogEnv is eval-only in verifiers terms).
 
 **Auto-batching**: Individual `/compact_generate` requests are transparently batched into
 `compact_generate_batch` calls (B=8) by `_RequestBatcher` in routes.py.

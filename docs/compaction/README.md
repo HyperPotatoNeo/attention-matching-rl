@@ -145,7 +145,8 @@ Create a session and generate the first response.
     "temperature": 0.6,
     "top_p": 0.95,
     "compaction_mode": "attention_matching",
-    "n_protect_turns": 1
+    "n_max_turns": 5,
+    "n_preserved_turns": 3
 }
 ```
 
@@ -155,14 +156,15 @@ Create a session and generate the first response.
 |-----------|------|---------|-------------|
 | `session_id` | `str` | required | Unique session identifier |
 | `prompt_ids` | `list[int]` | required | Tokenized system prompt + first user message |
-| `max_kv_len` | `int` | required | KV cache capacity (tokens). Triggers KV-budget compaction when `n_protect_turns=-1`. |
+| `max_kv_len` | `int` | required | KV cache capacity (tokens). Triggers KV-budget compaction when `n_max_turns=-1`. |
 | `compact_target_ratio` | `float` | 0.3 | Fraction of the compacted window to keep |
-| `compact_window` | `int\|null` | null | Compress only first N tokens of history (null = all). Ignored when `n_protect_turns >= 0`. |
+| `compact_window` | `int\|null` | null | Compress only first N tokens of history (null = all). Ignored when `n_max_turns >= 0`. |
 | `max_tokens` | `int` | 512 | Max tokens per response |
 | `temperature` | `float` | 0.7 | Sampling temperature |
 | `top_p` | `float` | 0.95 | Top-p sampling |
 | `compaction_mode` | `str` | `"attention_matching"` | `"attention_matching"` or `"markovian"` |
-| `n_protect_turns` | `int` | -1 | Turn-based compaction: keep last N turns uncompacted. `-1` = disabled (KV-budget mode). |
+| `n_max_turns` | `int` | -1 | Turn-based compaction: fire compaction when uncompacted turns reach this limit. `-1` = disabled (KV-budget mode). |
+| `n_preserved_turns` | `int` | 0 | Turn-based compaction: keep last N turns verbatim after compaction fires. |
 
 ### POST `/compact_session/step`
 
@@ -241,21 +243,26 @@ compaction_mode = "markovian"
 args = { ..., compaction_mode = "markovian", use_suffix_queries = false }
 ```
 
-### Turn-Based Compaction (`n_protect_turns`)
+### Turn-Based Compaction (`n_max_turns` + `n_preserved_turns`)
 
-Fires compaction **after each complete assistant response**, not reactively when the KV
-fills. The last `n_protect_turns` turns are kept verbatim; everything older is compacted.
+Fires compaction **after a turn completes and the uncompacted turn count reaches
+`n_max_turns`**, not reactively when the KV fills. The last `n_preserved_turns` turns
+are kept verbatim; everything older is compacted. Compaction then fires again every
+`n_max_turns - n_preserved_turns` turns.
+
+Example — `n_max_turns=5, n_preserved_turns=3`: turns accumulate until turn 5 → compact
+oldest 2, keep turns 3,4,5 → then compact again at turns 7, 9, ... (every 2 turns).
 
 The importance queries come from the **most recent assistant response's K-vectors** — a
 lookahead that grounds importance scoring in what the model actually attended to, rather
 than random Gaussian probes.
 
-KV structure after each step:
+KV structure after each compaction:
 ```
-[system prompt] | [compacted turns 1..N-n] | [user_{N-n+1}][asst_{N-n+1}] … [user_N][asst_N]
+[system prompt] | [compacted turns 1..N-n_preserved] | [turn_{N-n+1}]…[turn_N]
 ```
 
-Set `n_protect_turns >= 0` on the session endpoint. Default is `-1` (disabled — old
+Set `n_max_turns >= 0` on the session endpoint. Default is `-1` (disabled — old
 KV-budget behavior unchanged).
 
 ```python
@@ -265,7 +272,8 @@ client.post("/compact_session/create", json={
     "prompt_ids": [...],
     "max_kv_len": 8192,
     "compact_target_ratio": 0.5,
-    "n_protect_turns": 1,   # compact all but the most recent turn after each step
+    "n_max_turns": 5,        # fire compaction when 5 turns have accumulated
+    "n_preserved_turns": 3,  # keep the 3 most recent turns verbatim
 })
 ```
 
@@ -274,7 +282,7 @@ client.post("/compact_session/create", json={
 python scripts/eval_balrog_babyai.py \
     --mode compaction --use-sessions \
     --max-kv-len 8192 --compact-ratio 0.5 \
-    --n-protect-turns 1
+    --n-max-turns 5 --n-preserved-turns 3
 ```
 
 **Comparison of compaction triggers:**
@@ -282,7 +290,7 @@ python scripts/eval_balrog_babyai.py \
 | Mode | Trigger | Queries | Protects |
 |------|---------|---------|---------|
 | KV-budget | `seq_len >= max_kv_len` (mid-generation) | random Gaussian | nothing |
-| Turn-based | after each turn completes | assistant K-vectors (lookahead) | last N turns |
+| Turn-based | after N turns accumulate | assistant K-vectors (lookahead) | last `n_preserved_turns` turns |
 | Markovian | same trigger as KV-budget | n/a (hard delete) | nothing |
 
 ## BabyAI Evaluation
@@ -327,13 +335,13 @@ python scripts/eval_balrog_babyai.py --mode baseline --n 10
 python scripts/eval_balrog_babyai.py --mode compaction --n 10 \
     --max-kv-len 4096 --compact-ratio 0.5
 
-# Turn-based compaction — compacts after each turn, uses assistant K-vectors as probes
+# Turn-based compaction — compacts when 5 turns accumulate, keeps 3 most recent
 python scripts/eval_balrog_babyai.py --mode compaction --use-sessions --n 10 \
-    --max-kv-len 8192 --compact-ratio 0.5 --n-protect-turns 1
+    --max-kv-len 8192 --compact-ratio 0.5 --n-max-turns 5 --n-preserved-turns 3
 
-# Turn-based markovian — hard-deletes history after each turn
+# Turn-based markovian — hard-deletes history when 3 turns accumulate, keeps 1
 python scripts/eval_balrog_babyai.py --mode markovian --use-sessions --n 10 \
-    --max-kv-len 8192 --n-protect-turns 1
+    --max-kv-len 8192 --n-max-turns 3 --n-preserved-turns 1
 
 # Specific tasks only
 python scripts/eval_balrog_babyai.py --mode baseline --n 10 \
@@ -349,7 +357,8 @@ python scripts/eval_balrog_babyai.py --mode baseline --n 10 \
 | `--max-kv-len` | none | KV cache size limit (tokens) |
 | `--compact-ratio` | 0.25 | Fraction to keep after compaction |
 | `--use-sessions` | off | Use persistent KV session API |
-| `--n-protect-turns` | -1 | Turn-based: keep last N turns intact (-1 = KV-budget mode) |
+| `--n-max-turns` | -1 | Turn-based: trigger compaction when uncompacted turns reach this count (-1 = KV-budget mode) |
+| `--n-preserved-turns` | 0 | Turn-based: keep last N turns verbatim after compaction fires |
 | `--max-turns` | 64 | Max turns per episode |
 | `--max-response-tokens` | 512 | Max tokens per model response |
 | `--ports` | `8000,...,8003` | Server ports (comma-separated) |
@@ -359,9 +368,9 @@ python scripts/eval_balrog_babyai.py --mode baseline --n 10 \
 
 ### Notes
 
-- `--use-sessions` is required for turn-based compaction (`--n-protect-turns >= 0`).
+- `--use-sessions` is required for turn-based compaction (`--n-max-turns >= 0`).
   KV-budget compaction works without sessions (`--use-sessions` optional).
-- When `--n-protect-turns >= 0`, `--compact-window` has no effect and a warning is logged.
+- When `--n-max-turns >= 0`, `--compact-window` has no effect and a warning is logged.
 - The model (`Qwen/Qwen3-4B-Instruct-2507`) is served via `configs/compaction/qwen3_4b_serve_tp1.toml`.
 
 ---
