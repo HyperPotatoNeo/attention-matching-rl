@@ -41,6 +41,33 @@ uv sync --group dev
 
 Installs pytest, ruff, pre-commit, and other development tools.
 
+## BabyAI / BALROG setup
+
+The BabyAI multi-turn eval depends on `balrog` and `balrog-bench`. These cannot be
+added to `pyproject.toml` because `balrog` pulls `google-generativeai` which conflicts
+with the `verifiers` → `prime-sandboxes` dependency chain.
+
+**Install manually after `uv sync`:**
+
+```bash
+uv pip install git+https://github.com/DavidePaglieri/BALROG.git@a5fa0e7 --no-deps
+```
+
+`--no-deps` avoids the `google-generativeai` conflict. The transitive deps we actually
+need (`gymnasium`, `omegaconf`) are already installed by `uv sync`.
+
+`balrog-bench` is vendored at `src/balrog_bench.py` — installed automatically via the
+`src/` layout, no extra steps needed.
+
+> **Warning:** Do NOT `pip install balrog` or `pip install balrog-bench` from PyPI — the
+> PyPI `balrog` package is Paylogic's ACL library (unrelated), not the BALROG benchmark.
+
+Verify:
+```bash
+uv run python -c "from balrog.environments import make_env; print('balrog OK')"
+uv run python -c "import balrog_bench; print('balrog_bench OK')"
+```
+
 ## Key files
 
 - `pyproject.toml` — all dependencies, extras, and dependency groups
