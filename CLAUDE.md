@@ -16,6 +16,7 @@ the full technical walkthrough.
 | `src/prime_rl/inference/compaction/beta_attention.py` | BetaState mirrors + SDPA decode with per-token bias |
 | `src/compaction_env/env.py` | CompactionEnv + TurnCompactionEnv (verifiers env wrappers) |
 | `src/turn_compaction_env.py` | `load_environment` shim for `vf.load_environment("turn_compaction_env")` |
+| `src/balrog_bench.py` | Vendored BALROG verifiers env (not on PyPI — PyPI `balrog-bench` is wrong package) |
 | `scripts/eval_rg_mix.py` | rg-mix-env evaluation (compaction, baseline, and RSA modes) |
 | `scripts/eval_aime_rsa.py` | AIME benchmark for RSA vs baseline comparison |
 | `scripts/eval_balrog_babyai.py` | BabyAI (MiniGrid) multi-turn eval (compaction, baseline, markovian) |
@@ -96,6 +97,19 @@ onto existing KV), `_batch_generate` (K candidates in parallel), `_inject_compac
 
 Endpoint: `/rsa_generate` in routes.py. No auto-batching (RSA uses full GPU internally).
 
+### BALROG / BabyAI dependency
+
+`balrog` (the BALROG benchmark, not the Paylogic ACL package on PyPI) conflicts with
+`verifiers` via `google-generativeai` → `prime-sandboxes`, so it cannot go in `pyproject.toml`.
+Install manually after `uv sync`:
+
+```bash
+uv pip install git+https://github.com/DavidePaglieri/BALROG.git@a5fa0e7 --no-deps
+```
+
+`balrog-bench` is vendored at `src/balrog_bench.py` — no extra install needed.
+See the `installation` skill for full details.
+
 ### Running evals
 
 ```bash
@@ -127,3 +141,5 @@ python scripts/eval_balrog_babyai.py --mode compaction --n 10 \
 python scripts/eval_balrog_babyai.py --mode markovian --n 10 \
     --max-kv-len 2048
 ```
+
+@import /home/mila/e/emiliano.penaloza/orchestrator/CLAUDE.md
