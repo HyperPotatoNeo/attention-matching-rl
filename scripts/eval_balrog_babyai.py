@@ -19,6 +19,14 @@ Usage:
     python scripts/eval_balrog_babyai.py --mode markovian --n 10 \
         --max-kv-len 2048
 
+    # Summary compaction (text-level: summarize old turns on session reset)
+    python scripts/eval_balrog_babyai.py --mode summary --n 10 \
+        --n-max-turns 4 --n-preserved-turns 2 --summary-max-tokens 200
+
+    # Markovian pure (drop old turns entirely, fresh session with preserved turns only)
+    python scripts/eval_balrog_babyai.py --mode markovian_pure --n 10 \
+        --n-max-turns 4 --n-preserved-turns 2
+
     # Specific tasks only
     python scripts/eval_balrog_babyai.py --mode baseline --n 10 \
         --envs GoToObj GoToLocal
@@ -217,6 +225,51 @@ def build_messages(history, current_obs, no_thinking=False):
     return messages
 
 
+def generate_summary(client, turns, prev_summary, model_name, max_tokens=200):
+    """Generate a text summary of conversation turns for context compression.
+
+    Returns (summary_text, completion_tokens).
+    """
+    parts = []
+    for obs_text, response_text, *_ in turns:
+        parts.append(f"Observation:\n{obs_text}\nResponse:\n{response_text}")
+    interaction = "\n---\n".join(parts)
+
+    context = f"Previous context:\n{prev_summary}\n\n" if prev_summary else ""
+
+    resp = client.post("/v1/chat/completions", json={
+        "model": model_name,
+        "messages": [{"role": "user", "content": (
+            "/nothink\nBriefly summarize this grid-world navigation interaction. "
+            "Focus on: the mission, actions taken, what was discovered "
+            "(object locations, doors, keys), and current progress. "
+            "2-3 sentences.\n\n"
+            f"{context}Interaction:\n{interaction}"
+        )}],
+        "max_tokens": max_tokens,
+        "temperature": 0.3,
+    })
+    resp.raise_for_status()
+    data = resp.json()
+    text = data["choices"][0]["message"]["content"]
+    tokens = data["usage"]["completion_tokens"]
+    if "</think>" in text:
+        text = text.split("</think>", 1)[-1].strip()
+    return text, tokens
+
+
+def build_messages_with_summary(summary, recent_history, current_obs, no_thinking=False):
+    """Build chat messages with a summary of old turns injected into system prompt."""
+    system = SYSTEM_PROMPT_NOTHINK if no_thinking else SYSTEM_PROMPT
+    system += f"\n\nContext from earlier in this episode:\n{summary}"
+    messages = [{"role": "system", "content": system}]
+    for obs_text, response_text, *_ in recent_history:
+        messages.append({"role": "user", "content": obs_text})
+        messages.append({"role": "assistant", "content": response_text})
+    messages.append({"role": "user", "content": current_obs})
+    return messages
+
+
 def run_episode(env_name, idx, port, args, tokenizer=None, model_name=None, save_traces=False, run_id=None):  # noqa: C901
     """Run one BabyAI episode. Returns result dict."""
     env_id = f"BabyAI-{env_name}-v0"
@@ -234,9 +287,15 @@ def run_episode(env_name, idx, port, args, tokenizer=None, model_name=None, save
     terminated = False
     truncated = False
 
-    session_id = f"{run_id}_{env_name}_{idx}" if (args.mode != "baseline" and args.use_sessions) else None
+    session_id = f"{run_id}_{env_name}_{idx}" if (args.mode != "baseline" and (args.use_sessions or args.mode in ("summary", "markovian_pure"))) else None
     session_token_ids = None  # actual KV token IDs (not re-encoded)
     session_turns = 0  # turns completed in current session window
+
+    # Summary mode state
+    cumulative_summary = ""
+    last_summary_idx = 0
+    summary_tokens_used = 0
+    n_summary_resets = 0
 
     for turn in range(args.max_turns):
         messages = build_messages(history, obs_text, no_thinking=args.no_thinking)
@@ -249,31 +308,58 @@ def run_episode(env_name, idx, port, args, tokenizer=None, model_name=None, save
             total_tokens += n_tokens
             turn_token_ids = tokenizer.encode(text, add_special_tokens=False) if (save_traces and tokenizer) else None
         elif session_id is not None:
-            # Markovian: client-side session reset with clean re-prefill.
-            # When session_turns reaches n_max_turns, delete the current session and
-            # re-create with only the preserved history as context, giving clean KV
-            # vectors that were not computed with the deleted turns.
-            if (args.mode == "markovian" and args.n_max_turns >= 0
+            # Markovian / Summary / Markovian-pure: client-side session reset.
+            # Markovian & markovian_pure re-create with only preserved history (clean KV).
+            # Summary generates a text summary of old turns and injects it
+            # into the system prompt before re-creating the session.
+            if (args.mode in ("markovian", "summary", "markovian_pure") and args.n_max_turns >= 0
                     and session_turns >= args.n_max_turns):
+                n_keep = args.n_preserved_turns
+
+                if args.mode == "summary":
+                    summary_end = len(history) - n_keep if n_keep > 0 and len(history) > n_keep else len(history)
+                    turns_to_summarize = history[last_summary_idx:summary_end]
+                    if turns_to_summarize:
+                        cumulative_summary, stokens = generate_summary(
+                            client, turns_to_summarize, cumulative_summary,
+                            model_name, max_tokens=args.summary_max_tokens,
+                        )
+                        summary_tokens_used += stokens
+                    last_summary_idx = summary_end
+                    n_summary_resets += 1
+
                 client.delete(f"/compact_session/{session_id}")
                 session_id = f"{run_id}_{env_name}_{idx}_r{turn}"
                 session_token_ids = None
                 session_turns = 0
-                n_keep = args.n_preserved_turns
-                messages = build_messages(
-                    history[-n_keep:] if n_keep > 0 else [],
-                    obs_text, no_thinking=args.no_thinking,
-                )
+
+                recent = history[-n_keep:] if n_keep > 0 else []
+                if args.mode == "summary" and cumulative_summary:
+                    messages = build_messages_with_summary(
+                        cumulative_summary, recent, obs_text,
+                        no_thinking=args.no_thinking,
+                    )
+                else:
+                    messages = build_messages(
+                        recent, obs_text, no_thinking=args.no_thinking,
+                    )
 
             if session_token_ids is None:
                 result = tokenizer.apply_chat_template(
                     messages, add_generation_prompt=True, tokenize=True,
                 )
                 prompt_ids = list(result["input_ids"]) if hasattr(result, "keys") else list(result)
+                # Summary / markovian_pure: no server-side compaction; generous KV budget
+                if args.mode in ("summary", "markovian_pure"):
+                    kv_budget = 2000 + max(args.n_max_turns, 4) * (args.max_response_tokens + 300)
+                    server_max_kv_len = max(args.max_kv_len or kv_budget, kv_budget)
+                else:
+                    server_max_kv_len = args.max_kv_len
+
                 resp = client.post("/compact_session/create", json={
                     "session_id": session_id,
                     "prompt_ids": prompt_ids,
-                    "max_kv_len": args.max_kv_len,
+                    "max_kv_len": server_max_kv_len,
                     "max_response_tokens": args.max_response_tokens,
                     "compact_target_ratio": args.compact_ratio,
                     "compact_window": args.compact_window,
@@ -281,8 +367,8 @@ def run_episode(env_name, idx, port, args, tokenizer=None, model_name=None, save
                     "top_p": 0.95,
                     "compaction_mode": "markovian" if args.mode == "markovian" else "attention_matching",
                     "use_suffix_queries": args.use_suffix_queries,
-                    "n_max_turns": -1 if args.mode == "markovian" else args.n_max_turns,
-                    "n_preserved_turns": 0 if args.mode == "markovian" else args.n_preserved_turns,
+                    "n_max_turns": -1 if args.mode in ("markovian", "summary", "markovian_pure") else args.n_max_turns,
+                    "n_preserved_turns": 0 if args.mode in ("markovian", "summary", "markovian_pure") else args.n_preserved_turns,
                 })
                 if resp.status_code != 200:
                     raise RuntimeError(f"compact_session/create HTTP {resp.status_code}: {resp.text[:500]}")
@@ -396,6 +482,9 @@ def run_episode(env_name, idx, port, args, tokenizer=None, model_name=None, save
         "compactions": n_compactions,
         "time": round(elapsed, 2),
     }
+    if args.mode == "summary":
+        result["summary_tokens"] = summary_tokens_used
+        result["n_summary_resets"] = n_summary_resets
     if save_traces:
         result["trace"] = [
             {
@@ -511,7 +600,7 @@ def _save_results(results, episodes, args, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate on BabyAI (MiniGrid)")
-    parser.add_argument("--mode", choices=["baseline", "compaction", "markovian"], required=True)
+    parser.add_argument("--mode", choices=["baseline", "compaction", "markovian", "summary", "markovian_pure"], required=True)
     parser.add_argument("--n", type=int, default=10, help="Episodes per task")
     parser.add_argument("--envs", nargs="*", default=None,
                         help="BabyAI env suffixes (default: all)")
@@ -538,7 +627,14 @@ def main():
                         help="Generate comparison plot (needs >=2 result files)")
     parser.add_argument("--save-traces", action="store_true",
                         help="Save full turn-by-turn conversation traces in the output JSON")
+    parser.add_argument("--summary-max-tokens", type=int, default=200,
+                        help="Max tokens for summary generation (summary mode only)")
     args = parser.parse_args()
+
+    if args.mode in ("summary", "markovian_pure") and args.n_max_turns < 0:
+        args.n_max_turns = 4
+    if args.mode in ("summary", "markovian_pure") and args.n_preserved_turns == 0:
+        args.n_preserved_turns = 2
 
     ports = [int(p) for p in args.ports.split(",")]
 
@@ -694,6 +790,13 @@ def main():
         total_compactions = sum(r["compactions"] for r in results)
         print(f"\nTotal compactions: {total_compactions}")
         print(f"Avg compactions/episode: {total_compactions/n_total:.1f}")
+
+    if args.mode == "summary":
+        total_summary_tokens = sum(r.get("summary_tokens", 0) for r in results)
+        total_resets = sum(r.get("n_summary_resets", 0) for r in results)
+        print(f"\nSummary resets: {total_resets}")
+        print(f"Summary tokens: {total_summary_tokens}")
+        print(f"Avg summary tokens/episode: {total_summary_tokens/n_total:.0f}")
 
     print(f"\nResults saved to {output_path}")
 

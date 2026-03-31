@@ -488,6 +488,7 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         top_p: float = 0.95,
         compaction_mode: str = "attention_matching",
         use_suffix_queries: bool = True,
+        summary_max_tokens: int = 512,
         **kwargs,
     ):
         self.inner_env = inner_env
@@ -501,6 +502,7 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         self.top_p = top_p
         self.compaction_mode = compaction_mode
         self.use_suffix_queries = use_suffix_queries
+        self.summary_max_tokens = summary_max_tokens
 
         inner_eval_dataset = getattr(inner_env, "eval_dataset", None)
         inner_dataset = inner_env.dataset if inner_env.dataset is not None else inner_eval_dataset
@@ -553,6 +555,133 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         except Exception:
             pass  # best-effort cleanup
 
+    def _rebuild_prompt_with_summary(self, prompt_dicts: list[dict], state: State) -> list[dict]:
+        """Replace old turns with summary in prompt_dicts for TITO compatibility.
+
+        After a summary reset, verifiers still passes the full message history.
+        This rebuilds the prompt to match what the session KV actually contains:
+        [system+summary | preserved_turns | new_turns_since_reset | current_obs].
+        """
+        base_system = state["_tc_base_system"]
+        summary = state["_tc_summary"]
+
+        system_msg = {"role": "system", "content": base_system + f"\n\nContext from earlier:\n{summary}"}
+        current_user = prompt_dicts[-1]
+        turn_msgs = prompt_dicts[1:-1]
+
+        # Keep preserved turns + turns accumulated since last summary reset
+        summary_turn_count = state.get("_tc_summary_turn_count", 0)
+        n_recent_pairs = self.n_preserved_turns + summary_turn_count
+        if n_recent_pairs > 0 and len(turn_msgs) >= n_recent_pairs * 2:
+            recent = turn_msgs[-(n_recent_pairs * 2):]
+        else:
+            recent = turn_msgs
+
+        return [system_msg] + recent + [current_user]
+
+    def _rebuild_prompt_after_pure_reset(self, prompt_dicts: list[dict], state: State) -> list[dict]:
+        """Trim prompt_dicts to match session KV after a markovian_pure reset.
+
+        After reset, the session only contains [system | preserved_turns]. Verifiers
+        still passes full history, so trim to [system | recent_turns | current_obs].
+        """
+        current_user = prompt_dicts[-1]
+        turn_msgs = prompt_dicts[1:-1]
+
+        n_recent_pairs = self.n_preserved_turns + state.get("_tc_summary_turn_count", 0)
+        if n_recent_pairs > 0 and len(turn_msgs) >= n_recent_pairs * 2:
+            recent = turn_msgs[-(n_recent_pairs * 2):]
+        else:
+            recent = turn_msgs
+
+        return [prompt_dicts[0]] + recent + [current_user]
+
+    async def _markovian_pure_reset(self, state: State, prompt_dicts: list[dict]) -> list[dict]:
+        """Drop old turns, delete session, return prompt with only preserved turns."""
+        current_user = prompt_dicts[-1]
+        turn_msgs = prompt_dicts[1:-1]
+
+        n_keep = self.n_preserved_turns
+        preserved = turn_msgs[-(n_keep * 2):] if n_keep > 0 and len(turn_msgs) > n_keep * 2 else turn_msgs
+
+        await self._delete_session(state)
+        for key in ["_tc_session_id", "_tc_prev_prompt_ids", "_tc_prev_completion_ids",
+                     "_tc_last_token", "_tc_suffix_ids"]:
+            state.pop(key, None)
+        state["_tc_cleaned"] = False
+        state["_tc_summary_turn_count"] = 0
+        state["_tc_pure_reset_done"] = True
+
+        return [prompt_dicts[0]] + preserved + [current_user]
+
+    async def _summary_reset(
+        self,
+        state: State,
+        prompt_dicts: list[dict],
+        http_client: httpx.AsyncClient,
+        server_url: str,
+        model: str,
+    ) -> list[dict]:
+        """Generate summary of old turns, delete session, return modified prompt."""
+        system_msg = prompt_dicts[0]
+        current_user = prompt_dicts[-1]
+        turn_msgs = prompt_dicts[1:-1]
+
+        n_keep = self.n_preserved_turns
+        if n_keep > 0 and len(turn_msgs) > n_keep * 2:
+            to_summarize = turn_msgs[:-(n_keep * 2)]
+            preserved = turn_msgs[-(n_keep * 2):]
+        else:
+            to_summarize = turn_msgs
+            preserved = []
+
+        parts = []
+        for i in range(0, len(to_summarize), 2):
+            if i + 1 < len(to_summarize):
+                parts.append(
+                    f"Observation:\n{to_summarize[i].get('content', '')}\n"
+                    f"Response:\n{to_summarize[i + 1].get('content', '')}"
+                )
+
+        prev_summary = state.get("_tc_summary", "")
+        context = f"Previous context:\n{prev_summary}\n\n" if prev_summary else ""
+        interaction = "\n---\n".join(parts)
+
+        resp = await http_client.post(
+            f"{server_url}/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": (
+                    "/nothink\nBriefly summarize this interaction. "
+                    "Focus on mission, actions, discoveries, and progress. "
+                    "2-3 sentences.\n\n"
+                    f"{context}Interaction:\n{interaction}"
+                )}],
+                "max_tokens": self.summary_max_tokens,
+                "temperature": 0.3,
+            },
+        )
+        resp.raise_for_status()
+        summary_text = resp.json()["choices"][0]["message"]["content"]
+        if "</think>" in summary_text:
+            summary_text = summary_text.split("</think>", 1)[-1].strip()
+
+        state["_tc_summary"] = summary_text
+        logger.info("Summary reset: generated %d-char summary", len(summary_text))
+
+        # Delete old session and clean up state to force recreation
+        await self._delete_session(state)
+        for key in ["_tc_session_id", "_tc_prev_prompt_ids", "_tc_prev_completion_ids",
+                     "_tc_last_token", "_tc_suffix_ids"]:
+            state.pop(key, None)
+        state["_tc_cleaned"] = False
+        state["_tc_summary_turn_count"] = 0
+
+        # Build modified prompt with summary in system message
+        base_system = state["_tc_base_system"]
+        new_system = {"role": "system", "content": base_system + f"\n\nContext from earlier:\n{summary_text}"}
+        return [new_system] + preserved + [current_user]
+
     async def get_model_response(
         self,
         state: State,
@@ -592,7 +721,25 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
 
         prompt_dicts = _messages_to_openai(prompt)
 
+        # After a client-side reset, rebuild prompt to match session KV contents
+        if state.get("_tc_summary"):
+            prompt_dicts = self._rebuild_prompt_with_summary(prompt_dicts, state)
+        elif state.get("_tc_pure_reset_done"):
+            prompt_dicts = self._rebuild_prompt_after_pure_reset(prompt_dicts, state)
+
         async with httpx.AsyncClient(timeout=7200.0) as http_client:
+            # Client-side session reset when window is full (summary / markovian_pure)
+            if (self.compaction_mode in ("summary", "markovian_pure")
+                    and self.n_max_turns >= 0
+                    and state.get("_tc_summary_turn_count", 0) >= self.n_max_turns
+                    and "_tc_session_id" in state):
+                if self.compaction_mode == "summary":
+                    prompt_dicts = await self._summary_reset(
+                        state, prompt_dicts, http_client, server_url, model,
+                    )
+                else:
+                    prompt_dicts = await self._markovian_pure_reset(state, prompt_dicts)
+
             tokenize_body = {
                 "model": model,
                 "messages": prompt_dicts,
@@ -610,13 +757,25 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
             full_ids = tokenize_resp.json()["tokens"]
 
             if "_tc_session_id" not in state:
-                # Turn 0: use full tokenization directly
+                # Turn 0 (or first turn after summary reset): use full tokenization
                 prompt_ids = full_ids
                 session_id = str(uuid.uuid4())
+
+                # Store base system prompt for summary rebuilds
+                if self.compaction_mode == "summary" and "_tc_base_system" not in state:
+                    state["_tc_base_system"] = _messages_to_openai(prompt)[0].get("content", "")
+
                 session_max_kv_len = max(
                     self.max_kv_len,
                     len(prompt_ids) + self.n_max_turns * (self.max_response_tokens + 300),
                 ) if self.n_max_turns > 0 else self.max_kv_len
+
+                # Summary / markovian_pure: no server-side compaction, client manages context
+                client_managed = self.compaction_mode in ("summary", "markovian_pure")
+                server_compaction_mode = "attention_matching" if client_managed else self.compaction_mode
+                server_n_max_turns = -1 if client_managed else self.n_max_turns
+                server_n_preserved = 0 if client_managed else self.n_preserved_turns
+
                 resp = await http_client.post(
                     f"{server_url}/compact_session/create",
                     json={
@@ -628,10 +787,10 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
                         "compact_window": self.compact_window,
                         "temperature": temperature,
                         "top_p": top_p,
-                        "compaction_mode": self.compaction_mode,
+                        "compaction_mode": server_compaction_mode,
                         "use_suffix_queries": self.use_suffix_queries,
-                        "n_max_turns": self.n_max_turns,
-                        "n_preserved_turns": self.n_preserved_turns,
+                        "n_max_turns": server_n_max_turns,
+                        "n_preserved_turns": server_n_preserved,
                     },
                 )
                 state["_tc_session_id"] = session_id
@@ -768,6 +927,9 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         state["_tc_last_token"] = completion_ids[-1] if completion_ids else 0
         state["_tc_turn"] = turn + 1
 
+        if self.compaction_mode in ("summary", "markovian_pure"):
+            state["_tc_summary_turn_count"] = state.get("_tc_summary_turn_count", 0) + 1
+
         if self.max_turns > 0 and turn + 1 >= self.max_turns:
             await self._delete_session(state)
 
@@ -785,6 +947,7 @@ def load_turn_compaction_environment(
     top_p: float = 0.95,
     compaction_mode: str = "attention_matching",
     use_suffix_queries: bool = True,
+    summary_max_tokens: int = 512,
     **inner_env_kwargs,
 ) -> TurnCompactionEnv:
     """Load a TurnCompactionEnv wrapping the specified gym environment.
@@ -805,4 +968,5 @@ def load_turn_compaction_environment(
         top_p=top_p,
         compaction_mode=compaction_mode,
         use_suffix_queries=use_suffix_queries,
+        summary_max_tokens=summary_max_tokens,
     )

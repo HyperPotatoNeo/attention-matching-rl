@@ -19,7 +19,7 @@ the full technical walkthrough.
 | `src/balrog_bench.py` | Vendored BALROG verifiers env (not on PyPI — PyPI `balrog-bench` is wrong package) |
 | `scripts/eval_rg_mix.py` | rg-mix-env evaluation (compaction, baseline, and RSA modes) |
 | `scripts/eval_aime_rsa.py` | AIME benchmark for RSA vs baseline comparison |
-| `scripts/eval_balrog_babyai.py` | BabyAI (MiniGrid) multi-turn eval (compaction, baseline, markovian) |
+| `scripts/eval_balrog_babyai.py` | BabyAI (MiniGrid) multi-turn eval (compaction, baseline, markovian, summary, markovian_pure) |
 | `configs/compaction/qwen3_4b_balrog_babyai.toml` | BabyAI baseline training config |
 | `configs/compaction/qwen3_4b_turn_compaction_babyai.toml` | BabyAI turn-based compaction training config |
 | `scripts/start_4servers.sh` | Launch 4 TP=1 servers for DP=4 |
@@ -27,6 +27,8 @@ the full technical walkthrough.
 | `configs/compaction/qwen3_4b_beta_test.toml` | Beta attention test config |
 | `configs/compaction/qwen3_4b_markovian_test.toml` | Markovian mode — Qwen3-4B, 50 steps |
 | `configs/compaction/qwen3_06b_markovian_test.toml` | Markovian mode — Qwen3-0.6B, fast E2E test |
+| `configs/compaction/qwen3_4b_turn_compaction_babyai_summary_debug.toml` | BabyAI summary compaction training config |
+| `configs/compaction/qwen3_4b_turn_compaction_babyai_markovian_pure_debug.toml` | BabyAI markovian pure training config |
 | `configs/compaction/qwen3_4b_serve_tp1.toml` | TP=1 server config (compaction) |
 | `configs/compaction/qwen3_06b_serve_tp1.toml` | TP=1 server config (0.6B) |
 
@@ -48,6 +50,21 @@ captures handle pre-compaction (FlashAttention) and post-compaction (SDPA+beta) 
 of compressed. The cache becomes `[prompt | suffix]` with no C1/C2. Supported in both
 inference (`worker.py`) and trainer (`segmented_forward`). Config field `compaction_mode`
 is auto-synced from env args to trainer config.
+
+**Summary compaction**: When `compaction_mode="summary"`, old turns are replaced with a
+model-generated text summary instead of KV-level compression. Operates client-side: when
+the sliding window reaches `n_max_turns`, the eval script (or TurnCompactionEnv) generates
+a summary of `[prev_summary + current_window_turns]` via `/v1/chat/completions`, deletes
+the session, and re-creates with `[system_prompt + summary | preserved_turns | current_obs]`.
+Summary is capped at `summary_max_tokens` (default 512). No server-side KV compaction occurs.
+Flow: `[summary][turn1]...[turn_l]` → on window boundary → `[new_summary]`.
+
+**Markovian pure**: When `compaction_mode="markovian_pure"`, old turns are simply dropped
+without any KV manipulation or summary generation. Operates client-side like summary mode:
+when the sliding window reaches `n_max_turns`, the session is deleted and re-created with
+only `[system_prompt | preserved_turns | current_obs]`. No server-side compaction occurs.
+Training uses standard single-segment forward (no `segmented_forward` needed).
+Flow: `[system][turn1]...[turn_l]` → on window boundary → `[system][preserved_turns]`.
 
 **Turn-based compaction (TurnCompactionEnv)**: Uses `/compact_session/create` + `/compact_session/step`
 to maintain KV state across turns. Compaction fires between turns (server-side, controlled by
@@ -140,6 +157,14 @@ python scripts/eval_balrog_babyai.py --mode compaction --n 10 \
     --max-kv-len 2048 --compact-ratio 0.25
 python scripts/eval_balrog_babyai.py --mode markovian --n 10 \
     --max-kv-len 2048
+
+# Summary compaction (text-level: summarize old turns on window boundary)
+python scripts/eval_balrog_babyai.py --mode summary --n 10 \
+    --n-max-turns 4 --n-preserved-turns 2 --summary-max-tokens 512 --no-thinking
+
+# Markovian pure (drop old turns, fresh session with preserved turns only)
+python scripts/eval_balrog_babyai.py --mode markovian_pure --n 10 \
+    --n-max-turns 4 --n-preserved-turns 2
 ```
 
 @import /home/mila/e/emiliano.penaloza/orchestrator/CLAUDE.md
