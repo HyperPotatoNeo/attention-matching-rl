@@ -33,6 +33,31 @@ def _get_dp_engines(engine):
 _dp_counter = 0
 _session_dp_map: dict[str, int] = {}
 
+# Backpressure signaling: waiters block when blocks are exhausted;
+# compact_session_delete notifies them that blocks may be available.
+_blocks_freed: dict[int, asyncio.Condition] = {}  # per DP rank
+_blocks_freed_global: asyncio.Condition | None = None  # DP=1
+
+_BLOCK_WAIT_MAX_RETRIES = 30
+_BLOCK_WAIT_TIMEOUT = 10.0  # seconds per wait
+
+
+def _get_blocks_freed_condition(dp_rank: int | None) -> asyncio.Condition:
+    global _blocks_freed_global
+    if dp_rank is None:
+        if _blocks_freed_global is None:
+            _blocks_freed_global = asyncio.Condition()
+        return _blocks_freed_global
+    if dp_rank not in _blocks_freed:
+        _blocks_freed[dp_rank] = asyncio.Condition()
+    return _blocks_freed[dp_rank]
+
+
+async def _notify_blocks_freed(dp_rank: int | None):
+    cond = _get_blocks_freed_condition(dp_rank)
+    async with cond:
+        cond.notify_all()
+
 
 async def _session_rpc(engine, method: str, session_id: str, args: tuple = (), kwargs: dict | None = None):
     """Route a session RPC to a specific DP engine based on session_id.
@@ -46,9 +71,12 @@ async def _session_rpc(engine, method: str, session_id: str, args: tuple = (), k
     client, dp_engines = _get_dp_engines(engine)
     if dp_engines is not None:
         if method == "compact_session_create":
-            dp_rank = _dp_counter % len(dp_engines)
-            _dp_counter += 1
-            _session_dp_map[session_id] = dp_rank
+            if session_id in _session_dp_map:
+                dp_rank = _session_dp_map[session_id]
+            else:
+                dp_rank = _dp_counter % len(dp_engines)
+                _dp_counter += 1
+                _session_dp_map[session_id] = dp_rank
         elif session_id in _session_dp_map:
             dp_rank = _session_dp_map[session_id]
             if method == "compact_session_delete":
@@ -296,6 +324,8 @@ class SessionStepRequest(BaseModel):
 
 @router.post("/compact_session/create")
 async def compact_session_create(body: SessionCreateRequest, request: Request):
+    from fastapi.responses import JSONResponse
+
     engine = request.app.state.engine_client
     tokenizer = engine.get_tokenizer()
     eos_token_id = tokenizer.eos_token_id
@@ -305,41 +335,65 @@ async def compact_session_create(body: SessionCreateRequest, request: Request):
         body.session_id, len(body.prompt_ids), body.max_kv_len,
     )
 
-    result = await _session_rpc(
-        engine, "compact_session_create", body.session_id,
-        args=(
-            body.session_id,
-            body.prompt_ids,
-            body.max_kv_len,
-            body.max_response_tokens,
-            eos_token_id,
-        ),
-        kwargs={
-            "compact_target_ratio": body.compact_target_ratio,
-            "compact_window": body.compact_window,
-            "temperature": body.temperature,
-            "top_p": body.top_p,
-            "compaction_mode": body.compaction_mode,
-            "use_suffix_queries": body.use_suffix_queries,
-            "n_max_turns": body.n_max_turns,
-            "n_preserved_turns": body.n_preserved_turns,
-        },
-    )
+    dp_rank_for_wait = _session_dp_map.get(body.session_id)
 
-    data = result[0]
-    final_text = tokenizer.decode(data["all_token_ids"], skip_special_tokens=True)
-    return {
-        "session_id": data["session_id"],
-        "all_token_ids": data["all_token_ids"],
-        "all_logprobs": data.get("all_logprobs", []),
-        "final_text": final_text,
-        "current_seq_len": data["current_seq_len"],
-        "diagnostics": data.get("diagnostics", {}),
-    }
+    for attempt in range(_BLOCK_WAIT_MAX_RETRIES + 1):
+        result = await _session_rpc(
+            engine, "compact_session_create", body.session_id,
+            args=(
+                body.session_id,
+                body.prompt_ids,
+                body.max_kv_len,
+                body.max_response_tokens,
+                eos_token_id,
+            ),
+            kwargs={
+                "compact_target_ratio": body.compact_target_ratio,
+                "compact_window": body.compact_window,
+                "temperature": body.temperature,
+                "top_p": body.top_p,
+                "compaction_mode": body.compaction_mode,
+                "use_suffix_queries": body.use_suffix_queries,
+                "n_max_turns": body.n_max_turns,
+                "n_preserved_turns": body.n_preserved_turns,
+            },
+        )
+
+        data = result[0]
+        if isinstance(data, dict) and data.get("error") == "blocks_exhausted":
+            if attempt >= _BLOCK_WAIT_MAX_RETRIES:
+                _session_dp_map.pop(body.session_id, None)
+                return JSONResponse(status_code=503, content=data)
+            if dp_rank_for_wait is None:
+                dp_rank_for_wait = _session_dp_map.get(body.session_id)
+            logger.debug(
+                "Session %s waiting for blocks (attempt %d/%d, need=%d, free=%d)",
+                body.session_id, attempt + 1, _BLOCK_WAIT_MAX_RETRIES,
+                data["blocks_needed"], data["blocks_free"],
+            )
+            cond = _get_blocks_freed_condition(dp_rank_for_wait)
+            async with cond:
+                try:
+                    await asyncio.wait_for(cond.wait(), timeout=_BLOCK_WAIT_TIMEOUT)
+                except asyncio.TimeoutError:
+                    pass
+            continue
+
+        final_text = tokenizer.decode(data["all_token_ids"], skip_special_tokens=True)
+        return {
+            "session_id": data["session_id"],
+            "all_token_ids": data["all_token_ids"],
+            "all_logprobs": data.get("all_logprobs", []),
+            "final_text": final_text,
+            "current_seq_len": data["current_seq_len"],
+            "diagnostics": data.get("diagnostics", {}),
+        }
 
 
 @router.post("/compact_session/step")
 async def compact_session_step(body: SessionStepRequest, request: Request):
+    from fastapi.responses import JSONResponse
+
     engine = request.app.state.engine_client
     tokenizer = engine.get_tokenizer()
 
@@ -348,34 +402,56 @@ async def compact_session_step(body: SessionStepRequest, request: Request):
         body.session_id, len(body.new_token_ids),
     )
 
-    result = await _session_rpc(
-        engine, "compact_session_step", body.session_id,
-        args=(
-            body.session_id,
-            body.new_token_ids,
-            body.max_response_tokens,
-        ),
-    )
+    dp_rank_for_wait = _session_dp_map.get(body.session_id)
 
-    data = result[0]
-    final_text = tokenizer.decode(data["all_token_ids"], skip_special_tokens=True)
-    return {
-        "all_token_ids": data["all_token_ids"],
-        "all_logprobs": data.get("all_logprobs", []),
-        "final_text": final_text,
-        "current_seq_len": data["current_seq_len"],
-        "diagnostics": data.get("diagnostics", {}),
-    }
+    for attempt in range(_BLOCK_WAIT_MAX_RETRIES + 1):
+        result = await _session_rpc(
+            engine, "compact_session_step", body.session_id,
+            args=(
+                body.session_id,
+                body.new_token_ids,
+                body.max_response_tokens,
+            ),
+        )
+
+        data = result[0]
+        if isinstance(data, dict) and data.get("error") == "blocks_exhausted":
+            if attempt >= _BLOCK_WAIT_MAX_RETRIES:
+                return JSONResponse(status_code=503, content=data)
+            logger.debug(
+                "Session step %s waiting for blocks (attempt %d/%d)",
+                body.session_id, attempt + 1, _BLOCK_WAIT_MAX_RETRIES,
+            )
+            cond = _get_blocks_freed_condition(dp_rank_for_wait)
+            async with cond:
+                try:
+                    await asyncio.wait_for(cond.wait(), timeout=_BLOCK_WAIT_TIMEOUT)
+                except asyncio.TimeoutError:
+                    pass
+            continue
+
+        final_text = tokenizer.decode(data["all_token_ids"], skip_special_tokens=True)
+        return {
+            "all_token_ids": data["all_token_ids"],
+            "all_logprobs": data.get("all_logprobs", []),
+            "final_text": final_text,
+            "current_seq_len": data["current_seq_len"],
+            "diagnostics": data.get("diagnostics", {}),
+        }
 
 
 @router.delete("/compact_session/{session_id}")
 async def compact_session_delete(session_id: str, request: Request):
     engine = request.app.state.engine_client
 
+    dp_rank = _session_dp_map.get(session_id)
+
     await _session_rpc(
         engine, "compact_session_delete", session_id,
         args=(session_id,),
     )
+
+    await _notify_blocks_freed(dp_rank)
 
     return {"deleted": session_id}
 

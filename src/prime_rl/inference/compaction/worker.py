@@ -1881,22 +1881,21 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         num_kv_heads = kv_shape[3]
         head_size = kv_shape[4]
 
-        # Allocate a fixed block budget covering max_kv_len + max_response_tokens.
-        # attention_matching_full stacks compacted blocks so the KV grows over time;
-        # allocate 2x to avoid OOB during generation before compaction fires.
-        if compaction_mode == "attention_matching_full":
-            max_possible_len = max_kv_len * 2 + max_response_tokens
-        else:
-            max_possible_len = max_kv_len + max_response_tokens
-        blocks_needed = math.ceil(max_possible_len / block_size)
+        # Lazy allocation: only allocate blocks for the first turn (prompt +
+        # response). Additional blocks are acquired at each compact_session_step.
+        initial_len = len(prompt_ids) + max_response_tokens
+        blocks_needed = math.ceil(initial_len / block_size)
         free_blocks = self._find_free_blocks(num_total_blocks)
         if len(free_blocks) < blocks_needed:
             self._expire_stale_sessions()
             free_blocks = self._find_free_blocks(num_total_blocks)
-        assert len(free_blocks) >= blocks_needed, (
-            f"Session create needs {blocks_needed} blocks, only {len(free_blocks)} free "
-            f"({len(getattr(self, '_sessions', {}))} active sessions)"
-        )
+        if len(free_blocks) < blocks_needed:
+            return {
+                "error": "blocks_exhausted",
+                "blocks_needed": blocks_needed,
+                "blocks_free": len(free_blocks),
+                "active_sessions": len(getattr(self, "_sessions", {})),
+            }
         my_blocks = free_blocks[:blocks_needed]
 
         attn_layer_names = self._get_attn_layer_names(model)
@@ -1932,7 +1931,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             vllm_config=vllm_config,
             device=device,
         )
-        decode_ctx.metadata.max_seq_len = max_possible_len
+        decode_ctx.metadata.max_seq_len = initial_len
 
         compaction_events = []
 
@@ -1991,6 +1990,8 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 last_token_gpu = token.view(1)
                 current_seq_len += 1
                 seg_count += 1
+
+        self._shrink_blocks(my_blocks, current_seq_len, block_size)
 
         self._sessions[session_id] = SessionState(
             block_ids=my_blocks,
@@ -2054,10 +2055,17 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
 
         attn_layer_names = self._get_attn_layer_names(model)
         rng = torch.Generator(device=device)
+        num_total_blocks = kv_shape[1]
 
         # existing_seq_len is the position where boundary token's KV will be written
         existing_seq_len = state.current_seq_len - 1
         new_ids_t = torch.tensor(new_token_ids, dtype=torch.long, device=device)
+
+        # Grow blocks to cover append + response generation for this turn
+        append_target = existing_seq_len + len(new_token_ids) + 1 + max_response_tokens
+        err = self._grow_blocks(state, append_target, block_size, num_total_blocks)
+        if err:
+            return err
 
         logits = _prefill_append(
             model, new_ids_t,
@@ -2087,8 +2095,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             vllm_config=vllm_config,
             device=device,
         )
-        max_possible_len = state.max_kv_len + max_response_tokens
-        decode_ctx.metadata.max_seq_len = max_possible_len
+        decode_ctx.metadata.max_seq_len = append_target
 
         compaction_events = []
 
@@ -2276,12 +2283,13 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
 
         state.current_seq_len = current_seq_len
         state.position_offset = position_offset
+        self._shrink_blocks(state.block_ids, current_seq_len, block_size)
 
         logger.info(
             "compact_session_step: session=%s, new_tokens=%d, response_tokens=%d, "
-            "current_seq_len=%d, compactions=%d",
+            "current_seq_len=%d, blocks=%d, compactions=%d",
             session_id, len(new_token_ids), len(all_token_ids),
-            current_seq_len, len(compaction_events),
+            current_seq_len, len(state.block_ids), len(compaction_events),
         )
 
         return {
@@ -2322,6 +2330,39 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         for state in getattr(self, "_sessions", {}).values():
             used.update(state.block_ids)
         return sorted(b for b in range(num_total_blocks) if b not in used)
+
+    def _grow_blocks(
+        self,
+        state: SessionState,
+        target_seq_len: int,
+        block_size: int,
+        num_total_blocks: int,
+    ) -> dict | None:
+        """Ensure state.block_ids covers target_seq_len. Returns error dict on failure."""
+        blocks_needed = math.ceil(target_seq_len / block_size)
+        if blocks_needed <= len(state.block_ids):
+            return None
+        deficit = blocks_needed - len(state.block_ids)
+        free = self._find_free_blocks(num_total_blocks)
+        if len(free) < deficit:
+            self._expire_stale_sessions()
+            free = self._find_free_blocks(num_total_blocks)
+        if len(free) < deficit:
+            return {
+                "error": "blocks_exhausted",
+                "blocks_needed": deficit,
+                "blocks_free": len(free),
+                "active_sessions": len(getattr(self, "_sessions", {})),
+            }
+        state.block_ids.extend(free[:deficit])
+        return None
+
+    @staticmethod
+    def _shrink_blocks(block_ids: list[int], seq_len: int, block_size: int) -> None:
+        """Truncate block_ids in place to release blocks beyond seq_len."""
+        needed = math.ceil(seq_len / block_size) if seq_len > 0 else 1
+        if len(block_ids) > needed:
+            del block_ids[needed:]
 
     @staticmethod
     def _get_attn_layer_names(model: Module) -> list[str]:
