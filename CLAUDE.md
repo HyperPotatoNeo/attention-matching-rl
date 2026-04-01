@@ -20,6 +20,7 @@ the full technical walkthrough.
 | `scripts/eval_rg_mix.py` | rg-mix-env evaluation (compaction, baseline, and RSA modes) |
 | `scripts/eval_aime_rsa.py` | AIME benchmark for RSA vs baseline comparison |
 | `scripts/eval_balrog_babyai.py` | BabyAI (MiniGrid) multi-turn eval (compaction, baseline, markovian, summary, markovian_pure) |
+| `scripts/eval_balrog_textworld.py` | TextWorld (BALROG) multi-turn eval (compaction, baseline, markovian, summary, markovian_pure) |
 | `configs/compaction/qwen3_4b_balrog_babyai.toml` | BabyAI baseline training config |
 | `configs/compaction/qwen3_4b_turn_compaction_babyai.toml` | BabyAI turn-based compaction training config |
 | `scripts/start_4servers.sh` | Launch 4 TP=1 servers for DP=4 |
@@ -117,11 +118,12 @@ Endpoint: `/rsa_generate` in routes.py. No auto-batching (RSA uses full GPU inte
 ### BALROG / BabyAI dependency
 
 `balrog` (the BALROG benchmark, not the Paylogic ACL package on PyPI) conflicts with
-`verifiers` via `google-generativeai` → `prime-sandboxes`, so it cannot go in `pyproject.toml`.
-Install manually after `uv sync`:
+`verifiers` via `google-genai` → `prime-sandboxes`, so it cannot go in `pyproject.toml`.
+`textworld` is tracked in the `balrog` dependency group; `balrog` itself needs `--no-deps`.
 
 ```bash
-uv pip install git+https://github.com/DavidePaglieri/BALROG.git@a5fa0e7 --no-deps
+./scripts/install_balrog.sh              # install deps
+./scripts/install_balrog.sh --with-data  # install deps + TextWorld game files
 ```
 
 `balrog-bench` is vendored at `src/balrog_bench.py` — no extra install needed.
@@ -165,6 +167,15 @@ python scripts/eval_balrog_babyai.py --mode summary --n 10 \
 # Markovian pure (drop old turns, fresh session with preserved turns only)
 python scripts/eval_balrog_babyai.py --mode markovian_pure --n 10 \
     --n-max-turns 4 --n-preserved-turns 2
+
+# TextWorld text adventures (via BALROG — requires textworld package + game files)
+python scripts/eval_balrog_textworld.py --mode baseline --n 10
+python scripts/eval_balrog_textworld.py --mode compaction --n 10 \
+    --max-kv-len 4096 --compact-ratio 0.25
+python scripts/eval_balrog_textworld.py --mode summary --n 10 \
+    --n-max-turns 6 --n-preserved-turns 3 --summary-max-tokens 300
+python scripts/eval_balrog_textworld.py --mode markovian_pure --n 10 \
+    --n-max-turns 6 --n-preserved-turns 3
 ```
 
 @import /home/mila/e/emiliano.penaloza/orchestrator/CLAUDE.md

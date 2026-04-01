@@ -54,6 +54,7 @@ class SessionState:
     n_max_turns: int       # -1 = disabled (use KV-budget mode)
     n_preserved_turns: int  # turns to keep verbatim after compaction fires
     compaction_count: int = 0
+    compacted_prefix_end: int = 0  # stacking cursor for attention_matching_full
     last_access: float = 0.0
 
 
@@ -945,7 +946,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                             num_base_blocks, num_layers)
 
         populations = []
-        pop0, pop0_logprobs = _batch_generate(
+        pop0, pop0_logprobs, _ = _batch_generate(
             model, kv_caches, candidate_blocks, N,
             base_seq_len, base_offset, max_tokens_per_candidate,
             block_size, num_layers, attn_layer_names, vllm_config,
@@ -1117,7 +1118,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 _fork_kv_blocks(kv_caches, base_blocks, candidate_blocks[n],
                                 num_base_blocks_now, num_layers)
 
-            pop, pop_lps = _batch_generate(
+            pop, pop_lps, _ = _batch_generate(
                 model, kv_caches, candidate_blocks, N,
                 base_seq_len, base_offset, max_tokens_per_candidate,
                 block_size, num_layers, attn_layer_names, vllm_config,
@@ -1155,6 +1156,685 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 "population_sizes": [len(p) for p in populations],
                 "candidate_lengths": [[len(c) for c in p] for p in populations],
                 "compaction_events": compaction_events,
+                "total_time": round(total_time, 3),
+            },
+        }
+
+    def parallel_generate(
+        self,
+        coordinator_prompt_ids: list[int],
+        document_ids_list: list[list[int]],
+        compact_target_ratio: float,
+        probe_tokens: int,
+        max_gen_tokens: int,
+        temperature: float,
+        top_p: float,
+        eos_token_id: int,
+        compute_beta: bool = True,
+        summary_prompt: str | None = None,
+    ) -> dict:
+        """Parallel reasoning: sequentially append each document to coordinator,
+        compact in-place using the same pattern as RSA (position_offset, no
+        RoPE re-rotation), then decode the coordinator.
+        """
+        t_start = time.time()
+        K = len(document_ids_list)
+        model = self._get_model()
+        device = self._get_device()
+        vllm_config = self.model_runner.vllm_config
+
+        kv_caches = self.model_runner.kv_caches
+        num_layers = len(kv_caches)
+        kv_shape = kv_caches[0].shape
+        num_total_blocks = kv_shape[1]
+        block_size = kv_shape[2]
+        num_kv_heads = kv_shape[3]
+        head_size = kv_shape[4]
+
+        attn_layer_names = self._get_attn_layer_names(model)
+        rng = torch.Generator(device=device)
+
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            vllm_config.model_config.model, trust_remote_code=True)
+
+        prompt_len = len(coordinator_prompt_ids)
+        document_ids_list = [d for d in document_ids_list if len(d) > 0]
+        K = len(document_ids_list)
+        assert K > 0, "All documents are empty, nothing to compress"
+        doc_lens = [len(d) for d in document_ids_list]
+        max_doc_len = max(doc_lens)
+
+        summary_ids = None
+        summary_len = 0
+        if summary_prompt is not None:
+            summary_ids = tokenizer.encode(summary_prompt, add_special_tokens=False)
+            summary_len = len(summary_ids)
+
+        # --- Block budget ---
+        max_compacted_per_doc = int(max_doc_len * compact_target_ratio) + 1
+        # Coordinator temporarily holds the full document before compaction.
+        # Worst case: prompt + (K-1)*compacted + full_doc + summary
+        max_temp_len = (prompt_len + (K - 1) * max_compacted_per_doc
+                        + max_doc_len + summary_len + 16)
+        final_decode_len = (prompt_len + K * max_compacted_per_doc
+                            + max_gen_tokens + 16)
+        coordinator_max_len = max(max_temp_len, final_decode_len)
+        coordinator_blocks_needed = (coordinator_max_len + block_size - 1) // block_size
+
+        # Probe blocks: fork of coordinator for generating probe tokens
+        probe_max_len = max_temp_len + probe_tokens + 16
+        probe_blocks_needed = (probe_max_len + block_size - 1) // block_size
+
+        total_blocks_needed = coordinator_blocks_needed + probe_blocks_needed
+        free_blocks = self._find_free_blocks(num_total_blocks)
+        logger.info(
+            "parallel_generate: K=%d, prompt=%d, max_doc=%d, ratio=%.2f, "
+            "probe=%d, coord_blocks=%d, probe_blocks=%d, free=%d",
+            K, prompt_len, max_doc_len, compact_target_ratio,
+            probe_tokens, coordinator_blocks_needed, probe_blocks_needed,
+            len(free_blocks),
+        )
+        assert len(free_blocks) >= total_blocks_needed, (
+            f"parallel_generate needs {total_blocks_needed} blocks, "
+            f"only {len(free_blocks)} free"
+        )
+
+        coordinator_block_ids = free_blocks[:coordinator_blocks_needed]
+        probe_block_ids = free_blocks[
+            coordinator_blocks_needed:coordinator_blocks_needed + probe_blocks_needed
+        ]
+
+        # --- Phase 1: Prefill coordinator prompt ---
+        input_ids_t = torch.tensor(
+            coordinator_prompt_ids, dtype=torch.long, device=device)
+        positions_t = torch.arange(prompt_len, dtype=torch.long, device=device)
+
+        _run_prefill(
+            model, input_ids_t, positions_t,
+            seq_len=prompt_len,
+            block_ids=coordinator_block_ids,
+            block_size=block_size,
+            attn_layer_names=attn_layer_names,
+            vllm_config=vllm_config,
+            device=device,
+        )
+
+        # --- Phase 2: Sequentially append + compact each document ---
+        # Follows the RSA pattern: append text via _prefill_append, fork for
+        # probing, compact, inject back with _inject_compacted_range, track
+        # position_offset.  No RoPE re-rotation needed.
+        coord_seq_len = prompt_len
+        position_offset = 0
+        compacted_lens = []
+
+        for k in range(K):
+            t_doc = time.time()
+            doc_ids = document_ids_list[k]
+            doc_len = len(doc_ids)
+            doc_start = coord_seq_len
+
+            # 2a: Append-prefill document onto coordinator blocks
+            doc_ids_t = torch.tensor(doc_ids, dtype=torch.long, device=device)
+            doc_logits = _prefill_append(
+                model, doc_ids_t,
+                existing_seq_len=coord_seq_len,
+                position_offset=position_offset,
+                block_ids=coordinator_block_ids,
+                block_size=block_size,
+                attn_layer_names=attn_layer_names,
+                vllm_config=vllm_config,
+                device=device,
+            )
+            coord_seq_len += doc_len
+
+            # 2b: Fork coordinator → probe blocks
+            num_coord_blocks_now = (coord_seq_len + block_size - 1) // block_size
+            _fork_kv_blocks(kv_caches, coordinator_block_ids, probe_block_ids,
+                            num_coord_blocks_now, num_layers)
+            probe_seq_len = coord_seq_len
+
+            # 2c: Optionally append summary prompt onto PROBE blocks only
+            if summary_ids is not None:
+                summary_ids_t = torch.tensor(
+                    summary_ids, dtype=torch.long, device=device)
+                doc_logits = _prefill_append(
+                    model, summary_ids_t,
+                    existing_seq_len=probe_seq_len,
+                    position_offset=position_offset,
+                    block_ids=probe_block_ids,
+                    block_size=block_size,
+                    attn_layer_names=attn_layer_names,
+                    vllm_config=vllm_config,
+                    device=device,
+                )
+                probe_seq_len += summary_len
+
+            # 2d: Generate probe tokens on probe blocks
+            probe_decode_ctx = _DecodeContext.create(
+                block_ids=probe_block_ids,
+                block_size=block_size,
+                attn_layer_names=attn_layer_names,
+                vllm_config=vllm_config,
+                device=device,
+            )
+
+            probe_last_token, _ = _sample_token(
+                doc_logits[-1:], temperature, top_p, rng, seed=k * 1000)
+            probe_last_token = probe_last_token.view(1)
+            probe_seq_len += 1
+
+            probe_decode_ctx.metadata.max_seq_len = probe_seq_len + probe_tokens
+
+            with set_forward_context(
+                probe_decode_ctx.attn_metadata_dict,
+                probe_decode_ctx.vllm_config,
+                virtual_engine=0, num_tokens=1,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                slot_mapping=probe_decode_ctx.slot_mapping_ctx,
+            ):
+                for p in range(probe_tokens - 1):
+                    position = probe_seq_len - 1 + position_offset
+                    _update_decode_state(
+                        probe_last_token, position, probe_seq_len,
+                        probe_decode_ctx)
+                    decode_logits = _run_decode_step(model, probe_decode_ctx)
+                    probe_last_token, _ = _sample_token(
+                        decode_logits, temperature, top_p, rng,
+                        seed=k * 1000 + probe_seq_len,
+                    )
+                    probe_last_token = probe_last_token.view(1)
+                    probe_seq_len += 1
+
+            # 2e: Extract KV from probe blocks, compact document region
+            probe_kv_len = probe_seq_len - 1
+            keys, values = _extract_kv(
+                kv_caches, probe_block_ids, probe_kv_len,
+                block_size, num_layers)
+
+            suffix_start = coord_seq_len + (summary_len if summary_ids else 0)
+            suffix_queries = [
+                k_layer[suffix_start:probe_kv_len].permute(1, 0, 2)
+                for k_layer in keys
+            ]
+
+            doc_end = doc_start + doc_len
+            t_algo = time.time()
+            c1_list, c2_list, _, indices_list = compact_kv_range(
+                keys, values,
+                compact_start=doc_start,
+                compact_end=doc_end,
+                target_ratio=compact_target_ratio,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                device=device,
+                compute_beta=False,
+                suffix_queries=suffix_queries,
+            )
+            algo_time = time.time() - t_algo
+            compacted_len = c1_list[0].shape[0]
+            compacted_lens.append(compacted_len)
+
+            # 2f: Inject compacted KV back into coordinator blocks
+            coord_keys, coord_values = _extract_kv(
+                kv_caches, coordinator_block_ids, coord_seq_len,
+                block_size, num_layers)
+
+            new_coord_seq = _inject_compacted_range(
+                kv_caches, coord_keys, coord_values, c1_list, c2_list,
+                coordinator_block_ids, block_size,
+                compact_start=doc_start,
+                compact_end=doc_end,
+                num_layers=num_layers,
+                old_seq_len=coord_seq_len,
+            )
+
+            tokens_removed = coord_seq_len - new_coord_seq
+            position_offset += tokens_removed
+            coord_seq_len = new_coord_seq
+
+            logger.info(
+                "Doc %d/%d: doc=%d tok, compacted=%d tok, "
+                "coord_seq=%d, offset=%d, algo=%.3fs, total=%.2fs",
+                k + 1, K, doc_len, compacted_len,
+                coord_seq_len, position_offset,
+                algo_time, time.time() - t_doc,
+            )
+            torch.cuda.empty_cache()
+
+        # --- Phase 3: Coordinator decode ---
+        # Uses the same boundary-recompute pattern as compact_generate/RSA:
+        # +1 reserves a slot for the boundary token whose KV gets recomputed
+        # by the first decode step, attending to the full compacted context.
+        coordinator_seq_len = coord_seq_len
+        current_seq_len = coord_seq_len + 1
+
+        decode_ctx = _DecodeContext.create(
+            block_ids=coordinator_block_ids,
+            block_size=block_size,
+            attn_layer_names=attn_layer_names,
+            vllm_config=vllm_config,
+            device=device,
+        )
+        decode_ctx.metadata.max_seq_len = coordinator_max_len
+
+        # Boundary token: dummy token to trigger first decode and get logits
+        # (same pattern as _batch_generate with first_logits=None in RSA)
+        boundary_token = torch.zeros(1, dtype=torch.long, device=device)
+
+        _update_decode_state(
+            boundary_token,
+            position=coord_seq_len + position_offset,
+            seq_len=current_seq_len,
+            ctx=decode_ctx,
+        )
+
+        with set_forward_context(
+            decode_ctx.attn_metadata_dict, decode_ctx.vllm_config,
+            virtual_engine=0, num_tokens=1,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            slot_mapping=decode_ctx.slot_mapping_ctx,
+        ):
+            first_logits = _run_decode_step(model, decode_ctx)
+            first_token, first_lp = _sample_token(
+                first_logits, temperature, top_p, rng, seed=0)
+
+            all_token_ids = [first_token.item()]
+            all_logprobs = [first_lp.item()]
+            last_token_gpu = first_token.view(1)
+            current_seq_len += 1
+
+            for step in range(max_gen_tokens - 1):
+                if all_token_ids[-1] == eos_token_id:
+                    break
+
+                position = current_seq_len - 1 + position_offset
+                _update_decode_state(
+                    last_token_gpu, position, current_seq_len, decode_ctx)
+
+                decode_logits = _run_decode_step(model, decode_ctx)
+                token, logprob = _sample_token(
+                    decode_logits, temperature, top_p, rng, seed=step + 1)
+
+                all_token_ids.append(token.item())
+                all_logprobs.append(logprob.item())
+                last_token_gpu = token.view(1)
+                current_seq_len += 1
+
+        final_text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        total_time = time.time() - t_start
+        logger.info(
+            "parallel_generate DONE: K=%d, coord_seq=%d, offset=%d, "
+            "gen=%d tok, %.2fs total",
+            K, coordinator_seq_len, position_offset,
+            len(all_token_ids), total_time,
+        )
+
+        return {
+            "all_token_ids": all_token_ids,
+            "all_logprobs": all_logprobs,
+            "final_text": final_text,
+            "diagnostics": {
+                "prompt_len": prompt_len,
+                "K": K,
+                "doc_lens": doc_lens,
+                "compacted_lens": compacted_lens,
+                "coordinator_seq_len": coordinator_seq_len,
+                "position_offset": position_offset,
+                "total_tokens": len(all_token_ids),
+                "total_time": round(total_time, 3),
+            },
+        }
+
+    def parallel_generate_fused(
+        self,
+        prompt_ids: list[int],
+        K: int,
+        max_candidate_tokens: int,
+        compact_target_ratio: float,
+        max_gen_tokens: int,
+        temperature: float,
+        top_p: float,
+        eos_token_id: int,
+        compute_beta: bool = True,
+        probe_tokens: int = 256,
+        synthesis_prompt: str | None = None,
+        coordinator_prompt_ids: list[int] | None = None,
+    ) -> dict:
+        """Fused parallel reasoning: generate K candidates internally, then
+        re-encode each into the coordinator via _prefill_append + compact.
+
+        Candidates are generated from the shared prompt via _batch_generate.
+        The coordinator gets a separate prefill (optionally with a different
+        system prompt), and each candidate's TEXT is append-prefilled and
+        compacted in-place — following the RSA pattern (no RoPE re-rotation).
+        """
+        t_start = time.time()
+        model = self._get_model()
+        device = self._get_device()
+        vllm_config = self.model_runner.vllm_config
+
+        kv_caches = self.model_runner.kv_caches
+        num_layers = len(kv_caches)
+        kv_shape = kv_caches[0].shape
+        num_total_blocks = kv_shape[1]
+        block_size = kv_shape[2]
+        num_kv_heads = kv_shape[3]
+        head_size = kv_shape[4]
+
+        attn_layer_names = self._get_attn_layer_names(model)
+        rng = torch.Generator(device=device)
+
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            vllm_config.model_config.model, trust_remote_code=True)
+
+        prompt_len = len(prompt_ids)
+        coord_prompt_ids = coordinator_prompt_ids or prompt_ids
+        coord_prompt_len = len(coord_prompt_ids)
+
+        # --- Block budget ---
+        max_compacted_per_doc = int(max_candidate_tokens * compact_target_ratio) + 1
+        # Coordinator temporarily holds full candidate text before compaction
+        max_temp_len = (coord_prompt_len + (K - 1) * max_compacted_per_doc
+                        + max_candidate_tokens + 16)
+        final_decode_len = (coord_prompt_len + K * max_compacted_per_doc
+                            + max_gen_tokens + 16)
+        coordinator_max_len = max(max_temp_len, final_decode_len)
+        coordinator_blocks = (coordinator_max_len + block_size - 1) // block_size
+
+        candidate_max_len = prompt_len + max_candidate_tokens + 16
+        candidate_blocks_each = (candidate_max_len + block_size - 1) // block_size
+
+        # Probe blocks: fork of coordinator for probing
+        probe_max_len = max_temp_len + probe_tokens + 16
+        probe_blocks_needed = (probe_max_len + block_size - 1) // block_size
+
+        total_blocks_needed = (coordinator_blocks + K * candidate_blocks_each
+                               + probe_blocks_needed)
+        free_blocks = self._find_free_blocks(num_total_blocks)
+        logger.info(
+            "parallel_generate_fused: K=%d, prompt=%d, coord_prompt=%d, "
+            "max_cand_tok=%d, ratio=%.2f, coord_blocks=%d, cand_blocks=%d, "
+            "probe_blocks=%d, free=%d",
+            K, prompt_len, coord_prompt_len, max_candidate_tokens,
+            compact_target_ratio, coordinator_blocks, candidate_blocks_each,
+            probe_blocks_needed, len(free_blocks),
+        )
+        assert len(free_blocks) >= total_blocks_needed, (
+            f"parallel_generate_fused needs {total_blocks_needed} blocks, "
+            f"only {len(free_blocks)} free"
+        )
+
+        coordinator_block_ids = free_blocks[:coordinator_blocks]
+        candidate_block_ids = []
+        offset = coordinator_blocks
+        for _k in range(K):
+            candidate_block_ids.append(
+                free_blocks[offset:offset + candidate_blocks_each])
+            offset += candidate_blocks_each
+        probe_block_ids = free_blocks[offset:offset + probe_blocks_needed]
+
+        # --- Phase 1: Prefill shared prompt for candidate generation ---
+        input_ids_t = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+        positions_t = torch.arange(prompt_len, dtype=torch.long, device=device)
+
+        prefill_logits = _run_prefill(
+            model, input_ids_t, positions_t,
+            seq_len=prompt_len,
+            block_ids=coordinator_block_ids,
+            block_size=block_size,
+            attn_layer_names=attn_layer_names,
+            vllm_config=vllm_config,
+            device=device,
+        )
+
+        # --- Phase 2: Fork prefix → K candidates, batch-generate ---
+        num_prefix_blocks = (prompt_len + block_size - 1) // block_size
+        for k in range(K):
+            _fork_kv_blocks(kv_caches, coordinator_block_ids,
+                            candidate_block_ids[k],
+                            num_prefix_blocks, num_layers)
+
+        cand_texts, cand_logprobs, cand_token_ids = _batch_generate(
+            model, kv_caches, candidate_block_ids, K,
+            prompt_len, 0, max_candidate_tokens,
+            block_size, num_layers, attn_layer_names, vllm_config,
+            device, temperature, top_p, eos_token_id, rng,
+            first_logits=prefill_logits, tokenizer=tokenizer,
+        )
+        gen_lens = [len(ids) for ids in cand_token_ids]
+
+        logger.info(
+            "Phase 2 done: generated %d candidates, lengths %s",
+            K, gen_lens)
+        torch.cuda.empty_cache()
+
+        # --- Phase 3: Re-prefill coordinator with synthesis prompt ---
+        coord_ids_t = torch.tensor(
+            coord_prompt_ids, dtype=torch.long, device=device)
+        coord_positions_t = torch.arange(
+            coord_prompt_len, dtype=torch.long, device=device)
+        _run_prefill(
+            model, coord_ids_t, coord_positions_t,
+            seq_len=coord_prompt_len,
+            block_ids=coordinator_block_ids,
+            block_size=block_size,
+            attn_layer_names=attn_layer_names,
+            vllm_config=vllm_config,
+            device=device,
+        )
+
+        # --- Phase 4: Re-encode each candidate text into coordinator,
+        #     compact in-place (RSA pattern) ---
+        coord_seq_len = coord_prompt_len
+        position_offset = 0
+        compacted_lens = []
+
+        for k in range(K):
+            t_doc = time.time()
+            doc_ids = cand_token_ids[k]
+            doc_len = len(doc_ids)
+            doc_start = coord_seq_len
+
+            # Append-prefill candidate text onto coordinator
+            doc_ids_t = torch.tensor(doc_ids, dtype=torch.long, device=device)
+            doc_logits = _prefill_append(
+                model, doc_ids_t,
+                existing_seq_len=coord_seq_len,
+                position_offset=position_offset,
+                block_ids=coordinator_block_ids,
+                block_size=block_size,
+                attn_layer_names=attn_layer_names,
+                vllm_config=vllm_config,
+                device=device,
+            )
+            coord_seq_len += doc_len
+
+            # Fork coordinator → probe blocks for probing
+            num_coord_blocks_now = (
+                coord_seq_len + block_size - 1) // block_size
+            _fork_kv_blocks(kv_caches, coordinator_block_ids,
+                            probe_block_ids,
+                            num_coord_blocks_now, num_layers)
+
+            # Generate probe tokens on probe blocks
+            probe_decode_ctx = _DecodeContext.create(
+                block_ids=probe_block_ids,
+                block_size=block_size,
+                attn_layer_names=attn_layer_names,
+                vllm_config=vllm_config,
+                device=device,
+            )
+
+            probe_last_token, _ = _sample_token(
+                doc_logits[-1:], temperature, top_p, rng,
+                seed=k * 1000)
+            probe_last_token = probe_last_token.view(1)
+            probe_seq_len = coord_seq_len + 1
+
+            probe_decode_ctx.metadata.max_seq_len = (
+                probe_seq_len + probe_tokens)
+
+            with set_forward_context(
+                probe_decode_ctx.attn_metadata_dict,
+                probe_decode_ctx.vllm_config,
+                virtual_engine=0, num_tokens=1,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                slot_mapping=probe_decode_ctx.slot_mapping_ctx,
+            ):
+                for p in range(probe_tokens - 1):
+                    position = probe_seq_len - 1 + position_offset
+                    _update_decode_state(
+                        probe_last_token, position, probe_seq_len,
+                        probe_decode_ctx)
+                    decode_logits = _run_decode_step(
+                        model, probe_decode_ctx)
+                    probe_last_token, _ = _sample_token(
+                        decode_logits, temperature, top_p, rng,
+                        seed=k * 1000 + probe_seq_len,
+                    )
+                    probe_last_token = probe_last_token.view(1)
+                    probe_seq_len += 1
+
+            # Extract KV from probe blocks, compact candidate region
+            probe_kv_len = probe_seq_len - 1
+            keys, values = _extract_kv(
+                kv_caches, probe_block_ids, probe_kv_len,
+                block_size, num_layers)
+
+            suffix_queries = [
+                k_layer[coord_seq_len:probe_kv_len].permute(1, 0, 2)
+                for k_layer in keys
+            ]
+
+            doc_end = doc_start + doc_len
+            c1_list, c2_list, _, indices_list = compact_kv_range(
+                keys, values,
+                compact_start=doc_start,
+                compact_end=doc_end,
+                target_ratio=compact_target_ratio,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                device=device,
+                compute_beta=False,
+                suffix_queries=suffix_queries,
+            )
+            compacted_len = c1_list[0].shape[0]
+            compacted_lens.append(compacted_len)
+
+            # Inject compacted KV back into coordinator
+            coord_keys, coord_values = _extract_kv(
+                kv_caches, coordinator_block_ids, coord_seq_len,
+                block_size, num_layers)
+
+            new_coord_seq = _inject_compacted_range(
+                kv_caches, coord_keys, coord_values, c1_list, c2_list,
+                coordinator_block_ids, block_size,
+                compact_start=doc_start,
+                compact_end=doc_end,
+                num_layers=num_layers,
+                old_seq_len=coord_seq_len,
+            )
+
+            tokens_removed = coord_seq_len - new_coord_seq
+            position_offset += tokens_removed
+            coord_seq_len = new_coord_seq
+
+            logger.info(
+                "Candidate %d/%d: gen=%d tok, compacted=%d tok, "
+                "coord_seq=%d, offset=%d, %.2fs",
+                k + 1, K, doc_len, compacted_len,
+                coord_seq_len, position_offset, time.time() - t_doc,
+            )
+            torch.cuda.empty_cache()
+
+        # --- Phase 5: Coordinator decode ---
+        coordinator_seq_len = coord_seq_len
+        current_seq_len = coord_seq_len + 1
+
+        decode_ctx = _DecodeContext.create(
+            block_ids=coordinator_block_ids,
+            block_size=block_size,
+            attn_layer_names=attn_layer_names,
+            vllm_config=vllm_config,
+            device=device,
+        )
+        decode_ctx.metadata.max_seq_len = coordinator_max_len
+
+        boundary_token = torch.zeros(1, dtype=torch.long, device=device)
+        _update_decode_state(
+            boundary_token,
+            position=coord_seq_len + position_offset,
+            seq_len=current_seq_len,
+            ctx=decode_ctx,
+        )
+
+        with set_forward_context(
+            decode_ctx.attn_metadata_dict, decode_ctx.vllm_config,
+            virtual_engine=0, num_tokens=1,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            slot_mapping=decode_ctx.slot_mapping_ctx,
+        ):
+            first_logits = _run_decode_step(model, decode_ctx)
+            first_token, first_lp = _sample_token(
+                first_logits, temperature, top_p, rng, seed=0)
+
+            synth_token_ids = [first_token.item()]
+            synth_logprobs = [first_lp.item()]
+            last_token_gpu = first_token.view(1)
+            current_seq_len += 1
+
+            for step in range(max_gen_tokens - 1):
+                if synth_token_ids[-1] == eos_token_id:
+                    break
+
+                position = current_seq_len - 1 + position_offset
+                _update_decode_state(
+                    last_token_gpu, position, current_seq_len, decode_ctx)
+
+                decode_logits = _run_decode_step(model, decode_ctx)
+                token, logprob = _sample_token(
+                    decode_logits, temperature, top_p, rng, seed=step + 1)
+
+                synth_token_ids.append(token.item())
+                synth_logprobs.append(logprob.item())
+                last_token_gpu = token.view(1)
+                current_seq_len += 1
+
+        final_text = tokenizer.decode(synth_token_ids, skip_special_tokens=True)
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        total_time = time.time() - t_start
+        logger.info(
+            "parallel_generate_fused DONE: K=%d, coord_seq=%d, offset=%d, "
+            "gen=%d tok, %.2fs total",
+            K, coordinator_seq_len, position_offset,
+            len(synth_token_ids), total_time,
+        )
+
+        return {
+            "all_token_ids": synth_token_ids,
+            "all_logprobs": synth_logprobs,
+            "final_text": final_text,
+            "candidates": [
+                {"text": cand_texts[k], "gen_len": gen_lens[k]}
+                for k in range(K)
+            ],
+            "diagnostics": {
+                "prompt_len": prompt_len,
+                "K": K,
+                "gen_lens": gen_lens,
+                "compacted_lens": compacted_lens,
+                "coordinator_seq_len": coordinator_seq_len,
+                "position_offset": position_offset,
+                "total_tokens": len(synth_token_ids),
                 "total_time": round(total_time, 3),
             },
         }
@@ -1201,8 +1881,13 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         num_kv_heads = kv_shape[3]
         head_size = kv_shape[4]
 
-        # Allocate a fixed block budget covering max_kv_len + max_response_tokens
-        max_possible_len = max_kv_len + max_response_tokens
+        # Allocate a fixed block budget covering max_kv_len + max_response_tokens.
+        # attention_matching_full stacks compacted blocks so the KV grows over time;
+        # allocate 2x to avoid OOB during generation before compaction fires.
+        if compaction_mode == "attention_matching_full":
+            max_possible_len = max_kv_len * 2 + max_response_tokens
+        else:
+            max_possible_len = max_kv_len + max_response_tokens
         blocks_needed = math.ceil(max_possible_len / block_size)
         free_blocks = self._find_free_blocks(num_total_blocks)
         if len(free_blocks) < blocks_needed:
@@ -1324,6 +2009,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             turn_asst_lens=[len(all_token_ids)],
             n_max_turns=n_max_turns,
             n_preserved_turns=n_preserved_turns,
+            compacted_prefix_end=prompt_len,
             last_access=time.monotonic(),
         )
 
@@ -1525,9 +2211,16 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             )
             compact_end = kv_len - protected_total
 
-            if compact_end > state.prompt_len:
+            # attention_matching_full: only compact NEW turns (stack compacted blocks).
+            # Other modes: re-compact from prompt_len each time.
+            if state.compaction_mode == "attention_matching_full":
+                compact_start = state.compacted_prefix_end
+            else:
+                compact_start = state.prompt_len
+
+            if compact_end > compact_start:
                 keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
-                turn_compact_window = compact_end - state.prompt_len
+                turn_compact_window = compact_end - compact_start
 
                 indices_list = None
                 if state.compaction_mode == "markovian":
@@ -1546,7 +2239,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     compact_seed = state.prompt_len * 10000 + state.compaction_count
                     c1_list, c2_list, _, indices_list = compact_kv_range(
                         keys, values,
-                        compact_start=state.prompt_len,
+                        compact_start=compact_start,
                         compact_end=compact_end,
                         target_ratio=state.compact_target_ratio,
                         num_kv_heads=num_kv_heads,
@@ -1557,16 +2250,20 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     )
                     compacted_prefix_len = c1_list[0].shape[0]
                 state.compaction_count += 1
-                new_seq_len = state.prompt_len + compacted_prefix_len + (kv_len - compact_end)
+                new_seq_len = compact_start + compacted_prefix_len + (kv_len - compact_end)
 
                 _inject_compacted_kv(
                     kv_caches, keys, values, c1_list, c2_list,
-                    state.block_ids, block_size, state.prompt_len, num_layers,
+                    state.block_ids, block_size, compact_start, num_layers,
                     old_seq_len=kv_len,
                     compact_window=turn_compact_window,
                 )
                 position_offset += kv_len - new_seq_len
                 current_seq_len = new_seq_len + 1
+
+                if state.compaction_mode == "attention_matching_full":
+                    state.compacted_prefix_end = compact_start + compacted_prefix_len
+
                 compaction_events.append({
                     "kv_len_before": kv_len,
                     "kv_len_after": new_seq_len,
@@ -1982,6 +2679,78 @@ def _flush_seg(
 
 
 # ---------------------------------------------------------------------------
+# RoPE re-rotation
+# ---------------------------------------------------------------------------
+
+def _rerotate_rope_keys(
+    c1: torch.Tensor,
+    indices: torch.Tensor,
+    compact_start: int,
+    target_start: int,
+    rope_theta: float,
+    head_size: int,
+) -> torch.Tensor:
+    """Re-rotate compacted keys from original RoPE positions to coordinator positions.
+
+    When compacted keys are injected into a different sequence (e.g. coordinator
+    in parallel_generate), their baked-in RoPE encoding reflects the *source*
+    positions, not the *target* positions.  This applies a delta rotation
+    RoPE(target - original) to each (head, token) so that downstream attention
+    sees correct relative distances.
+
+    Args:
+        c1: (target_len, num_kv_heads, head_size) — compacted keys with original RoPE.
+        indices: (num_kv_heads, target_len) — region-relative indices returned by
+            compact_kv_range (i.e. relative to compact_start).
+        compact_start: Absolute sequence position where the compact region begins
+            in the source sequence.
+        target_start: Absolute sequence position where these keys will be placed
+            in the target (coordinator) sequence.
+        rope_theta: RoPE base frequency from model config.
+        head_size: Dimension per attention head (= rotary_dim for Qwen3).
+
+    Returns:
+        Re-rotated keys, same shape and dtype as c1.
+    """
+    device = c1.device
+    dtype = c1.dtype
+    target_len, num_kv_heads, _ = c1.shape
+
+    # Original absolute positions: (num_kv_heads, target_len)
+    original_pos = compact_start + indices.to(device=device)
+    # Target absolute positions: same for all heads
+    target_pos = target_start + torch.arange(target_len, device=device)
+    # Delta per (head, token)
+    delta = target_pos.unsqueeze(0) - original_pos  # (H, T)
+
+    # Standard RoPE inv_freq
+    inv_freq = 1.0 / (
+        rope_theta ** (
+            torch.arange(0, head_size, 2, device=device, dtype=torch.float32)
+            / head_size
+        )
+    )  # (D/2,)
+
+    # Angles: (H, T, D/2)
+    angles = delta.unsqueeze(-1).float() * inv_freq
+
+    cos_d = torch.cos(angles)
+    sin_d = torch.sin(angles)
+    # Duplicate for split-half layout: [cos, cos] matching [k_first_half, k_second_half]
+    cos_full = torch.cat([cos_d, cos_d], dim=-1)  # (H, T, D)
+    sin_full = torch.cat([sin_d, sin_d], dim=-1)
+
+    # Rotate: (T, H, D) -> (H, T, D)
+    k = c1.permute(1, 0, 2).float()
+    d = k.shape[-1]
+    k1, k2 = k[..., :d // 2], k[..., d // 2:]
+    k_rotated = torch.cat([-k2, k1], dim=-1)
+
+    k_new = k * cos_full + k_rotated * sin_full
+    return k_new.permute(1, 0, 2).to(dtype)
+
+
+# ---------------------------------------------------------------------------
 # KV cache manipulation
 # ---------------------------------------------------------------------------
 
@@ -2371,4 +3140,4 @@ def _batch_generate(
             vllm_config.model_config.model, trust_remote_code=True)
     texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in all_token_ids]
 
-    return texts, all_logprobs
+    return texts, all_logprobs, all_token_ids

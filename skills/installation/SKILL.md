@@ -41,20 +41,26 @@ uv sync --group dev
 
 Installs pytest, ruff, pre-commit, and other development tools.
 
-## BabyAI / BALROG setup
+## BabyAI / BALROG / TextWorld setup
 
-The BabyAI multi-turn eval depends on `balrog` and `balrog-bench`. These cannot be
-added to `pyproject.toml` because `balrog` pulls `google-generativeai` which conflicts
-with the `verifiers` → `prime-sandboxes` dependency chain.
+The BabyAI and TextWorld evals depend on `balrog`, `textworld`, and `balrog-bench`.
+`balrog` cannot go in `pyproject.toml` because it pulls `google-genai` which conflicts
+with `verifiers` → `prime-sandboxes`. Instead, `textworld` is tracked in the `balrog`
+dependency group and `balrog` itself is pip-installed with `--no-deps`.
 
-**Install manually after `uv sync`:**
+**One-command install:**
 
 ```bash
-uv pip install git+https://github.com/DavidePaglieri/BALROG.git@a5fa0e7 --no-deps
+./scripts/install_balrog.sh              # deps only
+./scripts/install_balrog.sh --with-data  # deps + TextWorld game files
 ```
 
-`--no-deps` avoids the `google-generativeai` conflict. The transitive deps we actually
-need (`gymnasium`, `omegaconf`) are already installed by `uv sync`.
+**Manual install (equivalent):**
+
+```bash
+uv sync --group balrog                   # installs textworld
+uv pip install git+https://github.com/DavidePaglieri/BALROG.git@a5fa0e7 --no-deps
+```
 
 `balrog-bench` is vendored at `src/balrog_bench.py` — installed automatically via the
 `src/` layout, no extra steps needed.
@@ -66,6 +72,7 @@ Verify:
 ```bash
 uv run python -c "from balrog.environments import make_env; print('balrog OK')"
 uv run python -c "import balrog_bench; print('balrog_bench OK')"
+uv run python -c "import textworld; print('textworld OK')"
 ```
 
 ## Key files

@@ -373,6 +373,143 @@ python scripts/eval_balrog_babyai.py --mode baseline --n 10 \
 - When `--n-max-turns >= 0`, `--compact-window` has no effect and a warning is logged.
 - The model (`Qwen/Qwen3-4B-Instruct-2507`) is served via `configs/compaction/qwen3_4b_serve_tp1.toml`.
 
+### Eval Results (Qwen3-4B-Instruct, BabyAI, n=3/task, max_turns=30, temp=0.6)
+
+#### Overall
+
+| Mode | Success | Rate | Avg Tokens | Avg Turns |
+|------|---------|------|------------|-----------|
+| Baseline | 1/24 | 4.2% | 5,015 | 28.9 |
+| Markovian Pure (window=4, keep=2) | 2/24 | 8.3% | 6,767 | 28.3 |
+| Compaction AM (ratio=0.25, kv=3000) | 3/24 | 12.5% | 2,104 | 28.0 |
+| Compaction AM Full (ratio=0.25, kv=3000) | 4/24 | 16.7% | 3,223 | 27.3 |
+
+#### Per-task breakdown
+
+| Task | Difficulty | Baseline | Markovian Pure | Compaction AM | Compaction AM Full |
+|------|-----------|----------|----------------|---------------|---------------------|
+| GoToObj | easy | 0/3 (0%) | 1/3 (33%) | 1/3 (33%) | 1/3 (33%) |
+| GoToLocal | easy | 0/3 (0%) | 0/3 (0%) | 1/3 (33%) | 2/3 (67%) |
+| PickupLoc | easy | 0/3 (0%) | 0/3 (0%) | 1/3 (33%) | 1/3 (33%) |
+| Open | medium | 0/3 (0%) | 0/3 (0%) | 0/3 (0%) | 0/3 (0%) |
+| PutNextLocal | medium | 0/3 (0%) | 0/3 (0%) | 0/3 (0%) | 0/3 (0%) |
+| GoTo | medium | 1/3 (33%) | 1/3 (33%) | 0/3 (0%) | 0/3 (0%) |
+| Unlock | hard | 0/3 (0%) | 0/3 (0%) | 0/3 (0%) | 0/3 (0%) |
+| UnlockLocal | hard | 0/3 (0%) | 0/3 (0%) | 0/3 (0%) | 0/3 (0%) |
+
+#### By difficulty
+
+| Difficulty | Baseline | Markovian Pure | Compaction AM | Compaction AM Full |
+|-----------|----------|----------------|---------------|---------------------|
+| Easy (3 tasks) | 0/9 (0%) | 1/9 (11%) | 3/9 (33%) | 4/9 (44%) |
+| Medium (3 tasks) | 1/9 (11%) | 1/9 (11%) | 0/9 (0%) | 0/9 (0%) |
+| Hard (2 tasks) | 0/6 (0%) | 0/6 (0%) | 0/6 (0%) | 0/6 (0%) |
+
+Compaction modes dramatically outperform baseline on easy tasks (33-44% vs 0%), likely
+because compressed KV retains navigational context that baseline loses to long noisy
+thinking traces. Medium/hard tasks remain unsolved across all modes — these require
+multi-step planning (find key → unlock door) that the base model struggles with regardless
+of context management.
+
+Compaction AM and AM Full use ~40-65% fewer tokens than baseline and markovian_pure because
+the compaction server disables thinking (`think_token_id = -1`), producing much shorter
+responses per turn.
+
+## TextWorld Evaluation
+
+Multi-turn text adventure benchmark using TextWorld (BALROG). The model receives text
+descriptions of rooms, objects, and interactions, and must issue freeform text commands
+to complete objectives. Evaluates context maintenance over long episodes with open-ended
+action spaces.
+
+### Installation
+
+Requires BALROG's forked TextWorld (not PyPI's `textworld`):
+
+```bash
+uv pip install "textworld @ git+https://github.com/balrog-ai/TextWorld.git" --no-deps
+uv pip install git+https://github.com/DavidePaglieri/BALROG.git@a5fa0e7 --no-deps
+```
+
+Game files are auto-downloaded to `$BALROG_DIR/tw_games` (default `/tmp/balrog/tw_games`)
+on first run. If `/tmp` is cleaned between runs, re-run or manually download from BALROG's
+Google Drive.
+
+### Tasks
+
+Three TextWorld tasks spanning three difficulty levels:
+
+| Task | Difficulty | Max Steps | Description |
+|------|-----------|-----------|-------------|
+| `coin_collector` | easy | 25 | Navigate rooms to find and pick up a coin |
+| `treasure_hunter` | medium | 40 | Find specific treasures in a larger map |
+| `the_cooking_game` | hard | 80 | Gather ingredients, prepare, cook, and eat a meal |
+
+### Running Evals
+
+```bash
+# Baseline — standard /v1/chat/completions generation
+python scripts/eval_balrog_textworld.py --mode baseline --n 10
+
+# KV-budget compaction — session API with reactive compaction
+python scripts/eval_balrog_textworld.py --mode compaction --n 10 \
+    --max-kv-len 4096 --compact-ratio 0.25
+
+# Markovian — session API with hard-delete of compaction window
+python scripts/eval_balrog_textworld.py --mode markovian --n 10 \
+    --max-kv-len 4096
+
+# Summary compaction — text-level summarization on window boundary
+python scripts/eval_balrog_textworld.py --mode summary --n 10 \
+    --n-max-turns 6 --n-preserved-turns 3 --summary-max-tokens 300
+
+# Markovian pure — drop old turns, fresh context with preserved turns only
+python scripts/eval_balrog_textworld.py --mode markovian_pure --n 10 \
+    --n-max-turns 6 --n-preserved-turns 3
+```
+
+### Mode differences
+
+| Mode | API path | Thinking | Turn management |
+|------|----------|----------|-----------------|
+| `baseline` | `/v1/chat/completions` | yes | full history |
+| `compaction` | session API (`compact_generate`) | no (think disabled) | KV-level compression |
+| `markovian` | session API | no | KV-level hard-delete |
+| `summary` | `/v1/chat/completions` | yes | client-side: summarize old turns, re-create context |
+| `markovian_pure` | `/v1/chat/completions` | yes | client-side: drop old turns, keep only preserved |
+
+`summary` and `markovian_pure` use `/v1/chat/completions` (not the session API) because
+the compaction worker disables thinking injection (`think_token_id = -1`) to avoid KL
+explosion during training. These modes manage context purely client-side.
+
+### Eval Results (Qwen3-4B-Instruct, TextWorld, n=10/task)
+
+#### Baseline
+
+| Task | Success | Rate | Avg Tokens | Avg Turns |
+|------|---------|------|------------|-----------|
+| coin_collector | 0/10 | 0% | 1,741 | 25 |
+| treasure_hunter | 0/10 | 0% | 4,255 | 40 |
+| the_cooking_game | 2/10 | 20% | 18,817 | 80 |
+| **Overall** | **2/30** | **6.7%** | **8,271** | **48.3** |
+
+The model always hits max_steps for navigation tasks. Only cooking_game sees occasional
+success (2/10), likely because its recipe structure provides clearer subgoal scaffolding.
+
+#### Markovian Pure (n_max_turns=6, n_preserved_turns=3)
+
+| Task | Success | Rate | Avg Tokens | Avg Turns |
+|------|---------|------|------------|-----------|
+| coin_collector | 0/10 | 0% | 1,411 | 25 |
+| treasure_hunter | 0/10 | 0% | 3,669 | 36.9 |
+| the_cooking_game | 6/10 | 60% | 14,326 | 80 |
+| **Overall** | **6/30** | **20%** | **6,469** | **47.3** |
+
+Markovian pure triples cooking_game success (60% vs 20% baseline) while using fewer tokens
+overall (6.5k vs 8.3k avg). The sliding context window forces more decisive action,
+benefiting structured tasks. Navigation tasks remain at 0% — spatial reasoning without
+persistent memory is equally hard with or without context trimming.
+
 ---
 
 ## Training

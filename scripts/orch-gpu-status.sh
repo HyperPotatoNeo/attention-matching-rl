@@ -1,0 +1,1 @@
+/home/mila/e/emiliano.penaloza/orchestrator/scripts/gpu-status.sh

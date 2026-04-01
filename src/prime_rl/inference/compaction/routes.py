@@ -437,3 +437,100 @@ async def rsa_generate(body: RsaGenerateRequest, request: Request):
         "best": rsa_result["best"],
         "diagnostics": rsa_result["diagnostics"],
     }
+
+
+class ParallelGenerateRequest(BaseModel):
+    coordinator_prompt_ids: list[int]
+    document_ids_list: list[list[int]]
+    compact_target_ratio: float = 0.25
+    probe_tokens: int = 256
+    max_gen_tokens: int = 2048
+    temperature: float = 0.7
+    top_p: float = 0.95
+    compute_beta: bool = True
+    summary_prompt: str | None = None
+
+
+@router.post("/parallel_generate")
+async def parallel_generate(body: ParallelGenerateRequest, request: Request):
+    engine = request.app.state.engine_client
+    tokenizer = engine.get_tokenizer()
+    eos_token_id = tokenizer.eos_token_id
+
+    result = await engine.collective_rpc(
+        "parallel_generate",
+        args=(
+            body.coordinator_prompt_ids,
+            body.document_ids_list,
+            body.compact_target_ratio,
+            body.probe_tokens,
+            body.max_gen_tokens,
+            body.temperature,
+            body.top_p,
+            eos_token_id,
+        ),
+        kwargs={
+            "compute_beta": body.compute_beta,
+            "summary_prompt": body.summary_prompt,
+        },
+    )
+
+    data = result[0]
+    return {
+        "all_token_ids": data["all_token_ids"],
+        "all_logprobs": data["all_logprobs"],
+        "final_text": data["final_text"],
+        "diagnostics": data.get("diagnostics", {}),
+    }
+
+
+class ParallelGenerateFusedRequest(BaseModel):
+    prompt_ids: list[int]
+    K: int = 4
+    max_candidate_tokens: int = 4096
+    compact_target_ratio: float = 0.25
+    max_gen_tokens: int = 4096
+    temperature: float = 0.7
+    top_p: float = 0.95
+    compute_beta: bool = True
+    probe_tokens: int = 256
+    synthesis_prompt: str | None = None
+    coordinator_prompt_ids: list[int] | None = None
+
+
+@router.post("/parallel_generate_fused")
+async def parallel_generate_fused(
+    body: ParallelGenerateFusedRequest, request: Request,
+):
+    engine = request.app.state.engine_client
+    tokenizer = engine.get_tokenizer()
+    eos_token_id = tokenizer.eos_token_id
+
+    result = await engine.collective_rpc(
+        "parallel_generate_fused",
+        args=(
+            body.prompt_ids,
+            body.K,
+            body.max_candidate_tokens,
+            body.compact_target_ratio,
+            body.max_gen_tokens,
+            body.temperature,
+            body.top_p,
+            eos_token_id,
+        ),
+        kwargs={
+            "compute_beta": body.compute_beta,
+            "probe_tokens": body.probe_tokens,
+            "synthesis_prompt": body.synthesis_prompt,
+            "coordinator_prompt_ids": body.coordinator_prompt_ids,
+        },
+    )
+
+    data = result[0]
+    return {
+        "all_token_ids": data["all_token_ids"],
+        "all_logprobs": data["all_logprobs"],
+        "final_text": data["final_text"],
+        "candidates": data.get("candidates", []),
+        "diagnostics": data.get("diagnostics", {}),
+    }

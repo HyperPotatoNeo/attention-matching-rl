@@ -1,0 +1,15 @@
+gpu_memory_utilization = 0.85
+
+[server]
+host = "0.0.0.0"
+
+[model]
+name = "/network/scratch/e/emiliano.penaloza/tau2/weights/Qwen3-8B"
+enforce_eager = true
+max_model_len = 32768
+
+[parallel]
+tp = 1
+
+[vllm_extra]
+enable_compaction = true

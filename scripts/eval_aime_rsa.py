@@ -21,7 +21,7 @@ import re
 import sys
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 
 import httpx
@@ -71,13 +71,37 @@ def extract_integer_answer(text: str) -> int | None:
     match = re.search(r"<answer>\s*(\d+)\s*</answer>", text, re.DOTALL)
     if match:
         return int(match.group(1))
-    # Fallback: last number in text
-    numbers = re.findall(r"\b(\d+)\b", text)
+    # Fallback: last number in text (cap at 4 digits to avoid huge numbers)
+    numbers = re.findall(r"\b(\d{1,4})\b", text)
     if numbers:
         val = int(numbers[-1])
         if 0 <= val <= 999:
             return val
     return None
+
+
+def force_answer(text: str, problem, model_name, port, temperature=0.6, top_p=0.95):
+    """If text was truncated without <answer>, do a short follow-up to extract one."""
+    if "<answer>" in text:
+        return text
+    if "<think>" in text and "</think>" not in text:
+        text += "</think>\n\n"
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": problem["question"]},
+        {"role": "assistant", "content": text + "\n\nMy final answer is: <answer>"},
+    ]
+    client = httpx.Client(base_url=f"http://localhost:{port}", timeout=60.0)
+    resp = client.post("/v1/chat/completions", json={
+        "model": model_name,
+        "messages": messages,
+        "max_tokens": 20,
+        "temperature": 0.0,
+        "chat_template_kwargs": {"enable_thinking": False},
+    })
+    resp.raise_for_status()
+    continuation = resp.json()["choices"][0]["message"]["content"] or ""
+    return text + "\n\nMy final answer is: <answer>" + continuation
 
 
 def score_aime(problem, response_text):
@@ -239,11 +263,14 @@ def main():
 
     def run_one(i, prob, port):
         if args.mode in ("rsa", "rsa_no_compact"):
-            return i, run_rsa(prob, port, tokenizer, args)
+            gen = run_rsa(prob, port, tokenizer, args)
         elif args.mode in ("compaction", "markovian"):
-            return i, run_compaction(prob, port, tokenizer, args)
+            gen = run_compaction(prob, port, tokenizer, args)
         else:
-            return i, run_baseline(prob, port, args.model, args)
+            gen = run_baseline(prob, port, args.model, args)
+        gen["text"] = force_answer(
+            gen["text"], prob, args.model, port, args.temperature, args.top_p)
+        return i, gen
 
     results = [None] * len(problems)
     total_correct = 0
@@ -332,8 +359,8 @@ def main():
         # RSA/baseline: one request per server, round-robin
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {}
-            pending_per_port = {p: 0 for p in ports}
             prob_queue = list(remaining)
+            pending = set()
 
             for port in ports:
                 if not prob_queue:
@@ -341,38 +368,39 @@ def main():
                 i, prob = prob_queue.pop(0)
                 fut = pool.submit(run_one, i, prob, port)
                 futures[fut] = (i, port)
-                pending_per_port[port] += 1
+                pending.add(fut)
 
-            for fut in as_completed(futures):
-                i, port = futures[fut]
-                _, gen = fut.result()
-                prob = problems[i]
-                completed += 1
-                pending_per_port[port] -= 1
+            while pending:
+                done_set, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done_set:
+                    i, port = futures[fut]
+                    _, gen = fut.result()
+                    prob = problems[i]
+                    completed += 1
 
-                sc = score_aime(prob, gen["text"])
-                correct = sc >= 0.5
-                total_correct += int(correct)
-                results[i] = {
-                    "idx": i, "correct": correct, "score": sc,
-                    "answer_extracted": extract_integer_answer(gen["text"]),
-                    "time": round(gen["time"], 2),
-                    "diagnostics": gen.get("diagnostics", {}),
-                }
-                _save_checkpoint()
-                status = "OK" if correct else "FAIL"
-                print(
-                    f"[{completed:3d}/{len(problems)}] {status} "
-                    f"answer={extract_integer_answer(gen['text'])} "
-                    f"time={gen['time']:.1f}s "
-                    f"acc={total_correct}/{completed} ({total_correct/completed:.1%})"
-                )
+                    sc = score_aime(prob, gen["text"])
+                    correct = sc >= 0.5
+                    total_correct += int(correct)
+                    results[i] = {
+                        "idx": i, "correct": correct, "score": sc,
+                        "answer_extracted": extract_integer_answer(gen["text"]),
+                        "time": round(gen["time"], 2),
+                        "diagnostics": gen.get("diagnostics", {}),
+                    }
+                    _save_checkpoint()
+                    status = "OK" if correct else "FAIL"
+                    print(
+                        f"[{completed:3d}/{len(problems)}] {status} "
+                        f"answer={extract_integer_answer(gen['text'])} "
+                        f"time={gen['time']:.1f}s "
+                        f"acc={total_correct}/{completed} ({total_correct/completed:.1%})"
+                    )
 
-                if prob_queue and pending_per_port[port] == 0:
-                    ni, nprob = prob_queue.pop(0)
-                    nfut = pool.submit(run_one, ni, nprob, port)
-                    futures[nfut] = (ni, port)
-                    pending_per_port[port] += 1
+                    if prob_queue:
+                        ni, nprob = prob_queue.pop(0)
+                        nfut = pool.submit(run_one, ni, nprob, port)
+                        futures[nfut] = (ni, port)
+                        pending.add(nfut)
 
     wall_time = time.time() - t_total
 

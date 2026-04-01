@@ -683,7 +683,7 @@ class TrainerConfig(BaseConfig):
     ] = False
     compaction_mode: Annotated[
         str,
-        Field(description="Compaction mode: 'attention_matching' (default) or 'markovian' (hard-delete window)."),
+        Field(description="Compaction mode: 'attention_matching' (default), 'attention_matching_full' (stack compacted blocks), or 'markovian' (hard-delete window)."),
     ] = "attention_matching"
 
     memory_profiler_path: Annotated[Path | None, Field(description="Path to write memory profile to.")] = None

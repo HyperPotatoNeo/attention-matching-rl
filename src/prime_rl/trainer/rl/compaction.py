@@ -31,7 +31,7 @@ from transformers import DynamicCache
 
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
-from prime_rl.inference.compaction.algorithm import compact_kv
+from prime_rl.inference.compaction.algorithm import compact_kv, compact_kv_range
 from prime_rl.trainer.models.layers.lora import base as lora_base
 from prime_rl.trainer.models.layers.lora import MultiLoRALinear
 
@@ -386,6 +386,10 @@ def segmented_forward(
         )
     seg_input_ranges = valid_ranges
 
+    # For attention_matching_full, compact_start advances after each compaction
+    # so that previously compacted blocks are never re-compacted.
+    compact_start = prompt_len
+
     for seg_idx, (seg_start, seg_end) in enumerate(seg_input_ranges):
         seg_ids = input_ids[:, seg_start:seg_end]
         seg_positions = position_ids[:, seg_start:seg_end]
@@ -454,14 +458,14 @@ def segmented_forward(
             num_layers = len(keys)
             kv_seq_len = keys[0].shape[0]
 
-            asst_len = kv_seq_len - prompt_len
+            region_len = kv_seq_len - compact_start
             # Use per-segment window from inference if available (turn-based mode
             # narrows the window to exclude protected turns)
             seg_window = None
             if compact_windows is not None and seg_idx < len(compact_windows):
                 seg_window = compact_windows[seg_idx]
             effective_window = seg_window or compact_window
-            window = min(effective_window or asst_len, asst_len)
+            window = min(effective_window or region_len, region_len)
 
             # Convert inference indices to forced_indices tensors if available
             seg_forced_indices = None
@@ -476,7 +480,7 @@ def segmented_forward(
             # Extract suffix queries from captured buffer
             suffix_queries = None
             if use_suffix_queries and query_buffer:
-                suffix_start_in_seg = prompt_len + window - seg_start
+                suffix_start_in_seg = compact_start + window - seg_start
                 suffix_queries = _extract_suffix_queries_from_buffer(
                     query_buffer, num_layers, suffix_start_in_seg,
                     num_kv_heads, head_size, device,
@@ -489,6 +493,22 @@ def segmented_forward(
                 c2_list = [torch.empty(kv_dim, dtype=values[0].dtype, device=device) for _ in range(num_layers)]
                 beta_list = None
                 compacted_prefix_len = 0
+            elif compaction_mode == "attention_matching_full":
+                compact_seed = prompt_len * 10000 + seg_idx
+                c1_list, c2_list, beta_list, _ = compact_kv_range(
+                    keys, values,
+                    compact_start=compact_start,
+                    compact_end=compact_start + window,
+                    target_ratio=compact_target_ratio,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                    device=device,
+                    compute_beta=compute_beta,
+                    seed=compact_seed,
+                    suffix_queries=suffix_queries,
+                    forced_indices=seg_forced_indices,
+                )
+                compacted_prefix_len = c1_list[0].shape[0]
             else:
                 compact_seed = prompt_len * 10000 + seg_idx
                 c1_list, c2_list, beta_list, _ = compact_kv(
@@ -501,17 +521,17 @@ def segmented_forward(
                     forced_indices=seg_forced_indices,
                 )
                 compacted_prefix_len = c1_list[0].shape[0]
-            suffix_len = asst_len - window
+            suffix_len = region_len - window
 
             compacted_cache = DynamicCache()
             for l in range(num_layers):
                 orig_K = keys[l]
                 orig_V = values[l]
-                suffix_K = orig_K[prompt_len + window:]
-                suffix_V = orig_V[prompt_len + window:]
+                suffix_K = orig_K[compact_start + window:]
+                suffix_V = orig_V[compact_start + window:]
 
-                new_K = torch.cat([orig_K[:prompt_len], c1_list[l], suffix_K], dim=0)
-                new_V = torch.cat([orig_V[:prompt_len], c2_list[l], suffix_V], dim=0)
+                new_K = torch.cat([orig_K[:compact_start], c1_list[l], suffix_K], dim=0)
+                new_V = torch.cat([orig_V[:compact_start], c2_list[l], suffix_V], dim=0)
 
                 new_K = new_K.permute(1, 0, 2).unsqueeze(0).detach()
                 new_V = new_V.permute(1, 0, 2).unsqueeze(0).detach()
@@ -520,16 +540,21 @@ def segmented_forward(
 
             # Register beta hooks for the next segment's forward pass
             if compute_beta and beta_list is not None:
-                new_kv_len = prompt_len + compacted_prefix_len + suffix_len
+                new_kv_len = compact_start + compacted_prefix_len + suffix_len
                 if beta_state is None:
                     num_heads = model.config.num_attention_heads
                     beta_state = _BetaTrainingState(num_kv_heads, num_heads)
                     beta_hooks = _register_beta_hooks(model, beta_state)
                 beta_state.set_beta(
-                    beta_list, prompt_len, compacted_prefix_len, new_kv_len, device)
+                    beta_list, compact_start, compacted_prefix_len, new_kv_len, device)
 
-            tokens_removed = kv_seq_len - (prompt_len + compacted_prefix_len + suffix_len)
+            new_kv_len = compact_start + compacted_prefix_len + suffix_len
+            tokens_removed = kv_seq_len - new_kv_len
             position_offset += tokens_removed
+
+            if compaction_mode == "attention_matching_full":
+                compact_start += compacted_prefix_len
+
             del keys, values, c1_list, c2_list, beta_list, kv_cache
             past_key_values = compacted_cache
             torch.cuda.empty_cache()
@@ -537,8 +562,7 @@ def segmented_forward(
             logger.debug(
                 "Compaction replay seg %d: kv_len %d -> %d (removed %d), "
                 "window=%d, prefix_after=%d, suffix=%d",
-                seg_idx, kv_seq_len,
-                prompt_len + compacted_prefix_len + suffix_len,
+                seg_idx, kv_seq_len, new_kv_len,
                 tokens_removed, window, compacted_prefix_len, suffix_len,
             )
 

@@ -134,6 +134,7 @@ class BetaState:
         beta: torch.Tensor,
         suffix_K: torch.Tensor,
         suffix_V: torch.Tensor,
+        zero_beta: bool = True,
     ):
         """Update contiguous buffer after compaction for one sequence, one layer.
 
@@ -158,7 +159,8 @@ class BetaState:
             self.K[layer_idx][seq_idx, end:suf_end] = suffix_K
             self.V[layer_idx][seq_idx, end:suf_end] = suffix_V
 
-        self.beta[layer_idx][seq_idx, :] = 0.0
+        if zero_beta:
+            self.beta[layer_idx][seq_idx, :] = 0.0
         # beta: (compacted_len, num_kv_heads) → (num_kv_heads, compacted_len)
         self.beta[layer_idx][seq_idx, :, start:end] = beta.T
 

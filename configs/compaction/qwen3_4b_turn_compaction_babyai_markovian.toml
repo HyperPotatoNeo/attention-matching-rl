@@ -1,23 +1,23 @@
-# BabyAI — Qwen3-4B-Instruct, Turn-Based Attention Matching Compaction (KV-budget mode)
+# BabyAI — Qwen3-4B-Instruct, Turn-Based Markovian Compaction (KV-budget mode)
 # Single node: 2 GPU inference (DP=2, TP=1), 2 GPUs training (FSDP2)
 # KV-budget: fires when current_seq_len >= max_kv_len (every turn after the first)
 
 max_steps = 600
 seq_len = 6000
-output_dir = "/network/scratch/e/emiliano.penaloza/outputs/balrog-babyai-good-full"
+output_dir = "/scratch/emiliano/outputs/babyai-markov"
 
 [model]
 name = "Qwen/Qwen3-4B-Instruct-2507"
 
 [wandb]
 project = "balrog-rl"
-name = "balrog-babyai-turn-am-full"
+name = "balrog-babyai-turn-markovian-full"
 
 [trainer.wandb]
-id = "babyai-turn-am-trainer-full"
+id = "babyai-turn-markovian-trainer-full"
 
 [orchestrator.wandb]
-id = "babyai-turn-am-orch"
+id = "babyai-turn-markovian-orch"
 
 [ckpt]
 interval = 5
@@ -40,8 +40,7 @@ enable_compaction = true
 [trainer]
 dist_timeout_seconds = 3600
 compact_target_ratio = 0.25
-compaction_mode = "attention_matching"
-use_suffix_queries = true
+compaction_mode = "markovian"
 
 [trainer.model]
 impl = "auto"
@@ -74,8 +73,8 @@ temperature = 1.0
 
 [[orchestrator.env]]
 id = "turn_compaction_env"
-name = "balrog-babyai-turn-am"
-args = { gym = "balrog-bench", max_kv_len = 3000, max_response_tokens = 512, compact_target_ratio = 0.25, n_max_turns = 4, n_preserved_turns = 2, max_turns = 30, compaction_mode = "attention_matching", use_suffix_queries = true, environments = ["babyai"], max_text_history = 16 }
+name = "balrog-babyai-turn-markovian"
+args = { gym = "balrog-bench", max_kv_len = 3000, max_response_tokens = 512, compact_target_ratio = 0.25, n_max_turns = 4, n_preserved_turns = 2, max_turns = 30, compaction_mode = "markovian", environments = ["babyai"], max_text_history = 16 }
 
 [orchestrator.eval]
 interval = 5
@@ -88,5 +87,5 @@ max_tokens = 512
 
 [[orchestrator.eval.env]]
 id = "turn_compaction_env"
-name = "balrog-babyai-turn-am-eval"
-args = { gym = "balrog-bench", max_kv_len = 3000, max_response_tokens = 512, compact_target_ratio = 0.25, n_max_turns = 4, n_preserved_turns = 2, max_turns = 30, compaction_mode = "attention_matching", use_suffix_queries = true, environments = ["babyai"], max_text_history = 16 }
+name = "balrog-babyai-turn-markovian-eval"
+args = { gym = "balrog-bench", max_kv_len = 3000, max_response_tokens = 512, compact_target_ratio = 0.25, n_max_turns = 4, n_preserved_turns = 2, max_turns = 30, compaction_mode = "markovian", environments = ["babyai"], max_text_history = 16 }
