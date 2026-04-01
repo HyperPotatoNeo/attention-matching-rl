@@ -14,6 +14,7 @@ KV cache state across turns. Compaction fires between turns (server-side), and
 segment_boundaries are stored on the first trajectory step so interleave_rollout
 can reconstruct the full compacted sequence for training.
 """
+import asyncio
 import json
 import logging
 import re
@@ -39,6 +40,34 @@ logger = logging.getLogger(__name__)
 _TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 
 
+async def _tokenize_with_retry(
+    http_client: httpx.AsyncClient,
+    url: str,
+    body: dict,
+    max_attempts: int = 5,
+    delay: float = 3.0,
+) -> dict:
+    """POST to /tokenize with retries on transient 400 errors."""
+    for attempt in range(max_attempts):
+        resp = await http_client.post(url, json=body)
+        if resp.status_code == 400 and attempt < max_attempts - 1:
+            logger.warning(f"/tokenize 400 (attempt {attempt + 1}/{max_attempts}), retrying in {delay}s: {resp.text[:300]}")
+            if attempt == 0:
+                # Log assistant messages with tool_calls for debugging
+                for i, m in enumerate(body.get("messages", [])):
+                    if m.get("role") == "assistant" and "tool_calls" in m:
+                        logger.warning(f"  msg[{i}] tool_calls: {m['tool_calls']}")
+                    if m.get("role") == "assistant":
+                        content = m.get("content") or ""
+                        if "<tool_call>" in content:
+                            logger.warning(f"  msg[{i}] has raw <tool_call> in content: {content[:200]}")
+            await asyncio.sleep(delay)
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    raise RuntimeError(f"/tokenize failed after {max_attempts} attempts")
+
+
 async def _compute_suffix_ids(
     http_client: httpx.AsyncClient,
     server_url: str,
@@ -58,9 +87,8 @@ async def _compute_suffix_ids(
         "model": model,
         "prompt": dummy_content,
     }
-    content_resp = await http_client.post(f"{server_url}/tokenize", json=content_body)
-    content_resp.raise_for_status()
-    dummy_content_ids = content_resp.json()["tokens"]
+    content_data = await _tokenize_with_retry(http_client, f"{server_url}/tokenize", content_body)
+    dummy_content_ids = content_data["tokens"]
 
     # Tokenize a full conversation to find what comes after the content
     msgs_body: dict = {
@@ -73,9 +101,8 @@ async def _compute_suffix_ids(
     }
     if oai_tools:
         msgs_body["tools"] = oai_tools
-    msgs_resp = await http_client.post(f"{server_url}/tokenize", json=msgs_body)
-    msgs_resp.raise_for_status()
-    dummy_msgs_ids = msgs_resp.json()["tokens"]
+    msgs_data = await _tokenize_with_retry(http_client, f"{server_url}/tokenize", msgs_body)
+    dummy_msgs_ids = msgs_data["tokens"]
 
     # Find last occurrence of the content's final token, then take everything after
     last_token = dummy_content_ids[-1]
@@ -106,7 +133,11 @@ def _parse_hermes_tool_calls(text: str) -> tuple[str | None, list[ToolCall]]:
     tool_calls = []
     for i, match in enumerate(_TOOL_CALL_RE.finditer(text)):
         raw = match.group(1).strip()
-        parsed = json.loads(raw)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning(f"Skipping unparseable tool_call: {raw[:100]}")
+            continue
         arguments = parsed.get("arguments", {})
         if not isinstance(arguments, str):
             arguments = json.dumps(arguments, ensure_ascii=False)
@@ -137,19 +168,63 @@ def _tool_defs_to_openai(tool_defs: list[Tool] | None) -> list[dict] | None:
     ]
 
 
+def _sanitize_tool_arguments(args: str) -> str:
+    """Ensure tool call arguments are valid JSON for vLLM's _postprocess_messages."""
+    if not args or not args.strip():
+        return "{}"
+    try:
+        json.loads(args)
+        return args
+    except (json.JSONDecodeError, TypeError):
+        return json.dumps({"raw": args})
+
+
 def _tool_call_to_openai(tc: dict) -> dict:
     """Convert a verifiers-style tool_call dict to OpenAI format."""
     if "function" in tc:
+        fn = tc["function"]
+        if "arguments" in fn:
+            fn["arguments"] = _sanitize_tool_arguments(fn["arguments"])
         return tc
     return {
         "id": tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
         "type": "function",
-        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+        "function": {
+            "name": tc["name"],
+            "arguments": _sanitize_tool_arguments(tc.get("arguments", "{}")),
+        },
     }
 
 
+def _last_n_turns(turn_msgs: list[dict], n: int) -> list[dict]:
+    """Return the messages belonging to the last *n* turns.
+
+    A "turn" starts at each ``user`` message and includes all subsequent
+    non-``user`` messages (assistant replies, tool responses, etc.).
+    This correctly handles tool-calling envs where each turn has 3+
+    messages instead of the simple user/assistant pair.
+    """
+    if n <= 0:
+        return []
+    # Walk backwards, counting user messages as turn boundaries.
+    count = 0
+    cut = len(turn_msgs)
+    for i in range(len(turn_msgs) - 1, -1, -1):
+        if turn_msgs[i].get("role") == "user":
+            count += 1
+            if count >= n:
+                cut = i
+                break
+    return turn_msgs[cut:]
+
+
 def _messages_to_openai(prompt) -> list[dict]:
-    """Convert a list of messages to OpenAI-compatible dicts for /tokenize."""
+    """Convert a list of messages to OpenAI-compatible dicts for /tokenize.
+
+    Strips verifiers-specific fields (reasoning_content, thinking_blocks) that
+    vLLM doesn't understand, and removes None/empty tool_calls to avoid tripping
+    vLLM's chat template rendering.
+    """
     dicts = []
     if isinstance(prompt, str):
         return [{"role": "user", "content": prompt}]
@@ -160,8 +235,14 @@ def _messages_to_openai(prompt) -> list[dict]:
             d = dict(msg)
         else:
             d = {"role": getattr(msg, "role", "user"), "content": str(getattr(msg, "content", ""))}
-        if "tool_calls" in d and d["tool_calls"]:
-            d["tool_calls"] = [_tool_call_to_openai(tc) for tc in d["tool_calls"]]
+        # Strip verifiers-only fields that vLLM doesn't understand
+        for key in ("reasoning_content", "thinking_blocks"):
+            d.pop(key, None)
+        if "tool_calls" in d:
+            if d["tool_calls"]:
+                d["tool_calls"] = [_tool_call_to_openai(tc) for tc in d["tool_calls"]]
+            else:
+                del d["tool_calls"]
         dicts.append(d)
     return dicts
 
@@ -325,12 +406,10 @@ class CompactionEnv(vf.MultiTurnEnv):
             if oai_tools:
                 tokenize_body["tools"] = oai_tools
 
-            tokenize_resp = await http_client.post(
-                f"{server_url}/tokenize",
-                json=tokenize_body,
+            tokenize_data = await _tokenize_with_retry(
+                http_client, f"{server_url}/tokenize", tokenize_body,
             )
-            tokenize_resp.raise_for_status()
-            prompt_ids = tokenize_resp.json()["tokens"]
+            prompt_ids = tokenize_data["tokens"]
 
             temperature = sampling_args.get("temperature", 0.7)
             top_p = sampling_args.get("top_p", 0.95)
@@ -571,11 +650,8 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
 
         # Keep preserved turns + turns accumulated since last summary reset
         summary_turn_count = state.get("_tc_summary_turn_count", 0)
-        n_recent_pairs = self.n_preserved_turns + summary_turn_count
-        if n_recent_pairs > 0 and len(turn_msgs) >= n_recent_pairs * 2:
-            recent = turn_msgs[-(n_recent_pairs * 2):]
-        else:
-            recent = turn_msgs
+        n_recent = self.n_preserved_turns + summary_turn_count
+        recent = _last_n_turns(turn_msgs, n_recent) if n_recent > 0 else turn_msgs
 
         return [system_msg] + recent + [current_user]
 
@@ -588,11 +664,8 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         current_user = prompt_dicts[-1]
         turn_msgs = prompt_dicts[1:-1]
 
-        n_recent_pairs = self.n_preserved_turns + state.get("_tc_summary_turn_count", 0)
-        if n_recent_pairs > 0 and len(turn_msgs) >= n_recent_pairs * 2:
-            recent = turn_msgs[-(n_recent_pairs * 2):]
-        else:
-            recent = turn_msgs
+        n_recent = self.n_preserved_turns + state.get("_tc_summary_turn_count", 0)
+        recent = _last_n_turns(turn_msgs, n_recent) if n_recent > 0 else turn_msgs
 
         return [prompt_dicts[0]] + recent + [current_user]
 
@@ -602,7 +675,7 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         turn_msgs = prompt_dicts[1:-1]
 
         n_keep = self.n_preserved_turns
-        preserved = turn_msgs[-(n_keep * 2):] if n_keep > 0 and len(turn_msgs) > n_keep * 2 else turn_msgs
+        preserved = _last_n_turns(turn_msgs, n_keep) if n_keep > 0 else turn_msgs
 
         await self._delete_session(state)
         for key in ["_tc_session_id", "_tc_prev_prompt_ids", "_tc_prev_completion_ids",
@@ -611,6 +684,18 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         state["_tc_cleaned"] = False
         state["_tc_summary_turn_count"] = 0
         state["_tc_pure_reset_done"] = True
+
+        # Reset cumulative tracking — no server-side compaction occurred,
+        # so stale boundaries would be meaningless for training.
+        state["_tc_cumulative"] = 0
+        state["_tc_seg_boundaries"] = []
+        state["_tc_compaction_indices"] = []
+        state["_tc_compact_windows"] = []
+        if state.get("trajectory"):
+            extras = state["trajectory"][0].get("extras", {})
+            extras.pop("segment_boundaries", None)
+            extras.pop("compaction_indices", None)
+            extras.pop("compact_windows", None)
 
         return [prompt_dicts[0]] + preserved + [current_user]
 
@@ -628,12 +713,11 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         turn_msgs = prompt_dicts[1:-1]
 
         n_keep = self.n_preserved_turns
-        if n_keep > 0 and len(turn_msgs) > n_keep * 2:
-            to_summarize = turn_msgs[:-(n_keep * 2)]
-            preserved = turn_msgs[-(n_keep * 2):]
+        preserved = _last_n_turns(turn_msgs, n_keep) if n_keep > 0 else []
+        if preserved:
+            to_summarize = turn_msgs[:-len(preserved)]
         else:
             to_summarize = turn_msgs
-            preserved = []
 
         parts = []
         for i in range(0, len(to_summarize), 2):
@@ -676,6 +760,18 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
             state.pop(key, None)
         state["_tc_cleaned"] = False
         state["_tc_summary_turn_count"] = 0
+
+        # Reset cumulative tracking — no server-side compaction occurred,
+        # so stale boundaries would be meaningless for training.
+        state["_tc_cumulative"] = 0
+        state["_tc_seg_boundaries"] = []
+        state["_tc_compaction_indices"] = []
+        state["_tc_compact_windows"] = []
+        if state.get("trajectory"):
+            extras = state["trajectory"][0].get("extras", {})
+            extras.pop("segment_boundaries", None)
+            extras.pop("compaction_indices", None)
+            extras.pop("compact_windows", None)
 
         # Build modified prompt with summary in system message
         base_system = state["_tc_base_system"]
@@ -749,12 +845,10 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
             if oai_tools:
                 tokenize_body["tools"] = oai_tools
 
-            tokenize_resp = await http_client.post(
-                f"{server_url}/tokenize",
-                json=tokenize_body,
+            tokenize_data = await _tokenize_with_retry(
+                http_client, f"{server_url}/tokenize", tokenize_body,
             )
-            tokenize_resp.raise_for_status()
-            full_ids = tokenize_resp.json()["tokens"]
+            full_ids = tokenize_data["tokens"]
 
             if "_tc_session_id" not in state:
                 # Turn 0 (or first turn after summary reset): use full tokenization

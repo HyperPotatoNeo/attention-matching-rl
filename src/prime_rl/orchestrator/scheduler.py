@@ -330,6 +330,7 @@ class Scheduler:
 
         batch_rollouts: list[vf.RolloutOutput] = []
         batch_progress = 0
+        failed_rollouts = 0
         pbar = ProgressTracker(
             total=self.batch_target, desc="Generating rollouts (train)", json_logging=self.json_logging, step=step
         )
@@ -368,7 +369,8 @@ class Scheduler:
                         await self.drop_group(group_id)
                     continue
                 except Exception as e:
-                    self.logger.warning(f"Rollout failed: {e}")
+                    failed_rollouts += 1
+                    self.logger.debug(f"Rollout failed: {e}")
                     if group_id is not None:
                         await self.drop_group(group_id)
                     continue
@@ -384,6 +386,8 @@ class Scheduler:
 
         batch_rollouts = self.finalize_batch_rollouts(batch_rollouts)
         pbar.close()
+        if failed_rollouts > 0:
+            self.logger.warning(f"Step {step}: {failed_rollouts} rollout(s) failed and were retried")
         self.last_batch_generation_time = time.perf_counter() - batch_start_time
         return batch_rollouts
 

@@ -12,7 +12,13 @@ from verifiers.workers import ZMQEnvClient, ZMQEnvServer
 
 from prime_rl.utils.logger import InterceptHandler, ProgressTracker
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_RETRIES = 0
+_TRANSIENT_RETRY_ATTEMPTS = 3
+_TRANSIENT_RETRY_DELAY = 10
+_SERVER_ERROR_RETRY_ATTEMPTS = 30
+_SERVER_ERROR_RETRY_DELAY = 10
 REQUIRED_STATE_COLUMNS = ["trajectory", "sampling_args"]
 DEFAULT_STATE_COLUMNS = []
 
@@ -142,6 +148,8 @@ async def generate(
     max_retries: int = DEFAULT_RETRIES,
     state_columns: list[str] = DEFAULT_STATE_COLUMNS,
     pbar_description: str = "Generating rollouts",
+    stagger_seconds: float = 0.0,
+    max_concurrent: int | None = None,
 ) -> list[vf.RolloutOutput]:
     """
     Wrapper for vf.Environment.generate().
@@ -162,30 +170,54 @@ async def generate(
 
     total_rollouts = len(examples) * rollouts_per_example
     pbar = ProgressTracker(total=total_rollouts, desc=pbar_description)
+    semaphore = asyncio.Semaphore(max_concurrent) if max_concurrent else None
 
     async def run_group_with_progress(example):
-        client = await get_client()
-        result = await run_group(
-            env=env,
-            client=client,
-            model_name=model_name,
-            example=example,
-            rollouts_per_example=rollouts_per_example,
-            max_retries=max_retries,
-            state_columns=state_columns,
-            sampling_args=sampling_args,
-        )
-        pbar.update(rollouts_per_example)
-        return result
+        for attempt in range(_SERVER_ERROR_RETRY_ATTEMPTS):
+            client = await get_client()
+            try:
+                result = await run_group(
+                    env=env,
+                    client=client,
+                    model_name=model_name,
+                    example=example,
+                    rollouts_per_example=rollouts_per_example,
+                    max_retries=max_retries,
+                    state_columns=state_columns,
+                    sampling_args=sampling_args,
+                )
+                pbar.update(rollouts_per_example)
+                return result
+            except RuntimeError as e:
+                err_str = str(e)
+                if "500 Internal Server Error" in err_str and attempt < _SERVER_ERROR_RETRY_ATTEMPTS - 1:
+                    logger.debug(f"Server error (attempt {attempt + 1}/{_SERVER_ERROR_RETRY_ATTEMPTS}), retrying in {_SERVER_ERROR_RETRY_DELAY}s")
+                    await asyncio.sleep(_SERVER_ERROR_RETRY_DELAY)
+                elif "400 Bad Request" in err_str and attempt < _TRANSIENT_RETRY_ATTEMPTS - 1:
+                    logger.warning(f"Transient 400 error (attempt {attempt + 1}/{_TRANSIENT_RETRY_ATTEMPTS}), retrying in {_TRANSIENT_RETRY_DELAY}s: {e}")
+                    await asyncio.sleep(_TRANSIENT_RETRY_DELAY)
+                else:
+                    raise
+
+    async def run_with_stagger(idx, example):
+        if stagger_seconds > 0 and idx > 0:
+            await asyncio.sleep(idx * stagger_seconds)
+        if semaphore:
+            async with semaphore:
+                return await run_group_with_progress(example)
+        return await run_group_with_progress(example)
 
     try:
         group_outputs_list: list[list[vf.RolloutOutput]] = await asyncio.gather(
-            *[run_group_with_progress(example) for example in examples]
+            *[run_with_stagger(i, ex) for i, ex in enumerate(examples)]
         )
     finally:
         pbar.close()
 
     return [output for group_outputs in group_outputs_list for output in group_outputs]
+
+
+_DEFAULT_EVAL_STAGGER_SECONDS = 0.1
 
 
 async def evaluate(
@@ -198,6 +230,8 @@ async def evaluate(
     get_client: Callable[[], Awaitable[vf.ClientConfig]] | None = None,
     max_retries: int = DEFAULT_RETRIES,
     state_columns: list[str] = DEFAULT_STATE_COLUMNS,
+    stagger_seconds: float = _DEFAULT_EVAL_STAGGER_SECONDS,
+    max_concurrent: int | None = None,
 ) -> list[vf.RolloutOutput]:
     """
     Wrapper for vf.Environment.evaluate().
@@ -221,6 +255,8 @@ async def evaluate(
         sampling_args=sampling_args,
         max_retries=max_retries,
         state_columns=state_columns,
+        stagger_seconds=stagger_seconds,
+        max_concurrent=max_concurrent,
     )
     return outputs
 
