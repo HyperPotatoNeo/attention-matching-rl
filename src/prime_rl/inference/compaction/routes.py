@@ -236,6 +236,107 @@ class _RequestBatcher:
 
 _batcher = _RequestBatcher()
 
+SESSION_STEP_BATCH_SIZE = 16
+SESSION_STEP_WAIT_SECONDS = 0.3
+
+
+class _SessionStepBatcher:
+    """Accumulates /compact_session/step requests and processes them in batch.
+
+    Groups requests by DP rank (sessions on the same GPU batch together).
+    Uses compact_session_step_batch for parallel model forward passes.
+    """
+
+    def __init__(self, max_batch_size: int = SESSION_STEP_BATCH_SIZE, max_wait: float = SESSION_STEP_WAIT_SECONDS):
+        self.max_batch_size = max_batch_size
+        self.max_wait = max_wait
+        # Per DP-rank queue; None key = DP=1
+        self._queues: dict[int | None, asyncio.Queue] = {}
+        self._started: set[int | None] = set()
+
+    def _ensure_started(self, app, dp_rank: int | None):
+        if dp_rank not in self._started:
+            self._started.add(dp_rank)
+            if dp_rank not in self._queues:
+                self._queues[dp_rank] = asyncio.Queue()
+            asyncio.create_task(self._worker(app, dp_rank))
+
+    async def submit(self, body, app, dp_rank: int | None) -> dict:
+        self._ensure_started(app, dp_rank)
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        await self._queues[dp_rank].put((body, future))
+        return await future
+
+    async def _worker(self, app, dp_rank: int | None):
+        queue = self._queues[dp_rank]
+        while True:
+            item = await queue.get()
+            batch = [item]
+            deadline = asyncio.get_event_loop().time() + self.max_wait
+            while len(batch) < self.max_batch_size:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=remaining)
+                    batch.append(item)
+                except asyncio.TimeoutError:
+                    break
+
+            try:
+                results = await self._process_batch(app, batch, dp_rank)
+                for (_, future), result in zip(batch, results):
+                    if not future.done():
+                        future.set_result(result)
+            except Exception as e:
+                for _, future in batch:
+                    if not future.done():
+                        future.set_exception(e)
+
+    async def _process_batch(self, app, batch, dp_rank: int | None) -> list[dict]:
+        engine = app.state.engine_client
+        tokenizer = engine.get_tokenizer()
+
+        session_ids = [b.session_id for b, _ in batch]
+        new_token_ids_list = [b.new_token_ids for b, _ in batch]
+        max_response_tokens_list = [b.max_response_tokens for b, _ in batch]
+        B = len(batch)
+
+        logger.info("SessionStepBatch: B=%d, dp_rank=%s", B, dp_rank)
+
+        client, dp_engines = _get_dp_engines(engine)
+        if dp_engines is not None and dp_rank is not None:
+            results = await client._call_utility_async(
+                "collective_rpc", "compact_session_step_batch", None,
+                (session_ids, new_token_ids_list, max_response_tokens_list), {},
+                engine=dp_engines[dp_rank],
+            )
+        else:
+            results = await engine.collective_rpc(
+                "compact_session_step_batch",
+                args=(session_ids, new_token_ids_list, max_response_tokens_list),
+            )
+
+        batch_data = results[0]
+        responses = []
+        for data in batch_data:
+            if isinstance(data, dict) and data.get("error"):
+                responses.append(data)
+            else:
+                final_text = tokenizer.decode(data["all_token_ids"], skip_special_tokens=True)
+                responses.append({
+                    "all_token_ids": data["all_token_ids"],
+                    "all_logprobs": data.get("all_logprobs", []),
+                    "final_text": final_text,
+                    "current_seq_len": data["current_seq_len"],
+                    "diagnostics": data.get("diagnostics", {}),
+                })
+        return responses
+
+
+_session_step_batcher = _SessionStepBatcher()
+
 
 @router.post("/compact_generate")
 async def compact_generate(body: CompactGenerateRequest, request: Request):
@@ -392,52 +493,9 @@ async def compact_session_create(body: SessionCreateRequest, request: Request):
 
 @router.post("/compact_session/step")
 async def compact_session_step(body: SessionStepRequest, request: Request):
-    from fastapi.responses import JSONResponse
-
-    engine = request.app.state.engine_client
-    tokenizer = engine.get_tokenizer()
-
-    logger.info(
-        "/compact_session/step: session=%s, new_tokens=%d",
-        body.session_id, len(body.new_token_ids),
-    )
-
-    dp_rank_for_wait = _session_dp_map.get(body.session_id)
-
-    for attempt in range(_BLOCK_WAIT_MAX_RETRIES + 1):
-        result = await _session_rpc(
-            engine, "compact_session_step", body.session_id,
-            args=(
-                body.session_id,
-                body.new_token_ids,
-                body.max_response_tokens,
-            ),
-        )
-
-        data = result[0]
-        if isinstance(data, dict) and data.get("error") == "blocks_exhausted":
-            if attempt >= _BLOCK_WAIT_MAX_RETRIES:
-                return JSONResponse(status_code=503, content=data)
-            logger.debug(
-                "Session step %s waiting for blocks (attempt %d/%d)",
-                body.session_id, attempt + 1, _BLOCK_WAIT_MAX_RETRIES,
-            )
-            cond = _get_blocks_freed_condition(dp_rank_for_wait)
-            async with cond:
-                try:
-                    await asyncio.wait_for(cond.wait(), timeout=_BLOCK_WAIT_TIMEOUT)
-                except asyncio.TimeoutError:
-                    pass
-            continue
-
-        final_text = tokenizer.decode(data["all_token_ids"], skip_special_tokens=True)
-        return {
-            "all_token_ids": data["all_token_ids"],
-            "all_logprobs": data.get("all_logprobs", []),
-            "final_text": final_text,
-            "current_seq_len": data["current_seq_len"],
-            "diagnostics": data.get("diagnostics", {}),
-        }
+    """Route session step through auto-batcher for parallel GPU inference."""
+    dp_rank = _session_dp_map.get(body.session_id)
+    return await _session_step_batcher.submit(body, request.app, dp_rank)
 
 
 @router.delete("/compact_session/{session_id}")

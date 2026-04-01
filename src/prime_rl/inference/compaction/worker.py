@@ -2299,6 +2299,283 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             "diagnostics": {"compaction_events": compaction_events},
         }
 
+    def compact_session_step_batch(
+        self,
+        session_ids: list[str],
+        new_token_ids_list: list[list[int]],
+        max_response_tokens_list: list[int],
+    ) -> list[dict]:
+        """Process N sessions' steps in one call with batched model forward passes.
+
+        Each session independently tracks its own KV state, compaction triggers,
+        and turn history. The model forward pass runs all N sequences in parallel.
+        """
+        N = len(session_ids)
+        states = [self._sessions[sid] for sid in session_ids]
+        for s in states:
+            s.last_access = time.monotonic()
+
+        model = self._get_model()
+        device = self._get_device()
+        vllm_config = self.model_runner.vllm_config
+        kv_caches = self.model_runner.kv_caches
+        num_layers = len(kv_caches)
+        kv_shape = kv_caches[0].shape
+        num_total_blocks = kv_shape[1]
+        block_size = kv_shape[2]
+        num_kv_heads = kv_shape[3]
+        head_size = kv_shape[4]
+        attn_layer_names = self._get_attn_layer_names(model)
+        rng = torch.Generator(device=device)
+
+        # --- Phase 1: Grow blocks + prefill append (sequential per session) ---
+        max_response_tokens_max = max(max_response_tokens_list)
+        for i, state in enumerate(states):
+            existing = state.current_seq_len - 1
+            target = existing + len(new_token_ids_list[i]) + 1 + max_response_tokens_list[i]
+            err = self._grow_blocks(state, target, block_size, num_total_blocks)
+            if err:
+                return [err] * N
+
+        boundary_tokens = []
+        boundary_logprobs = []
+        current_seq_lens_list = []
+        position_offsets_list = []
+        for i, state in enumerate(states):
+            existing = state.current_seq_len - 1
+            new_ids_t = torch.tensor(new_token_ids_list[i], dtype=torch.long, device=device)
+            logits = _prefill_append(
+                model, new_ids_t,
+                existing_seq_len=existing,
+                position_offset=state.position_offset,
+                block_ids=state.block_ids,
+                block_size=block_size,
+                attn_layer_names=attn_layer_names,
+                vllm_config=vllm_config,
+                device=device,
+            )
+            seq_len = existing + len(new_token_ids_list[i])
+            token, logprob = _sample_token(logits[-1:], state.temperature, state.top_p, rng, seed=0)
+            boundary_tokens.append(token)
+            boundary_logprobs.append(logprob)
+            current_seq_lens_list.append(seq_len + 1)
+            position_offsets_list.append(state.position_offset)
+
+        # --- Phase 2: Pre-decode compaction (KV-budget mode only) ---
+        for i, state in enumerate(states):
+            if state.n_max_turns < 0 and current_seq_lens_list[i] - 1 >= state.max_kv_len:
+                kv_len = current_seq_lens_list[i] - 1
+                asst_len = kv_len - state.prompt_len
+                window = min(state.compact_window or asst_len, asst_len)
+                suffix_len = asst_len - window
+                keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
+                if state.compaction_mode == "markovian":
+                    kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
+                    c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
+                    c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
+                    compacted_prefix_len = 0
+                else:
+                    seed = state.prompt_len * 10000 + state.compaction_count
+                    c1_list, c2_list, _, _ = compact_kv(
+                        keys, values, state.prompt_len, state.compact_target_ratio,
+                        num_kv_heads, head_size, device, compact_window=window, seed=seed,
+                    )
+                    compacted_prefix_len = c1_list[0].shape[0]
+                state.compaction_count += 1
+                new_seq_len = state.prompt_len + compacted_prefix_len + suffix_len
+                _inject_compacted_kv(
+                    kv_caches, keys, values, c1_list, c2_list,
+                    state.block_ids, block_size, state.prompt_len, num_layers,
+                    old_seq_len=kv_len, compact_window=window,
+                )
+                position_offsets_list[i] += kv_len - new_seq_len
+                current_seq_lens_list[i] = new_seq_len + 1
+
+        # --- Phase 3: Build batch decode context ---
+        per_seq_blocks = [s.block_ids for s in states]
+        max_blocks = max(len(b) for b in per_seq_blocks)
+        current_seq_lens = torch.tensor(current_seq_lens_list, dtype=torch.long, device=device)
+        position_offsets = torch.tensor(position_offsets_list, dtype=torch.long, device=device)
+        last_tokens = torch.stack(boundary_tokens)
+        max_seq_len_hint = max(current_seq_lens_list) + max_response_tokens_max
+
+        batch_ctx = _BatchDecodeContext.create(
+            B=N, per_seq_blocks=per_seq_blocks, block_size=block_size,
+            max_blocks_per_seq=max_blocks, attn_layer_names=attn_layer_names,
+            vllm_config=vllm_config, device=device,
+        )
+        batch_ctx.metadata.max_seq_len = max_seq_len_hint
+
+        all_token_ids = [[bt.item()] for bt in boundary_tokens]
+        all_logprobs = [[lp.item()] for lp in boundary_logprobs]
+        active = [True] * N
+        compaction_events: list[list[dict]] = [[] for _ in range(N)]
+
+        # --- Phase 4: Batched decode loop ---
+        with set_forward_context(
+            batch_ctx.attn_metadata_dict, batch_ctx.vllm_config,
+            virtual_engine=0, num_tokens=N,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            slot_mapping=batch_ctx.slot_mapping_ctx,
+        ):
+            step = 0
+            while any(active):
+                # Check per-session token limits
+                for i in range(N):
+                    if active[i] and len(all_token_ids[i]) >= max_response_tokens_list[i]:
+                        active[i] = False
+                    if active[i] and all_token_ids[i][-1] == states[i].eos_token_id:
+                        active[i] = False
+                if not any(active):
+                    break
+
+                # Batched forward
+                batch_ctx.input_ids[:] = last_tokens
+                batch_ctx.positions[:] = current_seq_lens - 1 + position_offsets
+                batch_ctx.seq_lens[:] = current_seq_lens.int()
+                _update_batch_slots(batch_ctx, current_seq_lens)
+                batch_ctx.metadata.max_seq_len = int(current_seq_lens.max().item())
+
+                hidden = model(input_ids=batch_ctx.input_ids, positions=batch_ctx.positions)
+                logits = model.compute_logits(hidden)
+
+                rng.manual_seed(step)
+                tokens, lps = _sample_batch(logits, states[0].temperature, states[0].top_p, rng)
+
+                for i in range(N):
+                    if not active[i]:
+                        continue
+                    all_token_ids[i].append(tokens[i].item())
+                    all_logprobs[i].append(lps[i].item())
+                    last_tokens[i] = tokens[i]
+                    current_seq_lens[i] += 1
+
+                step += 1
+
+                # Per-session KV-budget compaction
+                for i in range(N):
+                    if not active[i]:
+                        continue
+                    state = states[i]
+                    if state.n_max_turns >= 0:
+                        continue  # turn-based handled after decode
+                    if int(current_seq_lens[i].item()) - 1 < state.max_kv_len:
+                        continue
+
+                    kv_len = int(current_seq_lens[i].item()) - 1
+                    asst_len = kv_len - state.prompt_len
+                    window = min(state.compact_window or asst_len, asst_len)
+                    suffix_len = asst_len - window
+                    keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
+                    if state.compaction_mode == "markovian":
+                        kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
+                        c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
+                        c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
+                        compacted_prefix_len = 0
+                    else:
+                        seed = state.prompt_len * 10000 + state.compaction_count
+                        c1_list, c2_list, _, _ = compact_kv(
+                            keys, values, state.prompt_len, state.compact_target_ratio,
+                            num_kv_heads, head_size, device, compact_window=window, seed=seed,
+                        )
+                        compacted_prefix_len = c1_list[0].shape[0]
+                    state.compaction_count += 1
+                    new_seq_len = state.prompt_len + compacted_prefix_len + suffix_len
+                    _inject_compacted_kv(
+                        kv_caches, keys, values, c1_list, c2_list,
+                        state.block_ids, block_size, state.prompt_len, num_layers,
+                        old_seq_len=kv_len, compact_window=window,
+                    )
+                    position_offsets[i] += kv_len - new_seq_len
+                    current_seq_lens[i] = new_seq_len + 1
+                    compaction_events[i].append({
+                        "kv_len_before": kv_len, "kv_len_after": new_seq_len,
+                    })
+
+        # --- Phase 5: Turn-based compaction + state update ---
+        results = []
+        for i, state in enumerate(states):
+            cur_sl = int(current_seq_lens[i].item())
+            pos_off = int(position_offsets[i].item())
+
+            user_len = len(new_token_ids_list[i]) - 1
+            asst_len = len(all_token_ids[i])
+            state.turn_user_lens.append(user_len)
+            state.turn_asst_lens.append(asst_len)
+
+            if state.n_max_turns >= 0 and len(state.turn_asst_lens) >= state.n_max_turns:
+                kv_len = cur_sl - 1
+                n_protect = state.n_preserved_turns
+                protected_total = (
+                    sum(state.turn_user_lens[-n_protect:]) + sum(state.turn_asst_lens[-n_protect:])
+                    if n_protect > 0 else 0
+                )
+                compact_end = kv_len - protected_total
+                if state.compaction_mode == "attention_matching_full":
+                    compact_start = state.compacted_prefix_end
+                else:
+                    compact_start = state.prompt_len
+
+                if compact_end > compact_start:
+                    keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
+                    turn_compact_window = compact_end - compact_start
+                    indices_list = None
+                    if state.compaction_mode == "markovian":
+                        kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
+                        c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
+                        c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
+                        compacted_prefix_len = 0
+                    else:
+                        asst_in_kv = state.turn_asst_lens[-1] - 1
+                        asst_start = kv_len - asst_in_kv
+                        query_vecs = [k[asst_start:kv_len].permute(1, 0, 2) for k in keys]
+                        seed = state.prompt_len * 10000 + state.compaction_count
+                        c1_list, c2_list, _, indices_list = compact_kv_range(
+                            keys, values,
+                            compact_start=compact_start, compact_end=compact_end,
+                            target_ratio=state.compact_target_ratio,
+                            num_kv_heads=num_kv_heads, head_size=head_size,
+                            device=device, suffix_queries=query_vecs, seed=seed,
+                        )
+                        compacted_prefix_len = c1_list[0].shape[0]
+                    state.compaction_count += 1
+                    new_seq_len = compact_start + compacted_prefix_len + (kv_len - compact_end)
+                    _inject_compacted_kv(
+                        kv_caches, keys, values, c1_list, c2_list,
+                        state.block_ids, block_size, compact_start, num_layers,
+                        old_seq_len=kv_len, compact_window=turn_compact_window,
+                    )
+                    pos_off += kv_len - new_seq_len
+                    cur_sl = new_seq_len + 1
+                    if state.compaction_mode == "attention_matching_full":
+                        state.compacted_prefix_end = compact_start + compacted_prefix_len
+                    compaction_events[i].append({
+                        "kv_len_before": kv_len, "kv_len_after": new_seq_len,
+                        "compaction_indices": [idx.cpu().tolist() for idx in indices_list] if indices_list else None,
+                        "compact_window": turn_compact_window,
+                    })
+
+                state.turn_user_lens = state.turn_user_lens[-n_protect:] if n_protect > 0 else []
+                state.turn_asst_lens = state.turn_asst_lens[-n_protect:] if n_protect > 0 else []
+
+            state.current_seq_len = cur_sl
+            state.position_offset = pos_off
+            self._shrink_blocks(state.block_ids, cur_sl, block_size)
+
+            results.append({
+                "all_token_ids": all_token_ids[i],
+                "all_logprobs": all_logprobs[i],
+                "current_seq_len": cur_sl,
+                "diagnostics": {"compaction_events": compaction_events[i]},
+            })
+
+        logger.info(
+            "compact_session_step_batch: N=%d, total_response_tokens=%d, compactions=%d",
+            N, sum(len(t) for t in all_token_ids),
+            sum(len(e) for e in compaction_events),
+        )
+        return results
+
     def compact_session_delete(self, session_id: str) -> None:
         """Free session blocks by removing the session state."""
         getattr(self, "_sessions", {}).pop(session_id, None)
