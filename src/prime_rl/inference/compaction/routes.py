@@ -424,11 +424,20 @@ class _SessionCreateBatcher:
                 rank = 0
             by_rank.setdefault(rank, []).append((body, eos_token_id, future))
 
+        import time as _time
+        t0 = _time.monotonic()
+        rank_sizes = {r: len(g) for r, g in by_rank.items()}
+        logger.info(
+            "create_batcher: batch=%d, dp_engines=%s, ranks=%s",
+            len(batch), dp_engines is not None, rank_sizes,
+        )
+
         # Dispatch all DP ranks in parallel
         await asyncio.gather(*[
             self._dispatch_create_rank(engine, dp_engines, tokenizer, rank, group)
             for rank, group in by_rank.items()
         ])
+        logger.info("create_batcher: dispatch took %.3fs", _time.monotonic() - t0)
 
     async def _dispatch_create_rank(self, engine, dp_engines, tokenizer, rank, group):
         first = group[0][0]
@@ -603,11 +612,20 @@ class _SessionStepBatcher:
                 rank = 0
             by_rank.setdefault(rank, []).append((body, future))
 
+        import time as _time
+        t0 = _time.monotonic()
+        rank_sizes = {r: len(g) for r, g in by_rank.items()}
+        logger.info(
+            "step_batcher: batch=%d, normal=%d, dp_engines=%s, ranks=%s",
+            len(batch), len(normal), dp_engines is not None, rank_sizes,
+        )
+
         # Dispatch all DP ranks in parallel
         await asyncio.gather(*[
             self._dispatch_step_rank(engine, dp_engines, tokenizer, rank, group)
             for rank, group in by_rank.items()
         ])
+        logger.info("step_batcher: dispatch took %.3fs", _time.monotonic() - t0)
 
     async def _dispatch_step_rank(self, engine, dp_engines, tokenizer, rank, group):
         session_ids = [b.session_id for b, _ in group]
