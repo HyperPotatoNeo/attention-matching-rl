@@ -2829,6 +2829,66 @@ def _extract_kv(
     return keys, values
 
 
+def _write_to_blocks(
+    kv: torch.Tensor,
+    block_ids: list[int],
+    block_size: int,
+    start_pos: int,
+    data_k: torch.Tensor,
+    data_v: torch.Tensor,
+) -> None:
+    """Write N tokens of K/V data starting at start_pos into paged blocks.
+
+    Handles partial first/last blocks and vectorizes writes to complete middle blocks.
+    """
+    N = data_k.shape[0]
+    if N == 0:
+        return
+
+    end_pos = start_pos + N
+    first_block = start_pos // block_size
+    last_block = (end_pos - 1) // block_size
+
+    data_offset = 0
+    for b in range(first_block, last_block + 1):
+        block_start = b * block_size
+        write_start = max(start_pos, block_start)
+        write_end = min(end_pos, block_start + block_size)
+        count = write_end - write_start
+        block_offset = write_start - block_start
+
+        bid = block_ids[b]
+        kv[0, bid, block_offset:block_offset + count] = data_k[data_offset:data_offset + count]
+        kv[1, bid, block_offset:block_offset + count] = data_v[data_offset:data_offset + count]
+        data_offset += count
+
+
+def _zero_blocks(
+    kv: torch.Tensor,
+    block_ids: list[int],
+    block_size: int,
+    start_pos: int,
+    end_pos: int,
+) -> None:
+    """Zero out KV cache entries in positions [start_pos, end_pos)."""
+    if start_pos >= end_pos:
+        return
+
+    first_block = start_pos // block_size
+    last_block = (end_pos - 1) // block_size
+
+    for b in range(first_block, last_block + 1):
+        block_start = b * block_size
+        zero_start = max(start_pos, block_start)
+        zero_end = min(end_pos, block_start + block_size)
+        block_offset = zero_start - block_start
+        count = zero_end - zero_start
+
+        bid = block_ids[b]
+        kv[0, bid, block_offset:block_offset + count] = 0
+        kv[1, bid, block_offset:block_offset + count] = 0
+
+
 def _inject_compacted_kv(
     kv_caches: list[torch.Tensor],
     original_keys: list[torch.Tensor],
@@ -2842,37 +2902,37 @@ def _inject_compacted_kv(
     old_seq_len: int,
     compact_window: int | None = None,
 ) -> None:
-    """Write [prompt | compacted_prefix | suffix] into paged blocks, zeroing stale."""
-    # Pre-compute block mapping once (shared across layers)
-    num_blocks_to_touch = (old_seq_len + block_size - 1) // block_size
-    n_blocks = min(num_blocks_to_touch, len(block_ids))
-    bids = block_ids[:n_blocks]
+    """Write [prompt | compacted_prefix | suffix] into paged blocks.
 
+    Writes directly to affected blocks instead of allocating padded temporaries.
+    Prompt blocks are unchanged and skipped entirely.
+    """
     for layer_idx in range(num_layers):
         orig_K = original_keys[layer_idx]
         orig_V = original_values[layer_idx]
+        kv = kv_caches[layer_idx]
         asst_len = orig_K.shape[0] - prompt_len
         window = min(compact_window or asst_len, asst_len)
-        suffix_K = orig_K[prompt_len + window:]
-        suffix_V = orig_V[prompt_len + window:]
 
-        K = torch.cat([orig_K[:prompt_len], c1_list[layer_idx], suffix_K], dim=0)
-        V = torch.cat([orig_V[:prompt_len], c2_list[layer_idx], suffix_V], dim=0)
-        total_len = K.shape[0]
+        c1 = c1_list[layer_idx]
+        c2 = c2_list[layer_idx]
+        C = c1.shape[0]
+        suffix_len = asst_len - window
+        new_total = prompt_len + C + suffix_len
 
-        # Pad to full block-aligned length, then reshape into blocks
-        padded_len = n_blocks * block_size
-        K_padded = torch.zeros(padded_len, K.shape[1], K.shape[2],
-                               dtype=K.dtype, device=K.device)
-        V_padded = torch.zeros(padded_len, V.shape[1], V.shape[2],
-                               dtype=V.dtype, device=V.device)
-        K_padded[:total_len] = K
-        V_padded[:total_len] = V
+        # Write compacted keys/values at positions prompt_len..prompt_len+C
+        if C > 0:
+            _write_to_blocks(kv, block_ids, block_size, prompt_len, c1, c2)
 
-        # Reshape to (n_blocks, block_size, H, D) and scatter into kv_cache
-        kv = kv_caches[layer_idx]
-        kv[0, bids] = K_padded.view(n_blocks, block_size, K.shape[1], K.shape[2])
-        kv[1, bids] = V_padded.view(n_blocks, block_size, V.shape[1], V.shape[2])
+        # Shift suffix from old position to new position
+        if suffix_len > 0:
+            suffix_K = orig_K[prompt_len + window:]
+            suffix_V = orig_V[prompt_len + window:]
+            _write_to_blocks(kv, block_ids, block_size, prompt_len + C, suffix_K, suffix_V)
+
+        # Zero stale tail
+        if new_total < old_seq_len:
+            _zero_blocks(kv, block_ids, block_size, new_total, old_seq_len)
 
 
 def _fork_kv_blocks(
@@ -3021,40 +3081,37 @@ def _inject_compacted_range(
 ) -> int:
     """Write [prefix | compacted_region | suffix] into paged blocks.
 
+    Writes directly to affected blocks instead of allocating padded temporaries.
+    Prefix blocks (before compact_start) are unchanged and skipped entirely.
     Returns the new total sequence length after compaction.
     """
     compacted_len = c1_list[0].shape[0]
     suffix_start = compact_end
-    new_seq_len = compact_start + compacted_len + (old_seq_len - suffix_start)
-
-    num_blocks_to_touch = (old_seq_len + block_size - 1) // block_size
-    n_blocks = min(num_blocks_to_touch, len(block_ids))
-    bids = block_ids[:n_blocks]
+    suffix_len = old_seq_len - suffix_start
+    new_seq_len = compact_start + compacted_len + suffix_len
 
     for layer_idx in range(num_layers):
         orig_K = original_keys[layer_idx]
         orig_V = original_values[layer_idx]
-
-        prefix_K = orig_K[:compact_start]
-        prefix_V = orig_V[:compact_start]
-        suffix_K = orig_K[suffix_start:]
-        suffix_V = orig_V[suffix_start:]
-
-        K = torch.cat([prefix_K, c1_list[layer_idx], suffix_K], dim=0)
-        V = torch.cat([prefix_V, c2_list[layer_idx], suffix_V], dim=0)
-        total_len = K.shape[0]
-
-        padded_len = n_blocks * block_size
-        K_padded = torch.zeros(padded_len, K.shape[1], K.shape[2],
-                               dtype=K.dtype, device=K.device)
-        V_padded = torch.zeros(padded_len, V.shape[1], V.shape[2],
-                               dtype=V.dtype, device=V.device)
-        K_padded[:total_len] = K
-        V_padded[:total_len] = V
-
         kv = kv_caches[layer_idx]
-        kv[0, bids] = K_padded.view(n_blocks, block_size, K.shape[1], K.shape[2])
-        kv[1, bids] = V_padded.view(n_blocks, block_size, V.shape[1], V.shape[2])
+
+        c1 = c1_list[layer_idx]
+        c2 = c2_list[layer_idx]
+
+        # Write compacted region at compact_start
+        if compacted_len > 0:
+            _write_to_blocks(kv, block_ids, block_size, compact_start, c1, c2)
+
+        # Shift suffix from old position to new position
+        if suffix_len > 0:
+            suffix_K = orig_K[suffix_start:]
+            suffix_V = orig_V[suffix_start:]
+            _write_to_blocks(kv, block_ids, block_size,
+                             compact_start + compacted_len, suffix_K, suffix_V)
+
+        # Zero stale tail
+        if new_seq_len < old_seq_len:
+            _zero_blocks(kv, block_ids, block_size, new_seq_len, old_seq_len)
 
     return new_seq_len
 
