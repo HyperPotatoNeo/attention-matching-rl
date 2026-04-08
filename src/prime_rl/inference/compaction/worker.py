@@ -2618,6 +2618,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 state.block_ids = state.block_ids + free_blocks[:extra_needed]
 
         # --- Batched append-prefill ---
+        t_prefill_start = time.time()
         existing_seq_lens = [s.current_seq_len - 1 for s in states]
         position_offsets = [s.position_offset for s in states]
         per_seq_blocks = [s.block_ids for s in states]
@@ -2722,6 +2723,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         active = [True] * B
         max_resp = max(max_response_tokens_list)
         step = 0
+        t_decode_start = time.time()
 
         # --- Batched decode loop ---
         with set_forward_context(
@@ -2760,6 +2762,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     break
 
         # --- Post-decode: update state + per-session compaction ---
+        t_postdecode_start = time.time()
         results = []
         for i, state in enumerate(states):
             current_seq_len = current_seq_lens_t[i].item()
@@ -2855,12 +2858,17 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 "diagnostics": {"compaction_events": compaction_events},
             })
 
+        t_postdecode = time.time()
         logger.info(
             "compact_session_step_batch: B=%d, avg_response=%.0f tokens, "
-            "compactions=%d, %.3fs",
+            "compactions=%d, %.3fs (alloc=%.3f, prefill=%.3f, decode=%.3f, compact=%.3f)",
             B, sum(len(t) for t in all_token_ids) / B,
             sum(1 for r in results if r["diagnostics"]["compaction_events"]),
             time.time() - t_start,
+            t_prefill_start - t_start,
+            t_decode_start - t_prefill_start,
+            t_postdecode_start - t_decode_start,
+            t_postdecode - t_postdecode_start,
         )
 
         return results
