@@ -1937,7 +1937,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             vllm_config=vllm_config,
             device=device,
         )
-        decode_ctx.metadata.max_seq_len = max_possible_len
+        decode_ctx.metadata.max_seq_len = initial_len
 
         compaction_events = []
 
