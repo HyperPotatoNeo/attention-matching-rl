@@ -2354,6 +2354,14 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
     def _get_device(self) -> torch.device:
         return next(self._get_model().parameters()).device
 
+    def get_block_budget(self) -> dict:
+        """Return free block count and block size for adaptive batch sizing."""
+        kv_shape = self.model_runner.kv_caches[0].shape
+        num_total_blocks = kv_shape[1]
+        block_size = kv_shape[2]
+        free = self._find_free_blocks(num_total_blocks)
+        return {"free_blocks": len(free), "block_size": block_size}
+
     def _find_free_blocks(self, num_total_blocks: int) -> list[int]:
         used = set()
         for req in self.model_runner.requests.values():

@@ -12,6 +12,7 @@ compacted memory.
 
 import asyncio
 import logging
+import math
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
@@ -96,7 +97,7 @@ async def _session_rpc(engine, method: str, session_id: str, args: tuple = (), k
     return await engine.collective_rpc(method, args=args, kwargs=kwargs)
 
 MAX_BATCH_SIZE = 32
-MAX_WAIT_SECONDS = 1.0
+MAX_WAIT_SECONDS = 0.1
 
 
 class CompactGenerateRequest(BaseModel):
@@ -201,6 +202,32 @@ class _RequestBatcher:
             max_prompt = max(len(p) for p in prompt_ids_list)
             available = first_body.max_seq_len - max_prompt
             max_tokens_per_segment = available // max(first_body.n_compacts + 1, 1)
+
+        # Adaptive batch sizing: cap B at what the block budget can support.
+        try:
+            block_info = (await engine.collective_rpc("get_block_budget"))[0]
+            free_blocks = block_info["free_blocks"]
+            block_size = block_info["block_size"]
+            max_prompt = max(len(p) for p in prompt_ids_list)
+            if first_body.max_kv_len is not None:
+                max_possible_len = max(first_body.max_kv_len, max_prompt + 2)
+            else:
+                seg = first_body.max_tokens_per_segment or (
+                    (first_body.max_seq_len - max_prompt) // max(first_body.n_compacts + 1, 1))
+                max_possible_len = max_prompt + seg * (first_body.n_compacts + 1)
+            blocks_per_seq = math.ceil(max_possible_len / block_size)
+            max_B = max(1, free_blocks // blocks_per_seq) if blocks_per_seq > 0 else B
+            if max_B < B:
+                logger.warning(
+                    "Block budget allows %d seqs (%d blocks/seq, %d free), capping from %d",
+                    max_B, blocks_per_seq, free_blocks, B)
+                for req_future in batch[max_B:]:
+                    await self._queue.put(req_future)
+                batch = batch[:max_B]
+                prompt_ids_list = prompt_ids_list[:max_B]
+                B = max_B
+        except Exception as e:
+            logger.debug("Block budget query failed, using full batch: %s", e)
 
         logger.info("Auto-batch: B=%d, max_kv_len=%s, max_total_tokens=%s",
                      B, first_body.max_kv_len, first_body.max_total_tokens)
