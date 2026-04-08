@@ -85,6 +85,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         segment_boundaries=training_example.segment_boundaries,
         compaction_indices=training_example.compaction_indices,
         compact_windows=training_example.compact_windows,
+        system_prompt_len=training_example.system_prompt_len,
         # Multimodal fields (Qwen3-VL) - passed through without modification
         pixel_values=training_example.pixel_values,
         pixel_values_shape=training_example.pixel_values_shape,

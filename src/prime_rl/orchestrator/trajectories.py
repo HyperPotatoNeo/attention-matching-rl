@@ -93,6 +93,7 @@ def interleave_rollout(
         segment_boundaries = extras.get("segment_boundaries")
         compaction_indices = extras.get("compaction_indices")
         compact_windows = extras.get("compact_windows")
+        system_prompt_len = extras.get("system_prompt_len")
 
         return TrainingSample(
             prompt_ids=list(tokens["prompt_ids"]),
@@ -107,6 +108,7 @@ def interleave_rollout(
             segment_boundaries=segment_boundaries,
             compaction_indices=compaction_indices,
             compact_windows=compact_windows,
+            system_prompt_len=system_prompt_len,
         )
 
     def extend_sample(sample: TrainingSample, step: vf.TrajectoryStep, prefix_len: int) -> None:

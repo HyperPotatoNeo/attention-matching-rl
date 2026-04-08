@@ -5,20 +5,20 @@
 
 max_steps = 600
 seq_len = 6000
-output_dir = "/network/scratch/e/emiliano.penaloza/outputs/babyai-summary-debug"
+output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/rebuttal/summary"
 
 [model]
 name = "Qwen/Qwen3-4B-Instruct-2507"
 
 [wandb]
-project = "balrog-rl"
-name = "balrog-babyai-turn-summary-debug"
+project = "balrog-rl-good"
+name = "balrog-babyai-turn-summary"
 
 [trainer.wandb]
-id = "babyai-turn-summary-trainer-debug"
+id = "babyai-turn-summary-trainer"
 
 [orchestrator.wandb]
-id = "babyai-turn-summary-orch-debug"
+id = "babyai-turn-summary-orch"
 
 [ckpt]
 interval = 5
@@ -29,7 +29,7 @@ num_train_gpus = 2
 num_infer_gpus = 2
 
 [inference]
-gpu_memory_utilization = 0.85
+gpu_memory_utilization = 0.95
 
 [inference.model]
 enforce_eager = true
@@ -60,9 +60,9 @@ betas2 = 0.9
 type = "default"
 
 [orchestrator]
-batch_size = 8
+batch_size = 64
 rollouts_per_example = 4
-max_inflight_rollouts = 16
+max_inflight_rollouts = 64
 
 [orchestrator.client]
 base_url = ["http://localhost:8000/v1"]
@@ -78,7 +78,7 @@ args = { gym = "balrog-bench", max_kv_len = 6000, max_response_tokens = 512, com
 
 [orchestrator.eval]
 interval = 5
-num_examples = 5
+num_examples = 50
 rollouts_per_example = 1
 
 [orchestrator.eval.sampling]

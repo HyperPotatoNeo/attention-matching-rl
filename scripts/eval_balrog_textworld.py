@@ -498,9 +498,11 @@ def run_episode(task_name, idx, port, args, tokenizer=None, model_name=None, sav
     env.close()
     elapsed = time.time() - t0
 
-    # TextWorld scoring: continuous score scaled to 0-100
-    score = min(max(episode_return * 10.0, 0.0), 100.0)
-    success = terminated and episode_return > 0
+    # TextWorld scoring: normalize by max_score from the game
+    max_score = info.get("max_score", 1) if isinstance(info, dict) else 1
+    max_score = max(max_score, 1)
+    score = min(max(episode_return / max_score * 100.0, 0.0), 100.0)
+    success = info.get("won", False) if isinstance(info, dict) else False
 
     result = {
         "idx": idx,

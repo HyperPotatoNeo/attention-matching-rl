@@ -4,9 +4,12 @@ Used by both the inference worker (vLLM server-side) and the trainer (FSDP2 trai
 to compact KV caches using the same algorithm.
 """
 
+import logging
 import math
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def _solve_beta_nnls(
@@ -157,6 +160,14 @@ def compact_kv_range(
 
         if forced_indices is not None:
             topk_indices = forced_indices[layer_idx].to(device=device, dtype=torch.int64)
+            if (topk_indices >= region_len).any() or (topk_indices < 0).any():
+                logger.warning(
+                    "forced_indices out of bounds (max=%d, region_len=%d) at layer %d, "
+                    "falling back to importance scoring",
+                    topk_indices.max().item(), region_len, layer_idx,
+                )
+                importance = region_attn.pow(2).mean(dim=1).sqrt()
+                topk_indices = importance.topk(target_len, dim=-1).indices
             topk_indices = topk_indices.sort(dim=-1).values
         else:
             importance = region_attn.pow(2).mean(dim=1).sqrt()  # (H, region_len)

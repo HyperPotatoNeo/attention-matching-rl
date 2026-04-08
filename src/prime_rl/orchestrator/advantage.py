@@ -45,6 +45,12 @@ def default_advantage_fn(inputs: AdvantageInputs, length_weighted_mean: bool = F
     return AdvantageOutputs(advantages=inputs.rewards - baseline)
 
 
+def batch_mean_advantage_fn(inputs: AdvantageInputs) -> AdvantageOutputs:
+    """REINFORCE with batch-mean baseline: reward minus mean reward across the entire batch."""
+    baseline = inputs.rewards.mean()
+    return AdvantageOutputs(advantages=inputs.rewards - baseline)
+
+
 def setup_advantage_fn(config: AdvantageConfig) -> AdvantageFn:
     """Setup advantage function from config."""
     if isinstance(config, CustomAdvantageConfig):

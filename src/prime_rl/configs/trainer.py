@@ -17,7 +17,7 @@ from prime_rl.utils.config import BaseConfig
 
 # -- Shared trainer configs (used by both SFT and RL trainers) --
 
-AttnImplementation: TypeAlias = Literal["sdpa", "flash_attention_2", "flash_attention_3", "fa4"]
+AttnImplementation: TypeAlias = Literal["sdpa", "flash_attention_2", "flash_attention_3", "fa4", "flex_attention"]
 
 # User-facing name -> internal name. Users set `flash_attention_4` in configs,
 # which gets rewritten to `fa4` before pydantic validation.
@@ -683,7 +683,7 @@ class TrainerConfig(BaseConfig):
     ] = False
     compaction_mode: Annotated[
         str,
-        Field(description="Compaction mode: 'attention_matching' (default), 'attention_matching_full' (stack compacted blocks), or 'markovian' (hard-delete window)."),
+        Field(description="Compaction mode: 'attention_matching', 'attention_matching_full', 'markovian', 'markovian_pure', 'kv_markovian_grad' (single-pass + deletion mask), or 'kv_summary_grad'."),
     ] = "attention_matching"
 
     memory_profiler_path: Annotated[Path | None, Field(description="Path to write memory profile to.")] = None

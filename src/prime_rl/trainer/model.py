@@ -63,26 +63,36 @@ torch._dynamo.config.cache_size_limit = 64  # default: 8
 def freeze_vision_encoder(model: nn.Module) -> None:
     """Freeze the vision encoder parameters for VLM training.
 
-    For Qwen3-VL, the vision encoder is at model.model.visual.
-    This freezes all parameters in the vision encoder so only the
-    language model (with LoRA) is trained.
+    Freezes all non-language-model components so only the text LM is trained.
+    Supports Qwen3-VL (model.model.visual) and Mistral3 (model.model.vision_tower +
+    model.model.multi_modal_projector).
     """
     logger = get_logger()
+    modules_to_freeze: list[tuple[str, nn.Module]] = []
 
-    # Qwen3-VL structure: model.model.visual
     if hasattr(model, "model") and hasattr(model.model, "visual"):
-        vision_encoder = model.model.visual
-    # Qwen2-VL structure: model.visual
+        modules_to_freeze.append(("visual", model.model.visual))
     elif hasattr(model, "visual"):
-        vision_encoder = model.visual
-    else:
-        raise ValueError("Could not find vision encoder to freeze. Expected model.model.visual or model.visual")
+        modules_to_freeze.append(("visual", model.visual))
+
+    if hasattr(model, "model") and hasattr(model.model, "vision_tower"):
+        modules_to_freeze.append(("vision_tower", model.model.vision_tower))
+    if hasattr(model, "model") and hasattr(model.model, "multi_modal_projector"):
+        modules_to_freeze.append(("multi_modal_projector", model.model.multi_modal_projector))
+
+    if not modules_to_freeze:
+        raise ValueError(
+            "Could not find vision encoder to freeze. "
+            "Expected model.model.visual, model.model.vision_tower, or model.visual"
+        )
 
     num_frozen = 0
-    for param in vision_encoder.parameters():
-        param.requires_grad = False
-        num_frozen += 1
-    logger.info(f"Froze {num_frozen} parameters in vision encoder")
+    for name, module in modules_to_freeze:
+        for param in module.parameters():
+            param.requires_grad = False
+            num_frozen += 1
+        logger.info(f"Froze {name} ({sum(1 for _ in module.parameters())} params)")
+    logger.info(f"Froze {num_frozen} vision parameters total")
 
 
 def freeze_moe_router(model: nn.Module) -> None:
@@ -197,6 +207,14 @@ def get_model(
     # The model should load in its default dtype (bf16) to match vLLM inference.
     # The FSDP MixedPrecisionPolicy handles compute dtype separately.
 
+    # Composition models (e.g. Mistral3) wrap a text LM + vision encoder.
+    # Extract the text-only config so AutoModelForCausalLM can load it directly,
+    # matching the architecture vLLM uses internally for inference.
+    if not is_vlm and getattr(model_config, "is_composition", False) and hasattr(model_config, "text_config"):
+        logger.info(f"Extracting text-only config from composition model {config.name}")
+        model_config.text_config._composition_source = config.name
+        model_config = model_config.text_config
+
     logger.debug(f"Loaded model config ({model_config.to_dict()})")
 
     if config.debug.num_layers is not None:
@@ -239,6 +257,25 @@ def get_model(
         if device == torch.device("meta"):
             logger.info(f"Loading model {config.name} using {model_cls.__name__} to meta device")
             model = model_cls.from_config(model_config, trust_remote_code=config.trust_remote_code, **dtype_kwarg)
+        elif getattr(model_config, "_composition_source", None):
+            # Composition model on CPU: create model then load remapped weights directly
+            # from safetensors (from_pretrained can't handle the key prefix mismatch)
+            logger.info(f"Loading composition text-only model {config.name} to CPU with key remapping")
+            model = model_cls.from_config(model_config, trust_remote_code=config.trust_remote_code, **dtype_kwarg)
+            from huggingface_hub import snapshot_download
+            snap = Path(snapshot_download(repo_id=config.name, repo_type="model")) if not Path(config.name).exists() else Path(config.name)
+            from prime_rl.trainer.weights import load_state_dict
+            full_sd = load_state_dict(snap)
+            remapped = {}
+            for k, v in full_sd.items():
+                if k.startswith(("vision_tower.", "multi_modal_projector.")):
+                    continue
+                if k.startswith("language_model."):
+                    remapped[k[len("language_model."):]] = v
+                else:
+                    remapped[k] = v
+            model.load_state_dict(remapped, strict=False)
+            del full_sd, remapped
         else:
             logger.info(f"Loading model {config.name} using {model_cls.__name__} to CPU")
             model = model_cls.from_pretrained(
@@ -289,23 +326,25 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
 
         dp_mod_ep_mesh = parallel_dims.world_mesh[tuple(dp_mod_ep_mesh_dim_names)]
 
-    # For VLM models, shard the frozen vision encoder as a single unit
-    # This allows FSDP to manage the memory while keeping it frozen
+    # For VLM models, shard frozen vision components as single units
     is_vlm = is_vlm_model(config.name)
     if is_vlm:
+        vision_modules: list[tuple[str, nn.Module]] = []
         if hasattr(model, "model") and hasattr(model.model, "visual"):
-            vision_encoder = model.model.visual
+            vision_modules.append(("visual", model.model.visual))
         elif hasattr(model, "visual"):
-            vision_encoder = model.visual
-        else:
+            vision_modules.append(("visual", model.visual))
+        if hasattr(model, "model") and hasattr(model.model, "vision_tower"):
+            vision_modules.append(("vision_tower", model.model.vision_tower))
+        if hasattr(model, "model") and hasattr(model.model, "multi_modal_projector"):
+            vision_modules.append(("multi_modal_projector", model.model.multi_modal_projector))
+
+        if not vision_modules:
             raise ValueError(f"VLM model {config.name} does not have a recognized vision encoder attribute")
 
-        fully_shard(
-            vision_encoder,
-            mesh=hsdp_mesh,
-            **fsdp_config,
-        )
-        get_logger().info("Applied FSDP to frozen vision encoder")
+        for name, module in vision_modules:
+            fully_shard(module, mesh=hsdp_mesh, **fsdp_config)
+            get_logger().info(f"Applied FSDP to frozen {name}")
 
     # Get the language model layers (handle VLM structure)
     # For Qwen3-VL: model.model.language_model contains the transformer layers
@@ -467,6 +506,32 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
 
     # All ranks wait for master rank to finish conversion
     torch.distributed.barrier()
+
+    # Composition models (e.g. Mistral3): the HF snapshot stores weights with
+    # a "language_model." prefix, but the text-only model expects bare keys.
+    # Create a one-time remapped snapshot that strips the prefix.
+    composition_source = getattr(model.config, "_composition_source", None)
+    if composition_source:
+        snapshot_keys = load_state_dict_keys(snapshot_path)
+        has_composition_prefix = any(k.startswith("language_model.") for k in snapshot_keys)
+        model_has_prefix = any(k.startswith("language_model.") for k in model.state_dict())
+        if has_composition_prefix and not model_has_prefix:
+            remapped_path = snapshot_path / "text_only"
+            if not remapped_path.exists() and get_world().is_master:
+                logger.info(f"Remapping composition weights: stripping language_model. prefix → {remapped_path}")
+                full_sd = load_state_dict(snapshot_path)
+                remapped = {}
+                for k, v in full_sd.items():
+                    if k.startswith(("vision_tower.", "multi_modal_projector.")):
+                        continue
+                    if k.startswith("language_model."):
+                        remapped[k[len("language_model."):]] = v
+                    else:
+                        remapped[k] = v
+                save_state_dict(remapped, remapped_path)
+                del full_sd, remapped
+            torch.distributed.barrier()
+            snapshot_path = remapped_path
 
     logger.info(f"Loading weights using HF DCP from {snapshot_path}")
     load_dcp_start_time = time.perf_counter()
@@ -724,6 +789,7 @@ def forward(
     # Multimodal fields (Qwen3-VL)
     pixel_values: Float[Tensor, "num_patches patch_dim"] | None = None,
     image_grid_thw: Int[Tensor, "num_images 3"] | None = None,
+    attention_mask=None,
 ) -> PrimeLmOutput:
     # Build kwargs for model forward
     kwargs = {
@@ -731,6 +797,9 @@ def forward(
         "labels": labels,
         "temperature": temperature,
     }
+
+    if attention_mask is not None:
+        kwargs["attention_mask"] = attention_mask
 
     # For multimodal (VLM), don't pass position_ids - let the model compute MRoPE internally
     # using image_grid_thw. Qwen3-VL only computes proper MRoPE when position_ids is None.

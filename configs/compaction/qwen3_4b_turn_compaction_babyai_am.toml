@@ -4,20 +4,21 @@
 
 max_steps = 600
 seq_len = 6000
-output_dir = "/network/scratch/e/emiliano.penaloza/outputs/balrog-babyai-good-full"
+output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/rebuttal/am-recursive2"
+
 
 [model]
 name = "Qwen/Qwen3-4B-Instruct-2507"
 
 [wandb]
-project = "balrog-rl"
-name = "balrog-babyai-turn-am-full"
+project = "balrog-rl-good"
+name = "balrog-babyai-turn-am-recursive2"
 
 [trainer.wandb]
-id = "babyai-turn-am-trainer-full"
+id = "babyai-turn-am-trainer-full-recursive2"
 
 [orchestrator.wandb]
-id = "babyai-turn-am-orch"
+id = "babyai-turn-am-orch-recursive2"
 
 [ckpt]
 interval = 5
@@ -28,7 +29,7 @@ num_train_gpus = 2
 num_infer_gpus = 2
 
 [inference]
-gpu_memory_utilization = 0.85
+gpu_memory_utilization = 0.95
 
 [inference.model]
 enforce_eager = true
@@ -62,7 +63,7 @@ type = "default"
 [orchestrator]
 batch_size = 64
 rollouts_per_example = 4
-max_inflight_rollouts = 16
+max_inflight_rollouts = 64
 
 
 [orchestrator.client]
@@ -75,11 +76,11 @@ temperature = 1.0
 [[orchestrator.env]]
 id = "turn_compaction_env"
 name = "balrog-babyai-turn-am"
-args = { gym = "balrog-bench", max_kv_len = 3000, max_response_tokens = 512, compact_target_ratio = 0.25, n_max_turns = 4, n_preserved_turns = 2, max_turns = 30, compaction_mode = "attention_matching", use_suffix_queries = true, environments = ["babyai"], max_text_history = 16 }
+args = { gym = "balrog-bench", max_kv_len = 6000, max_response_tokens = 512, compact_target_ratio = 0.25, n_max_turns = 4, n_preserved_turns = 2, max_turns = 30, compaction_mode = "attention_matching", use_suffix_queries = true, environments = ["babyai"], max_text_history = 16 }
 
 [orchestrator.eval]
 interval = 5
-num_examples = 5
+num_examples = 50
 rollouts_per_example = 1
 
 [orchestrator.eval.sampling]
@@ -89,4 +90,4 @@ max_tokens = 512
 [[orchestrator.eval.env]]
 id = "turn_compaction_env"
 name = "balrog-babyai-turn-am-eval"
-args = { gym = "balrog-bench", max_kv_len = 3000, max_response_tokens = 512, compact_target_ratio = 0.25, n_max_turns = 4, n_preserved_turns = 2, max_turns = 30, compaction_mode = "attention_matching", use_suffix_queries = true, environments = ["babyai"], max_text_history = 16 }
+args = { gym = "balrog-bench", max_kv_len = 6000, max_response_tokens = 512, compact_target_ratio = 0.25, n_max_turns = 4, n_preserved_turns = 2, max_turns = 30, compaction_mode = "attention_matching", use_suffix_queries = true, environments = ["babyai"], max_text_history = 16 }

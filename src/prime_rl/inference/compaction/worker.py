@@ -53,6 +53,7 @@ class SessionState:
     turn_asst_lens: list[int]
     n_max_turns: int       # -1 = disabled (use KV-budget mode)
     n_preserved_turns: int  # turns to keep verbatim after compaction fires
+    system_prompt_len: int | None = None
     compaction_count: int = 0
     compacted_prefix_end: int = 0  # stacking cursor for attention_matching_full
     last_access: float = 0.0
@@ -1854,6 +1855,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         use_suffix_queries: bool = True,
         n_max_turns: int = -1,
         n_preserved_turns: int = 0,
+        system_prompt_len: int | None = None,
     ) -> dict:
         """Create a persistent KV session, prefill prompt, generate first response."""
         if not hasattr(self, "_sessions"):
@@ -1881,9 +1883,12 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         num_kv_heads = kv_shape[3]
         head_size = kv_shape[4]
 
-        # Allocate a fixed block budget covering max_kv_len + max_response_tokens.
-        # attention_matching_full stacks compacted blocks so the KV grows over time;
-        # allocate 2x to avoid OOB during generation before compaction fires.
+        # Allocate a fixed block budget for the entire session lifetime.
+        # The caller (TurnCompactionEnv) already inflates max_kv_len to cover
+        # n_max_turns turns (prompt + n_max_turns * (max_response_tokens + obs_tokens)).
+        # attention_matching_full stacks compacted blocks so allocate 2x to avoid
+        # OOB during generation before compaction fires.
+        # Step-time dynamic extension (compact_session_step) handles any overflow.
         if compaction_mode == "attention_matching_full":
             max_possible_len = max_kv_len * 2 + max_response_tokens
         else:
@@ -2009,6 +2014,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             turn_asst_lens=[len(all_token_ids)],
             n_max_turns=n_max_turns,
             n_preserved_turns=n_preserved_turns,
+            system_prompt_len=system_prompt_len,
             compacted_prefix_end=prompt_len,
             last_access=time.monotonic(),
         )
@@ -2033,10 +2039,14 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         session_id: str,
         new_token_ids: list[int],
         max_response_tokens: int,
+        is_summary: bool = False,
+        trigger_compact: bool = False,
     ) -> dict:
         """Append new_token_ids to existing session KV and generate a response.
 
         new_token_ids = [boundary_token_from_prev_step] + [new_user_turn_tokens]
+        is_summary: if True, don't count this step as a real turn (used for kv_summary mode).
+        trigger_compact: if True, force-fire turn-based compaction after this step.
         """
         state = self._sessions[session_id]
         state.last_access = time.monotonic()
@@ -2048,6 +2058,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         kv_caches = self.model_runner.kv_caches
         num_layers = len(kv_caches)
         kv_shape = kv_caches[0].shape
+        num_total_blocks = kv_shape[1]
         block_size = kv_shape[2]
         num_kv_heads = kv_shape[3]
         head_size = kv_shape[4]
@@ -2058,6 +2069,21 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         # existing_seq_len is the position where boundary token's KV will be written
         existing_seq_len = state.current_seq_len - 1
         new_ids_t = torch.tensor(new_token_ids, dtype=torch.long, device=device)
+
+        # In turn-based mode the KV grows across turns before compaction fires.
+        # Extend state.block_ids to cover this step's append + full decode phase.
+        max_seq_len_this_step = existing_seq_len + len(new_token_ids) + max_response_tokens
+        blocks_required = math.ceil(max_seq_len_this_step / block_size)
+        if blocks_required > len(state.block_ids):
+            extra_needed = blocks_required - len(state.block_ids)
+            free_blocks = self._find_free_blocks(num_total_blocks)
+            if len(free_blocks) < extra_needed:
+                raise RuntimeError(
+                    f"compact_session_step: session={session_id!r} needs {extra_needed} extra "
+                    f"blocks (have {len(state.block_ids)}, need {blocks_required} for "
+                    f"seq_len={max_seq_len_this_step}), but only {len(free_blocks)} free"
+                )
+            state.block_ids = state.block_ids + free_blocks[:extra_needed]
 
         logits = _prefill_append(
             model, new_ids_t,
@@ -2194,14 +2220,19 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 current_seq_len += 1
                 seg_count += 1
 
-        # Record completed turn
-        user_len = len(new_token_ids) - 1  # minus boundary token
-        asst_len = len(all_token_ids)
-        state.turn_user_lens.append(user_len)
-        state.turn_asst_lens.append(asst_len)
+        # Record completed turn (skip for summary steps — they don't count as real turns)
+        if not is_summary:
+            user_len = len(new_token_ids) - 1  # minus boundary token
+            asst_len = len(all_token_ids)
+            state.turn_user_lens.append(user_len)
+            state.turn_asst_lens.append(asst_len)
 
-        # Turn-based compaction: fires when accumulated turns reach n_max_turns
-        if state.n_max_turns >= 0 and len(state.turn_asst_lens) >= state.n_max_turns:
+        # Turn-based compaction: fires when accumulated turns reach n_max_turns,
+        # or immediately when trigger_compact=True (kv_summary mode).
+        should_compact = trigger_compact or (
+            not is_summary and state.n_max_turns >= 0 and len(state.turn_asst_lens) >= state.n_max_turns
+        )
+        if should_compact:
             kv_len = current_seq_len - 1  # boundary token not yet in KV
 
             n_protect = state.n_preserved_turns
@@ -2775,8 +2806,8 @@ def _extract_kv(
         kv = kv_caches[layer_idx]
         k_gathered = kv[0][bids].reshape(-1, kv.shape[3], kv.shape[4])[:seq_len]
         v_gathered = kv[1][bids].reshape(-1, kv.shape[3], kv.shape[4])[:seq_len]
-        keys.append(k_gathered.clone())
-        values.append(v_gathered.clone())
+        keys.append(k_gathered)
+        values.append(v_gathered)
 
     return keys, values
 
@@ -2916,6 +2947,12 @@ def _prefill_append_chunk(
     for pos in range(existing_seq_len, total_seq_len):
         block_idx = pos // block_size
         offset = pos % block_size
+        assert block_idx < len(block_ids), (
+            f"KV position {pos} requires block_idx={block_idx} but only "
+            f"{len(block_ids)} blocks allocated (block_size={block_size}, "
+            f"existing_seq_len={existing_seq_len}, n_new={n_new}). "
+            "Increase max_kv_len or reduce n_max_turns/max_response_tokens."
+        )
         slots.append(block_ids[block_idx] * block_size + offset)
     slot_mapping = torch.tensor(slots, dtype=torch.int64, device=device)
 

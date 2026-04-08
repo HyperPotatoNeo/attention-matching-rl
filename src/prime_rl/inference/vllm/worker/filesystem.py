@@ -31,8 +31,12 @@ class FileSystemWeightUpdateWorker(Worker):
             model = model_runner.model
         assert isinstance(model, Module)
 
-        # Get vLLM model loader
-        model_loader = get_model_loader(self.load_config)
+        # Broadcasts are always written in HF safetensors format, so override
+        # load_format to "safetensors" regardless of the server's config
+        # (e.g. load_format="mistral" would fail on HF-sharded files).
+        from dataclasses import replace
+        load_config = replace(self.load_config, load_format="safetensors")
+        model_loader = get_model_loader(load_config)
         assert isinstance(model_loader, DefaultModelLoader)
         local_source = DefaultModelLoader.Source(
             weight_path,

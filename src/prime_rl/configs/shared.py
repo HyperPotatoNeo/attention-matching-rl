@@ -218,6 +218,8 @@ class WandbConfig(BaseConfig):
 
     offline: Annotated[bool, Field(description="Whether to run W&B in offline mode.")] = False
 
+    tags: Annotated[list[str], Field(description="Tags for the W&B run.")] = []
+
     # Individual configs (can only be specified on trainer or orchestrator)
     id: Annotated[
         str | None,

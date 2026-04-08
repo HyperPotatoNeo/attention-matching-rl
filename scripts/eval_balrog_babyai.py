@@ -321,7 +321,7 @@ def run_episode(env_name, idx, port, args, tokenizer=None, model_name=None, save
                 n_summary_resets += 1
             history = history[-n_keep:] if n_keep > 0 else []
             last_summary_idx = 0
-            window_turns = n_keep
+            window_turns = 0
 
         if args.mode == "summary" and cumulative_summary:
             messages = build_messages_with_summary(

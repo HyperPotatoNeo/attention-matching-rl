@@ -39,7 +39,7 @@ from prime_rl.trainer.model import (
     is_tt_moe_model,
     get_load_balance_stats,
 )
-from prime_rl.trainer.rl.compaction import segmented_forward
+from prime_rl.trainer.rl.compaction import segmented_forward, build_markovian_grad_mask, GRAD_COMPACTION_MODES
 from prime_rl.trainer.parallel_dims import get_parallel_dims
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.utils import (
@@ -415,7 +415,33 @@ def train(config: TrainerConfig):
             dist.all_reduce(max_forwards_t, op=dist.ReduceOp.MAX)
             max_forwards = int(max_forwards_t.item())
 
-            if max_forwards > 0:
+            if max_forwards > 0 and config.compaction_mode in GRAD_COMPACTION_MODES:
+                # Grad compaction: single forward pass with deletion mask
+                prompt_len = input_ids.shape[1] - seg_boundaries[-1] if seg_boundaries is not None else 0
+                sys_prompt_len = micro_batch.get("system_prompt_len") or prompt_len
+                num_heads = getattr(model.config, "num_attention_heads", None) or model.config.text_config.num_attention_heads
+                deletion_mask = build_markovian_grad_mask(
+                    seq_len=input_ids.shape[1],
+                    prompt_len=prompt_len,
+                    system_prompt_len=sys_prompt_len,
+                    segment_boundaries=seg_boundaries or [],
+                    compact_windows=compact_windows or [],
+                    num_heads=num_heads,
+                    device=input_ids.device,
+                )
+                out = forward(
+                    model,
+                    input_ids,
+                    forward_position_ids,
+                    labels=labels,
+                    temperature=temperatures,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    routed_experts=routed_experts,
+                    attention_mask=deletion_mask,
+                )
+
+            elif max_forwards > 0:
                 # At least one DP rank has compaction — all ranks use segmented_forward
                 if seg_boundaries is None:
                     seg_boundaries = [input_ids.shape[1]]
@@ -489,6 +515,7 @@ def train(config: TrainerConfig):
                     compaction_mode=config.compaction_mode,
                     compact_windows=compact_windows,
                     segment_loss_fn=_segment_loss_fn,
+                    system_prompt_len=micro_batch.get('system_prompt_len'),
                 )
 
                 # Aggregate per-segment stats for logging
@@ -527,7 +554,7 @@ def train(config: TrainerConfig):
                 # VanillaOutputLinear was used or segmented forward - compute logprobs from logits
                 assert out.get("logits") is not None, "Logits must be provided to compute logprobs"
                 logits = out["logits"]
-                if seg_boundaries is not None:
+                if seg_boundaries is not None and config.compaction_mode not in GRAD_COMPACTION_MODES:
                     # Segmented forward already applied temperature
                     scaled_logits = logits
                 else:

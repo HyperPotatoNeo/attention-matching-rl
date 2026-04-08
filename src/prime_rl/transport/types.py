@@ -36,6 +36,10 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # where protected turns narrow the window).
     compact_windows: list[int] | None = None
 
+    # Compaction training: length of system prompt tokens only (excludes U0).
+    # Used as compact_start so U0 enters the compaction window.
+    system_prompt_len: int | None = None
+
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A batch of training examples with metadata for transport."""
@@ -67,6 +71,9 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
 
     # Compaction training: per-event compact_window from inference
     compact_windows: list[int] | None = None
+
+    # Compaction training: system prompt length (excludes U0) for compact_start
+    system_prompt_len: int | None = None
 
     # Multimodal fields (Qwen3-VL) — pixel_values stored as raw float32 bytes for efficient serialization
     pixel_values: bytes | None = None

@@ -27,6 +27,7 @@ from collections.abc import Callable
 
 import torch
 from torch import Tensor
+from torch.nn.attention.flex_attention import create_block_mask
 from transformers import DynamicCache
 
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
@@ -36,6 +37,47 @@ from prime_rl.trainer.models.layers.lora import base as lora_base
 from prime_rl.trainer.models.layers.lora import MultiLoRALinear
 
 logger = logging.getLogger(__name__)
+
+
+GRAD_COMPACTION_MODES = ("kv_markovian_grad", "kv_summary_grad")
+
+
+def build_markovian_grad_mask(
+    seq_len: int,
+    prompt_len: int,
+    system_prompt_len: int,
+    segment_boundaries: list[int],
+    compact_windows: list[int],
+    num_heads: int,
+    device: torch.device,
+) -> "BlockMask":
+    """Build a FlexAttention BlockMask replicating markovian compaction.
+
+    Standard causal attention with growing blocked-out regions at each
+    compaction boundary. For queries after boundary i, tokens in the
+    cumulatively deleted range [spl, spl + sum(cw[0:i+1])) are masked out.
+    """
+    boundaries = []
+    cumulative_end = system_prompt_len
+    for i, cw in enumerate(compact_windows):
+        if cw is None:
+            continue
+        cumulative_end += cw
+        boundary_pos = prompt_len + segment_boundaries[i]
+        boundaries.append((boundary_pos, system_prompt_len, cumulative_end))
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        causal = q_idx >= kv_idx
+        allowed = causal
+        for boundary_pos, del_start, del_end in boundaries:
+            in_deleted = (kv_idx >= del_start) & (kv_idx < del_end)
+            after_boundary = q_idx >= boundary_pos
+            allowed = allowed & ~(after_boundary & in_deleted)
+        return allowed
+
+    return create_block_mask(
+        mask_mod, B=1, H=num_heads, Q_LEN=seq_len, KV_LEN=seq_len, device=device,
+    )
 
 
 # ── Beta attention hooks for training ──────────────────────────────────────
@@ -278,6 +320,7 @@ def segmented_forward(
     compaction_mode: str = "attention_matching",
     compact_windows: list[int] | None = None,
     segment_loss_fn: Callable[[Tensor, int, int], dict] | None = None,
+    system_prompt_len: int | None = None,
 ) -> dict[str, Tensor]:
     """Run segmented forward passes with compaction replay between segments.
 
@@ -388,7 +431,7 @@ def segmented_forward(
 
     # For attention_matching_full, compact_start advances after each compaction
     # so that previously compacted blocks are never re-compacted.
-    compact_start = prompt_len
+    compact_start = system_prompt_len if system_prompt_len is not None else prompt_len
 
     for seg_idx, (seg_start, seg_end) in enumerate(seg_input_ranges):
         seg_ids = input_ids[:, seg_start:seg_end]
@@ -494,7 +537,7 @@ def segmented_forward(
                 beta_list = None
                 compacted_prefix_len = 0
             elif compaction_mode == "attention_matching_full":
-                compact_seed = prompt_len * 10000 + seg_idx
+                compact_seed = compact_start * 10000 + seg_idx
                 c1_list, c2_list, beta_list, _ = compact_kv_range(
                     keys, values,
                     compact_start=compact_start,
@@ -510,11 +553,15 @@ def segmented_forward(
                 )
                 compacted_prefix_len = c1_list[0].shape[0]
             else:
-                compact_seed = prompt_len * 10000 + seg_idx
-                c1_list, c2_list, beta_list, _ = compact_kv(
-                    keys, values, prompt_len, compact_target_ratio,
-                    num_kv_heads, head_size, device,
-                    compact_window=window,
+                compact_seed = compact_start * 10000 + seg_idx
+                c1_list, c2_list, beta_list, _ = compact_kv_range(
+                    keys, values,
+                    compact_start=compact_start,
+                    compact_end=compact_start + window,
+                    target_ratio=compact_target_ratio,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                    device=device,
                     compute_beta=compute_beta,
                     seed=compact_seed,
                     suffix_queries=suffix_queries,

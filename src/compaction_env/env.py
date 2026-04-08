@@ -38,6 +38,10 @@ from verifiers.types import (
 logger = logging.getLogger(__name__)
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+_FUNCTION_CALL_RE = re.compile(r"<function_calls>(.*?)</function_calls>", re.DOTALL)
+_FUNC_SIGNATURE_RE = re.compile(r"(\w+)\((.*)\)", re.DOTALL)
+_MISTRAL_TOOL_RE = re.compile(r"\[TOOL_CALLS\]\s*(\w+)\[ARGS\]\s*(\{.*?\})", re.DOTALL)
+_RAW_TOOL_RE = re.compile(r"(\w+)\s*(\{[^}]*\})", re.DOTALL)
 
 
 async def _tokenize_with_retry(
@@ -47,13 +51,19 @@ async def _tokenize_with_retry(
     max_attempts: int = 5,
     delay: float = 3.0,
 ) -> dict:
-    """POST to /tokenize with retries on transient 400 errors."""
+    """POST to /tokenize with retries on transient 400 and connection errors."""
     for attempt in range(max_attempts):
-        resp = await http_client.post(url, json=body)
+        try:
+            resp = await http_client.post(url, json=body)
+        except (httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+            if attempt < max_attempts - 1:
+                logger.warning(f"/tokenize connection error (attempt {attempt + 1}/{max_attempts}), retrying in {delay}s: {exc}")
+                await asyncio.sleep(delay)
+                continue
+            raise
         if resp.status_code == 400 and attempt < max_attempts - 1:
             logger.warning(f"/tokenize 400 (attempt {attempt + 1}/{max_attempts}), retrying in {delay}s: {resp.text[:300]}")
             if attempt == 0:
-                # Log assistant messages with tool_calls for debugging
                 for i, m in enumerate(body.get("messages", [])):
                     if m.get("role") == "assistant" and "tool_calls" in m:
                         logger.warning(f"  msg[{i}] tool_calls: {m['tool_calls']}")
@@ -68,6 +78,123 @@ async def _tokenize_with_retry(
     raise RuntimeError(f"/tokenize failed after {max_attempts} attempts")
 
 
+_LOCAL_TOKENIZER_CACHE: dict[str, "PreTrainedTokenizer"] = {}
+
+
+def _get_local_tokenizer(model: str):
+    """Get or create a cached local tokenizer for fallback tokenization."""
+    if model not in _LOCAL_TOKENIZER_CACHE:
+        from transformers import AutoTokenizer
+        _LOCAL_TOKENIZER_CACHE[model] = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    return _LOCAL_TOKENIZER_CACHE[model]
+
+
+def _build_completion_mask(token_ids: list[int], model: str) -> list[int]:
+    """Build completion_mask that zeros out pad token garbage and trailing EOS.
+
+    Chat models like Qwen3 have a split: eos_token=<|im_end|> (turn delimiter)
+    and pad_token=<|endoftext|> (document boundary). The model can hallucinate
+    <|endoftext|> mid-completion; everything from the first pad token onward is
+    garbage and should not receive gradient. The trailing <|im_end|> (forced stop
+    signal) is also masked since it's not a model decision.
+    """
+    tokenizer = _get_local_tokenizer(model)
+    pad_id = tokenizer.pad_token_id
+    eos_id = tokenizer.eos_token_id
+    if pad_id is None or pad_id == eos_id:
+        return [1] * len(token_ids)
+
+    mask = []
+    active = True
+    for tid in token_ids:
+        if active and tid == pad_id:
+            active = False
+        mask.append(1 if active else 0)
+
+    # Mask the trailing EOS (<|im_end|>) — it's a forced stop, not a model action
+    if mask and token_ids and token_ids[-1] == eos_id:
+        mask[-1] = 0
+
+    return mask
+
+
+def _strip_template_validation(template: str) -> str:
+    """Remove all validation checks from a Jinja chat template.
+
+    Mistral templates enforce strict role alternation and content requirements
+    that don't account for multi-turn tool-call patterns.  Stripping all
+    raise_exception blocks lets us tokenize these conversations locally
+    without changing the actual rendered output.
+    """
+    import re
+    # Remove alternation counter loop
+    template = re.sub(
+        r"\{%-?\s*set\s+ns\s*=\s*namespace\(index=0\).*?\{%-?\s*endfor\s*%\}",
+        "",
+        template,
+        flags=re.DOTALL,
+    )
+    # Remove all if-blocks that only raise exceptions
+    template = re.sub(
+        r"\{%-?\s*if[^}]*%\}\s*\{\{-?\s*raise_exception\([^)]*\)\s*-?\}\}\s*\{%-?\s*endif\s*-?%\}",
+        "",
+        template,
+    )
+    return template
+
+
+_LENIENT_TEMPLATE_CACHE: dict[str, str] = {}
+
+
+def _tokenize_messages_local(model: str, body: dict) -> dict:
+    """Tokenize a chat messages body locally when vLLM /tokenize rejects it."""
+    tokenizer = _get_local_tokenizer(model)
+    messages = body["messages"]
+    kwargs = {}
+    if "tools" in body:
+        kwargs["tools"] = body["tools"]
+    add_gen = body.get("add_generation_prompt", False)
+
+    # Use lenient template (no strict alternation check) if available
+    if tokenizer.chat_template and model not in _LENIENT_TEMPLATE_CACHE:
+        _LENIENT_TEMPLATE_CACHE[model] = _strip_template_validation(tokenizer.chat_template)
+    if model in _LENIENT_TEMPLATE_CACHE:
+        kwargs["chat_template"] = _LENIENT_TEMPLATE_CACHE[model]
+
+    # Sanitize None content — Mistral template crashes on content=None
+    for msg in messages:
+        if msg.get("content") is None:
+            msg["content"] = ""
+
+    result = tokenizer.apply_chat_template(messages, add_generation_prompt=add_gen, **kwargs)
+    # Some tokenizers return BatchEncoding instead of list[int] when using custom templates
+    if hasattr(result, "input_ids"):
+        tokens = result.input_ids
+        if isinstance(tokens, list) and tokens and isinstance(tokens[0], list):
+            tokens = tokens[0]
+    else:
+        tokens = result
+    return {"tokens": list(tokens)}
+
+
+async def _tokenize_with_retry_messages(
+    http_client: httpx.AsyncClient,
+    url: str,
+    body: dict,
+    model: str,
+    max_attempts: int = 3,
+) -> dict:
+    """Tokenize chat messages, using local tokenizer directly when the body contains messages.
+
+    vLLM's /tokenize endpoint rejects chat messages for some tokenizer modes
+    (e.g. Mistral). Rather than wasting time on retries, we always tokenize
+    messages locally and only use the server for plain prompt strings.
+    """
+    if "messages" in body:
+        return _tokenize_messages_local(model, body)
+    return await _tokenize_with_retry(http_client, url, body, max_attempts=max_attempts)
+
+
 async def _compute_suffix_ids(
     http_client: httpx.AsyncClient,
     server_url: str,
@@ -80,6 +207,9 @@ async def _compute_suffix_ids(
     and extract the tokens that appear after the assistant content but before
     the next user message.  These are template-specific separators
     (e.g. ``<|im_end|>\\n`` for Qwen3).
+
+    Falls back to local tokenizer if the server /tokenize endpoint rejects
+    chat messages (e.g. Mistral tokenizer_mode).
     """
     dummy_content = "World!"
     # Tokenize just the content to find its tokens
@@ -101,7 +231,7 @@ async def _compute_suffix_ids(
     }
     if oai_tools:
         msgs_body["tools"] = oai_tools
-    msgs_data = await _tokenize_with_retry(http_client, f"{server_url}/tokenize", msgs_body)
+    msgs_data = await _tokenize_with_retry_messages(http_client, f"{server_url}/tokenize", msgs_body, model)
     dummy_msgs_ids = msgs_data["tokens"]
 
     # Find last occurrence of the content's final token, then take everything after
@@ -122,33 +252,114 @@ def _find_suffix_overlap(prefix: list[int], suffix: list[int]) -> int:
 
 
 def _parse_hermes_tool_calls(text: str) -> tuple[str | None, list[ToolCall]]:
-    """Parse Hermes-format tool calls from model output text.
+    """Parse tool calls from model output text.
+
+    Supports formats:
+    - Hermes/Qwen:  <tool_call>{"name": "fn", "arguments": {"k": "v"}}</tool_call>
+    - OLMo-3:       <function_calls>fn(k="v")</function_calls>
+    - Ministral:    [TOOL_CALLS]fn_name[ARGS]{"k": "v"}
+    - Raw:          fn_name{"k": "v"}  (fallback for models that omit markers)
 
     Returns (content_before_tools, list_of_tool_calls).
     If no tool calls found, returns (text, []).
     """
-    if "<tool_call>" not in text:
-        return text, []
+    has_hermes = "<tool_call>" in text
+    has_olmo = "<function_calls>" in text
+    has_mistral = "[TOOL_CALLS]" in text
 
     tool_calls = []
-    for i, match in enumerate(_TOOL_CALL_RE.finditer(text)):
-        raw = match.group(1).strip()
+
+    # Hermes format: <tool_call>{"name": "fn", "arguments": {...}}</tool_call>
+    if has_hermes:
+        for match in _TOOL_CALL_RE.finditer(text):
+            raw = match.group(1).strip()
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.warning(f"Skipping unparseable tool_call: {raw[:100]}")
+                continue
+            if "name" not in parsed:
+                logger.warning(f"Skipping tool_call missing 'name': {raw[:100]}")
+                continue
+            arguments = parsed.get("arguments", {})
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            tool_calls.append(ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                name=parsed["name"],
+                arguments=arguments,
+            ))
+        content = text[:text.find("<tool_call>")].strip() or None
+        return content, tool_calls
+
+    # OLMo-3 format: <function_calls>fn(k="v", k2="v2")</function_calls>
+    if has_olmo:
+        for match in _FUNCTION_CALL_RE.finditer(text):
+            raw = match.group(1).strip()
+            for line in raw.strip().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                sig_match = _FUNC_SIGNATURE_RE.match(line)
+                if not sig_match:
+                    logger.warning(f"Skipping unparseable function_call: {line[:100]}")
+                    continue
+                func_name = sig_match.group(1)
+                args_str = sig_match.group(2).strip()
+                arguments = {}
+                if args_str:
+                    for part in re.split(r",\s*(?=\w+=)", args_str):
+                        if "=" in part:
+                            k, v = part.split("=", 1)
+                            v = v.strip().strip('"').strip("'")
+                            arguments[k.strip()] = v
+                tool_calls.append(ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    name=func_name,
+                    arguments=json.dumps(arguments, ensure_ascii=False),
+                ))
+        content = text[:text.find("<function_calls>")].strip() or None
+        return content, tool_calls
+
+    # Ministral format: [TOOL_CALLS]fn_name[ARGS]{"k": "v"}
+    if has_mistral:
+        for match in _MISTRAL_TOOL_RE.finditer(text):
+            func_name = match.group(1)
+            args_raw = match.group(2).strip()
+            try:
+                arguments = json.loads(args_raw)
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+            except json.JSONDecodeError:
+                arguments = args_raw
+            tool_calls.append(ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                name=func_name,
+                arguments=arguments,
+            ))
+        content = text[:text.find("[TOOL_CALLS]")].strip() or None
+        return content, tool_calls
+
+    # Raw fallback: fn_name{"k": "v"} (no markers)
+    match = _RAW_TOOL_RE.search(text)
+    if match:
+        func_name = match.group(1)
+        args_raw = match.group(2).strip()
         try:
-            parsed = json.loads(raw)
+            arguments = json.loads(args_raw)
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
         except json.JSONDecodeError:
-            logger.warning(f"Skipping unparseable tool_call: {raw[:100]}")
-            continue
-        arguments = parsed.get("arguments", {})
-        if not isinstance(arguments, str):
-            arguments = json.dumps(arguments, ensure_ascii=False)
+            arguments = args_raw
         tool_calls.append(ToolCall(
             id=f"call_{uuid.uuid4().hex[:8]}",
-            name=parsed["name"],
+            name=func_name,
             arguments=arguments,
         ))
+        content = text[:match.start()].strip() or None
+        return content, tool_calls
 
-    content = text[:text.find("<tool_call>")].strip() or None
-    return content, tool_calls
+    return text, []
 
 
 def _tool_defs_to_openai(tool_defs: list[Tool] | None) -> list[dict] | None:
@@ -282,6 +493,7 @@ def _fix_prompt_after_setup(state: State) -> None:
             e = getattr(e, "env", None)
         if mission is not None:
             updated_prompt = game_env.get_instruction_prompt(instructions=mission)
+            updated_prompt += "\n\nYou must call the take_action tool exactly once per response. Do not include any other text or explanation — just the tool call."
             for msg in state.get("prompt", []):
                 role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
                 if role == "system":
@@ -406,8 +618,8 @@ class CompactionEnv(vf.MultiTurnEnv):
             if oai_tools:
                 tokenize_body["tools"] = oai_tools
 
-            tokenize_data = await _tokenize_with_retry(
-                http_client, f"{server_url}/tokenize", tokenize_body,
+            tokenize_data = await _tokenize_with_retry_messages(
+                http_client, f"{server_url}/tokenize", tokenize_body, model,
             )
             prompt_ids = tokenize_data["tokens"]
 
@@ -467,7 +679,7 @@ class CompactionEnv(vf.MultiTurnEnv):
             prompt_ids=prompt_ids,
             prompt_mask=[0] * len(prompt_ids),
             completion_ids=all_token_ids,
-            completion_mask=[1] * len(all_token_ids),
+            completion_mask=_build_completion_mask(all_token_ids, model),
             completion_logprobs=all_logprobs,
             routed_experts=None,
         )
@@ -639,12 +851,8 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
 
         After a summary reset, verifiers still passes the full message history.
         This rebuilds the prompt to match what the session KV actually contains:
-        [system+summary | preserved_turns | new_turns_since_reset | current_obs].
+        [system | preserved_turns | sum_user | sum_asst | new_turns_since_reset | current_obs].
         """
-        base_system = state["_tc_base_system"]
-        summary = state["_tc_summary"]
-
-        system_msg = {"role": "system", "content": base_system + f"\n\nContext from earlier:\n{summary}"}
         current_user = prompt_dicts[-1]
         turn_msgs = prompt_dicts[1:-1]
 
@@ -653,7 +861,8 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         n_recent = self.n_preserved_turns + summary_turn_count
         recent = _last_n_turns(turn_msgs, n_recent) if n_recent > 0 else turn_msgs
 
-        return [system_msg] + recent + [current_user]
+        summary_msgs = state.get("_tc_summary_msgs", [])
+        return [prompt_dicts[0]] + recent + summary_msgs + [current_user]
 
     def _rebuild_prompt_after_pure_reset(self, prompt_dicts: list[dict], state: State) -> list[dict]:
         """Trim prompt_dicts to match session KV after a markovian_pure reset.
@@ -699,6 +908,25 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
 
         return [prompt_dicts[0]] + preserved + [current_user]
 
+    def _build_summary_prompt_text(self, turn_msgs: list[dict], prev_summary: str) -> str:
+        """Build the summary prompt text from all window turns + prior summary."""
+        parts = []
+        for i in range(0, len(turn_msgs), 2):
+            if i + 1 < len(turn_msgs):
+                obs = (turn_msgs[i].get("content") or "")[:2000]
+                resp = (turn_msgs[i + 1].get("content") or "")[:2000]
+                parts.append(f"Observation:\n{obs}\nResponse:\n{resp}")
+
+        context = f"Previous context:\n{prev_summary}\n\n" if prev_summary else ""
+        interaction = "\n---\n".join(parts)
+
+        return (
+            "Briefly summarize this interaction. "
+            "Focus on mission, actions, discoveries, and progress. "
+            "2-3 sentences.\n\n"
+            f"{context}Interaction:\n{interaction}"
+        )
+
     async def _summary_reset(
         self,
         state: State,
@@ -707,40 +935,26 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         server_url: str,
         model: str,
     ) -> list[dict]:
-        """Generate summary of old turns, delete session, return modified prompt."""
+        """Generate summary of old turns, delete session, return modified prompt.
+
+        Summary becomes a user+assistant turn at the END of the preserved window:
+        [sys][preserved_turns][sum_user][sum_asst][current_user].
+        """
         system_msg = prompt_dicts[0]
         current_user = prompt_dicts[-1]
         turn_msgs = prompt_dicts[1:-1]
 
         n_keep = self.n_preserved_turns
         preserved = _last_n_turns(turn_msgs, n_keep) if n_keep > 0 else []
-        if preserved:
-            to_summarize = turn_msgs[:-len(preserved)]
-        else:
-            to_summarize = turn_msgs
-
-        parts = []
-        for i in range(0, len(to_summarize), 2):
-            if i + 1 < len(to_summarize):
-                parts.append(
-                    f"Observation:\n{to_summarize[i].get('content', '')}\n"
-                    f"Response:\n{to_summarize[i + 1].get('content', '')}"
-                )
 
         prev_summary = state.get("_tc_summary", "")
-        context = f"Previous context:\n{prev_summary}\n\n" if prev_summary else ""
-        interaction = "\n---\n".join(parts)
+        summary_prompt_text = self._build_summary_prompt_text(turn_msgs, prev_summary)
 
         resp = await http_client.post(
             f"{server_url}/v1/chat/completions",
             json={
                 "model": model,
-                "messages": [{"role": "user", "content": (
-                    "/nothink\nBriefly summarize this interaction. "
-                    "Focus on mission, actions, discoveries, and progress. "
-                    "2-3 sentences.\n\n"
-                    f"{context}Interaction:\n{interaction}"
-                )}],
+                "messages": [{"role": "user", "content": summary_prompt_text}],
                 "max_tokens": self.summary_max_tokens,
                 "temperature": 0.3,
             },
@@ -751,6 +965,10 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
             summary_text = summary_text.split("</think>", 1)[-1].strip()
 
         state["_tc_summary"] = summary_text
+        state["_tc_summary_msgs"] = [
+            {"role": "user", "content": summary_prompt_text},
+            {"role": "assistant", "content": summary_text},
+        ]
         logger.info("Summary reset: generated %d-char summary", len(summary_text))
 
         # Delete old session and clean up state to force recreation
@@ -773,10 +991,115 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
             extras.pop("compaction_indices", None)
             extras.pop("compact_windows", None)
 
-        # Build modified prompt with summary in system message
-        base_system = state["_tc_base_system"]
-        new_system = {"role": "system", "content": base_system + f"\n\nContext from earlier:\n{summary_text}"}
-        return [new_system] + preserved + [current_user]
+        return [system_msg] + preserved + state["_tc_summary_msgs"] + [current_user]
+
+    async def _kv_summary_compact(
+        self,
+        state: State,
+        prompt_dicts: list[dict],
+        http_client: httpx.AsyncClient,
+        server_url: str,
+        model: str,
+    ) -> None:
+        """Generate summary with full KV context, then trigger markovian compaction.
+
+        Unlike _summary_reset, the session stays alive. The summary is generated
+        as a compact_session/step with is_summary=True (keeping KVs), then
+        trigger_compact=True fires markovian deletion of the oldest turn.
+        """
+        turn_msgs = prompt_dicts[1:-1]
+        prev_summary = state.get("_tc_summary", "")
+        summary_prompt_text = self._build_summary_prompt_text(turn_msgs, prev_summary)
+
+        # Build TITO-compatible token delta: tokenize the full conversation with
+        # the summary user message appended (through the chat template), then
+        # extract the delta after the known prefix.
+        prev_prompt_ids = state["_tc_prev_prompt_ids"]
+        prev_completion_ids = state["_tc_prev_completion_ids"]
+        suffix_ids = state.get("_tc_suffix_ids", [])
+        overlap_len = _find_suffix_overlap(prev_prompt_ids + prev_completion_ids, suffix_ids)
+        extended_prefix = prev_prompt_ids + prev_completion_ids + suffix_ids[overlap_len:]
+
+        # Replace current user obs with summary prompt for tokenization
+        summary_prompt_dicts = prompt_dicts[:-1] + [{"role": "user", "content": summary_prompt_text}]
+        tokenize_resp = await _tokenize_with_retry_messages(
+            http_client, f"{server_url}/tokenize",
+            {"model": model, "messages": summary_prompt_dicts, "add_generation_prompt": True},
+            model,
+        )
+        full_ids = tokenize_resp["tokens"]
+
+        summary_user_ids = full_ids[len(extended_prefix):]
+        new_token_ids = [state["_tc_last_token"]] + summary_user_ids
+
+        resp = await http_client.post(
+            f"{server_url}/compact_session/step",
+            json={
+                "session_id": state["_tc_session_id"],
+                "new_token_ids": new_token_ids,
+                "max_response_tokens": self.summary_max_tokens,
+                "is_summary": True,
+                "trigger_compact": True,
+            },
+        )
+        if resp.status_code >= 500:
+            for retry in range(4):
+                logger.warning(
+                    "%s returned %d (attempt %d/5), retrying in 5s: %s",
+                    resp.request.url, resp.status_code, retry + 2, resp.text[:300],
+                )
+                await asyncio.sleep(5)
+                resp = await http_client.post(
+                    str(resp.request.url),
+                    json=json.loads(resp.request.content),
+                )
+                if resp.status_code < 500:
+                    break
+        if resp.status_code >= 400:
+            logger.error("%s returned %d: %s", resp.request.url, resp.status_code, resp.text[:500])
+            resp.raise_for_status()
+
+        result = resp.json()
+        summary_text = result["final_text"]
+        if "</think>" in summary_text:
+            summary_text = summary_text.split("</think>", 1)[-1].strip()
+
+        state["_tc_summary"] = summary_text
+        state["_tc_summary_msgs"] = [
+            {"role": "user", "content": summary_prompt_text},
+            {"role": "assistant", "content": summary_text},
+        ]
+        state["_tc_summary_turn_count"] = 0
+
+        # Update TITO state: the summary step's tokens become the new prev
+        all_token_ids = result["all_token_ids"]
+        state["_tc_prev_prompt_ids"] = extended_prefix + summary_user_ids
+        state["_tc_prev_completion_ids"] = all_token_ids
+        state["_tc_last_token"] = all_token_ids[-1] if all_token_ids else state["_tc_last_token"]
+        state["_tc_user_delta_len"] = len(summary_user_ids)
+
+        # Store compaction events for segment boundary tracking
+        pending = result.get("diagnostics", {}).get("compaction_events", [])
+        state["_tc_pending_events"] = state.get("_tc_pending_events", []) + pending
+
+        logger.info("KV-summary compact: generated %d-char summary, %d compaction events",
+                     len(summary_text), len(pending))
+
+    def _rebuild_prompt_with_kv_summary(self, prompt_dicts: list[dict], state: State) -> list[dict]:
+        """Trim prompt to match KV state after kv_summary compaction.
+
+        After kv_summary, the KV cache contains:
+        [sys | preserved_turns | sum_user | sum_asst | new_turns_since_compact].
+        """
+        current_user = prompt_dicts[-1]
+        turn_msgs = prompt_dicts[1:-1]
+
+        summary_turn_count = state.get("_tc_summary_turn_count", 0)
+        n_recent = self.n_preserved_turns + summary_turn_count
+        recent = _last_n_turns(turn_msgs, n_recent) if n_recent > 0 else turn_msgs
+
+        summary_msgs = state.get("_tc_summary_msgs", [])
+        return [prompt_dicts[0]] + recent + summary_msgs + [current_user]
 
     async def get_model_response(
         self,
@@ -818,19 +1141,26 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         prompt_dicts = _messages_to_openai(prompt)
 
         # After a client-side reset, rebuild prompt to match session KV contents
-        if state.get("_tc_summary"):
+        if state.get("_tc_summary_msgs") and self.compaction_mode in ("kv_summary", "kv_summary_grad"):
+            prompt_dicts = self._rebuild_prompt_with_kv_summary(prompt_dicts, state)
+        elif state.get("_tc_summary_msgs"):
             prompt_dicts = self._rebuild_prompt_with_summary(prompt_dicts, state)
         elif state.get("_tc_pure_reset_done"):
             prompt_dicts = self._rebuild_prompt_after_pure_reset(prompt_dicts, state)
 
         async with httpx.AsyncClient(timeout=7200.0) as http_client:
-            # Client-side session reset when window is full (summary / markovian_pure)
-            if (self.compaction_mode in ("summary", "markovian_pure")
+            # Client-managed compaction when window is full
+            _CLIENT_MANAGED_MODES = ("summary", "markovian_pure", "kv_summary", "kv_summary_grad")
+            if (self.compaction_mode in _CLIENT_MANAGED_MODES
                     and self.n_max_turns >= 0
                     and state.get("_tc_summary_turn_count", 0) >= self.n_max_turns
                     and "_tc_session_id" in state):
                 if self.compaction_mode == "summary":
                     prompt_dicts = await self._summary_reset(
+                        state, prompt_dicts, http_client, server_url, model,
+                    )
+                elif self.compaction_mode in ("kv_summary", "kv_summary_grad"):
+                    await self._kv_summary_compact(
                         state, prompt_dicts, http_client, server_url, model,
                     )
                 else:
@@ -845,8 +1175,8 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
             if oai_tools:
                 tokenize_body["tools"] = oai_tools
 
-            tokenize_data = await _tokenize_with_retry(
-                http_client, f"{server_url}/tokenize", tokenize_body,
+            tokenize_data = await _tokenize_with_retry_messages(
+                http_client, f"{server_url}/tokenize", tokenize_body, model,
             )
             full_ids = tokenize_data["tokens"]
 
@@ -855,38 +1185,67 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
                 prompt_ids = full_ids
                 session_id = str(uuid.uuid4())
 
-                # Store base system prompt for summary rebuilds
-                if self.compaction_mode == "summary" and "_tc_base_system" not in state:
-                    state["_tc_base_system"] = _messages_to_openai(prompt)[0].get("content", "")
+                # Tokenize just the system message to get its token length.
+                # This lets the server separate system prompt from U0 so that
+                # U0 enters the compaction window instead of being permanently
+                # preserved.
+                sys_tok = await _tokenize_with_retry_messages(
+                    http_client, f"{server_url}/tokenize",
+                    {"model": model, "messages": [prompt_dicts[0]], "add_generation_prompt": False},
+                    model,
+                )
+                system_prompt_len = len(sys_tok["tokens"])
+                state["_tc_system_prompt_len"] = system_prompt_len
 
                 session_max_kv_len = max(
                     self.max_kv_len,
                     len(prompt_ids) + self.n_max_turns * (self.max_response_tokens + 300),
                 ) if self.n_max_turns > 0 else self.max_kv_len
 
-                # Summary / markovian_pure: no server-side compaction, client manages context
+                # Client-managed modes: no automatic server-side turn compaction
                 client_managed = self.compaction_mode in ("summary", "markovian_pure")
-                server_compaction_mode = "attention_matching" if client_managed else self.compaction_mode
-                server_n_max_turns = -1 if client_managed else self.n_max_turns
-                server_n_preserved = 0 if client_managed else self.n_preserved_turns
+                if self.compaction_mode in ("kv_summary", "kv_summary_grad"):
+                    # kv_summary: server uses markovian delete, but client triggers it
+                    server_compaction_mode = "markovian"
+                    server_n_max_turns = -1
+                    server_n_preserved = self.n_preserved_turns
+                elif client_managed:
+                    server_compaction_mode = "attention_matching"
+                    server_n_max_turns = -1
+                    server_n_preserved = 0
+                else:
+                    _MODE_TO_SERVER = {"kv_markovian_grad": "markovian"}
+                    server_compaction_mode = _MODE_TO_SERVER.get(self.compaction_mode, self.compaction_mode)
+                    server_n_max_turns = self.n_max_turns
+                    server_n_preserved = self.n_preserved_turns
 
-                resp = await http_client.post(
-                    f"{server_url}/compact_session/create",
-                    json={
-                        "session_id": session_id,
-                        "prompt_ids": prompt_ids,
-                        "max_kv_len": session_max_kv_len,
-                        "max_response_tokens": self.max_response_tokens,
-                        "compact_target_ratio": self.compact_target_ratio,
-                        "compact_window": self.compact_window,
-                        "temperature": temperature,
-                        "top_p": top_p,
-                        "compaction_mode": server_compaction_mode,
-                        "use_suffix_queries": self.use_suffix_queries,
-                        "n_max_turns": server_n_max_turns,
-                        "n_preserved_turns": server_n_preserved,
-                    },
-                )
+                create_body = {
+                    "session_id": session_id,
+                    "prompt_ids": prompt_ids,
+                    "max_kv_len": session_max_kv_len,
+                    "max_response_tokens": self.max_response_tokens,
+                    "compact_target_ratio": self.compact_target_ratio,
+                    "compact_window": self.compact_window,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "compaction_mode": server_compaction_mode,
+                    "use_suffix_queries": self.use_suffix_queries,
+                    "n_max_turns": server_n_max_turns,
+                    "n_preserved_turns": server_n_preserved,
+                    "system_prompt_len": system_prompt_len,
+                }
+                while True:
+                    resp = await http_client.post(
+                        f"{server_url}/compact_session/create", json=create_body,
+                    )
+                    if resp.status_code < 500:
+                        break
+                    logger.warning(
+                        "compact_session/create returned %d (no blocks?), retrying in 5s: %s",
+                        resp.status_code, resp.text[:200],
+                    )
+                    await asyncio.sleep(5)
+                resp.raise_for_status()
                 state["_tc_session_id"] = session_id
                 state["_tc_server_url"] = server_url
                 state["_tc_user_delta_len"] = 0
@@ -925,7 +1284,26 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
                 )
                 state["_tc_user_delta_len"] = len(user_delta)
 
-            resp.raise_for_status()
+            # Retry on 500s (server not ready or transient error)
+            if resp.status_code >= 500:
+                for retry in range(19):
+                    logger.warning(
+                        "%s returned %d (attempt %d/20), retrying in 10s: %s",
+                        resp.request.url, resp.status_code, retry + 2, resp.text[:300],
+                    )
+                    await asyncio.sleep(10)
+                    resp = await http_client.post(
+                        str(resp.request.url),
+                        json=json.loads(resp.request.content),
+                    )
+                    if resp.status_code < 500:
+                        break
+            if resp.status_code >= 400:
+                logger.error(
+                    "%s returned %d: %s",
+                    resp.request.url, resp.status_code, resp.text[:500],
+                )
+                resp.raise_for_status()
             result = resp.json()
 
         state["_tc_pending_events"] = result.get("diagnostics", {}).get("compaction_events", [])
@@ -946,7 +1324,7 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
             prompt_ids=prompt_ids,
             prompt_mask=[0] * len(prompt_ids),
             completion_ids=all_token_ids,
-            completion_mask=[1] * len(all_token_ids),
+            completion_mask=_build_completion_mask(all_token_ids, model),
             completion_logprobs=all_logprobs,
             routed_experts=None,
         )
@@ -1011,6 +1389,9 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
                 extras["compaction_indices"] = all_compaction_indices
             if any(w is not None for w in all_compact_windows):
                 extras["compact_windows"] = all_compact_windows
+            sys_len = state.get("_tc_system_prompt_len")
+            if sys_len is not None:
+                extras["system_prompt_len"] = sys_len
 
         state["_tc_cumulative"] = cumulative
         state["_tc_seg_boundaries"] = seg_boundaries
@@ -1021,7 +1402,7 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         state["_tc_last_token"] = completion_ids[-1] if completion_ids else 0
         state["_tc_turn"] = turn + 1
 
-        if self.compaction_mode in ("summary", "markovian_pure"):
+        if self.compaction_mode in ("summary", "markovian_pure", "kv_summary", "kv_summary_grad"):
             state["_tc_summary_turn_count"] = state.get("_tc_summary_turn_count", 0) + 1
 
         if self.max_turns > 0 and turn + 1 >= self.max_turns:

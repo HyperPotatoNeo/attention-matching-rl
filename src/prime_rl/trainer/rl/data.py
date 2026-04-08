@@ -40,6 +40,9 @@ class TensorMicroBatch(TypedDict):
     # Compaction training: per-event compact_window from inference
     compact_windows: list[int] | None
 
+    # Compaction training: system prompt length (excludes U0) for compact_start
+    system_prompt_len: int | None
+
     # Multimodal fields (Qwen3-VL)
     # pixel_values: flattened image patches [num_patches, patch_dim] where patch_dim=1176 for Qwen3-VL
     pixel_values: Float[Tensor, "num_patches patch_dim"] | None
@@ -118,6 +121,7 @@ class FakeDataLoader:
             "segment_boundaries": None,
             "compaction_indices": None,
             "compact_windows": None,
+            "system_prompt_len": None,
             "pixel_values": None,
             "image_grid_thw": None,
         }
@@ -146,6 +150,7 @@ class FakeDataLoader:
             "segment_boundaries": None,
             "compaction_indices": None,
             "compact_windows": None,
+            "system_prompt_len": None,
             "pixel_values": None,
             "image_grid_thw": None,
         }
@@ -225,4 +230,5 @@ class DataLoader:
             segment_boundaries=micro_batch.segment_boundaries,
             compaction_indices=micro_batch.compaction_indices,
             compact_windows=micro_batch.compact_windows,
+            system_prompt_len=micro_batch.system_prompt_len,
         )

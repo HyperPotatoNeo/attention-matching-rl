@@ -21,6 +21,40 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _get_chat_eos_token_id(tokenizer) -> int:
+    """Get the EOS token ID that chat models actually use to end responses.
+
+    Many chat models (e.g. OLMo-3) set eos_token to <|endoftext|> but
+    actually end assistant turns with <|im_end|>. Using the wrong one
+    causes the worker to generate past the natural stop, producing garbage.
+    """
+    im_end_ids = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+    if len(im_end_ids) == 1:
+        logger.info("Using <|im_end|> (id=%d) as chat EOS instead of default eos_token_id=%d",
+                     im_end_ids[0], tokenizer.eos_token_id)
+        return im_end_ids[0]
+    logger.info("No single-token <|im_end|>, using default eos_token_id=%d", tokenizer.eos_token_id)
+    return tokenizer.eos_token_id
+
+
+def _decode_response(tokenizer, token_ids: list[int]) -> str:
+    """Decode generated tokens, preserving tool-call markers but stripping BOS/EOS.
+
+    Using skip_special_tokens=True strips model-specific tool markers like
+    Ministral's [TOOL_CALLS] and [ARGS].  Instead we decode with all tokens
+    then manually remove only BOS/EOS boundaries.
+    """
+    text = tokenizer.decode(token_ids, skip_special_tokens=False)
+    for attr in ("bos_token", "eos_token"):
+        token_str = getattr(tokenizer, attr, None)
+        if token_str:
+            text = text.replace(token_str, "")
+    # MistralTokenizer lacks bos_token/eos_token attrs — strip common markers
+    for marker in ("</s>", "<s>"):
+        text = text.replace(marker, "")
+    return text.strip()
+
+
 def _get_dp_engines(engine):
     """Resolve the list of DP engine identities from the top-level engine."""
     client = getattr(engine, "engine_core", engine)
@@ -153,7 +187,7 @@ class _RequestBatcher:
     async def _process_batch(self, app, batch: list[tuple[CompactGenerateRequest, asyncio.Future]]) -> list[dict]:
         engine = app.state.engine_client
         tokenizer = engine.get_tokenizer()
-        eos_token_id = tokenizer.eos_token_id
+        eos_token_id = _get_chat_eos_token_id(tokenizer)
 
         first_body = batch[0][0]
         prompt_ids_list = [b.prompt_ids for b, _ in batch]
@@ -196,7 +230,7 @@ class _RequestBatcher:
         batch_results = results[0]
         responses = []
         for result in batch_results:
-            final_text = tokenizer.decode(result["all_token_ids"], skip_special_tokens=True)
+            final_text = _decode_response(tokenizer, result["all_token_ids"])
             responses.append({
                 "all_token_ids": result["all_token_ids"],
                 "all_logprobs": result["all_logprobs"],
@@ -219,7 +253,7 @@ async def compact_generate_batch(body: CompactGenerateBatchRequest, request: Req
     engine = request.app.state.engine_client
 
     tokenizer = engine.get_tokenizer()
-    eos_token_id = tokenizer.eos_token_id
+    eos_token_id = _get_chat_eos_token_id(tokenizer)
 
     if body.max_kv_len is not None:
         max_tokens_per_segment = 0
@@ -262,7 +296,7 @@ async def compact_generate_batch(body: CompactGenerateBatchRequest, request: Req
 
     responses = []
     for result in batch_results:
-        final_text = tokenizer.decode(result["all_token_ids"], skip_special_tokens=True)
+        final_text = _decode_response(tokenizer, result["all_token_ids"])
         responses.append({
             "all_token_ids": result["all_token_ids"],
             "all_logprobs": result["all_logprobs"],
@@ -286,19 +320,22 @@ class SessionCreateRequest(BaseModel):
     use_suffix_queries: bool = True
     n_max_turns: int = -1
     n_preserved_turns: int = 0
+    system_prompt_len: int | None = None
 
 
 class SessionStepRequest(BaseModel):
     session_id: str
     new_token_ids: list[int]
     max_response_tokens: int = 512
+    is_summary: bool = False
+    trigger_compact: bool = False
 
 
 @router.post("/compact_session/create")
 async def compact_session_create(body: SessionCreateRequest, request: Request):
     engine = request.app.state.engine_client
     tokenizer = engine.get_tokenizer()
-    eos_token_id = tokenizer.eos_token_id
+    eos_token_id = _get_chat_eos_token_id(tokenizer)
 
     logger.info(
         "/compact_session/create: session=%s, prompt_len=%d, max_kv_len=%d",
@@ -323,11 +360,12 @@ async def compact_session_create(body: SessionCreateRequest, request: Request):
             "use_suffix_queries": body.use_suffix_queries,
             "n_max_turns": body.n_max_turns,
             "n_preserved_turns": body.n_preserved_turns,
+            "system_prompt_len": body.system_prompt_len,
         },
     )
 
     data = result[0]
-    final_text = tokenizer.decode(data["all_token_ids"], skip_special_tokens=True)
+    final_text = _decode_response(tokenizer, data["all_token_ids"])
     return {
         "session_id": data["session_id"],
         "all_token_ids": data["all_token_ids"],
@@ -355,10 +393,11 @@ async def compact_session_step(body: SessionStepRequest, request: Request):
             body.new_token_ids,
             body.max_response_tokens,
         ),
+        kwargs={"is_summary": body.is_summary, "trigger_compact": body.trigger_compact},
     )
 
     data = result[0]
-    final_text = tokenizer.decode(data["all_token_ids"], skip_special_tokens=True)
+    final_text = _decode_response(tokenizer, data["all_token_ids"])
     return {
         "all_token_ids": data["all_token_ids"],
         "all_logprobs": data.get("all_logprobs", []),
@@ -407,7 +446,7 @@ class RsaGenerateRequest(BaseModel):
 async def rsa_generate(body: RsaGenerateRequest, request: Request):
     engine = request.app.state.engine_client
     tokenizer = engine.get_tokenizer()
-    eos_token_id = tokenizer.eos_token_id
+    eos_token_id = _get_chat_eos_token_id(tokenizer)
 
     result = await engine.collective_rpc(
         "rsa_generate",
@@ -455,7 +494,7 @@ class ParallelGenerateRequest(BaseModel):
 async def parallel_generate(body: ParallelGenerateRequest, request: Request):
     engine = request.app.state.engine_client
     tokenizer = engine.get_tokenizer()
-    eos_token_id = tokenizer.eos_token_id
+    eos_token_id = _get_chat_eos_token_id(tokenizer)
 
     result = await engine.collective_rpc(
         "parallel_generate",
@@ -504,7 +543,7 @@ async def parallel_generate_fused(
 ):
     engine = request.app.state.engine_client
     tokenizer = engine.get_tokenizer()
-    eos_token_id = tokenizer.eos_token_id
+    eos_token_id = _get_chat_eos_token_id(tokenizer)
 
     result = await engine.collective_rpc(
         "parallel_generate_fused",

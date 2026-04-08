@@ -325,6 +325,69 @@ class BALROGRubric(vf.Rubric):
             return float(min(max(episode_return, 0.0) * 50.0, 100.0))
 
 
+_RESET_MAX_REJECTIONS = 10  # max rejection samples before reseeding (typical success: 0-4)
+_RESET_MAX_RESEEDS = 10  # max reseeds before raising
+
+
+def _patch_gen_grid_max_retries():
+    """Patch RoomGridLevel._gen_grid to cap rejection sampling retries.
+
+    MiniGrid's PutNextLocal loops forever in _gen_grid when rejection
+    sampling can't find a valid configuration for certain seeds.
+    This patch adds a max retry limit and raises so we can reseed.
+    """
+    try:
+        from minigrid.envs.babyai.core.roomgrid_level import RoomGridLevel, RejectSampling
+    except ImportError:
+        return
+
+    if getattr(RoomGridLevel, "_patched_gen_grid", False):
+        return
+
+    def _gen_grid_with_limit(self, width, height):
+        for _ in range(_RESET_MAX_REJECTIONS):
+            try:
+                # Call the grandparent _gen_grid (RoomGrid), not our patched version
+                super(RoomGridLevel, self)._gen_grid(width, height)
+                self.gen_mission()
+                self.validate_instrs(self.instrs)
+                return
+            except RecursionError:
+                continue
+            except RejectSampling:
+                continue
+        raise RejectSampling(
+            f"Failed to generate valid grid after {_RESET_MAX_REJECTIONS} attempts"
+        )
+
+    RoomGridLevel._gen_grid = _gen_grid_with_limit
+    RoomGridLevel._patched_gen_grid = True
+
+
+_patch_gen_grid_max_retries()
+
+
+def _reset_with_timeout(env, timeout: int = 30) -> tuple:
+    """Call env.reset() with reseeding on persistent rejection failures.
+
+    After patching _gen_grid with a retry cap, reset() will raise
+    RejectSampling instead of looping forever. We catch that and reseed.
+    """
+    try:
+        from minigrid.envs.babyai.core.roomgrid_level import RejectSampling
+    except ImportError:
+        return env.reset()
+
+    for attempt in range(_RESET_MAX_RESEEDS):
+        try:
+            return env.reset()
+        except RejectSampling:
+            logger.warning(
+                f"env.reset() hit max rejections (attempt {attempt + 1}/{_RESET_MAX_RESEEDS}), reseeding"
+            )
+    return env.reset()
+
+
 class BalrogEnv(MultiTurnEnv):
     """BALROG environment with official evaluator integration."""
 
@@ -404,11 +467,11 @@ class BalrogEnv(MultiTurnEnv):
                 logger.debug("Please download text world files")
             else:
                 raise
-        obs, _ = env.reset()
+        obs, _ = _reset_with_timeout(env, timeout=30)
 
         # Initialize history manager for 16-step observation history
         history_manager = HistoryPromptBuilder(
-            max_text_history=self.max_text_history,
+            max_history=self.max_text_history,
             max_image_history=self.max_image_history,
             max_cot_history=self.max_cot_history,
         )
@@ -497,9 +560,17 @@ class BalrogEnv(MultiTurnEnv):
             tool_calls = last_message["tool_calls"]
 
         if not tool_calls:
-            return []
-
-        messages_out = []
+            obs = state.get("observation")
+            if obs is None:
+                return []
+            obs_text = self.format_balrog_observation(obs, state["environment"], state["history_manager"])
+            response_content = (
+                "Your response was not recognized as a valid action. "
+                "You must call the take_action tool. Example:\n"
+                '<tool_call>\n{"name": "take_action", "arguments": {"action": "go forward"}}\n</tool_call>\n\n'
+                + obs_text
+            )
+            return [{"role": "user", "content": response_content}]
 
         # Extract reasoning from assistant message (before tool calls)
         assistant_reasoning = None
@@ -513,122 +584,117 @@ class BalrogEnv(MultiTurnEnv):
         if not assistant_reasoning:
             assistant_reasoning = self.extract_reasoning_from_message(last_message)
 
-        for tool_call in tool_calls:
-            call_id = None
-            action = None
+        # Only process the first tool call (one action per step)
+        tool_call = tool_calls[0]
+        call_id = None
+        action = None
 
-            if hasattr(tool_call, "id"):
-                call_id = tool_call.id
-            elif isinstance(tool_call, dict):
-                call_id = tool_call.get("id")
+        if hasattr(tool_call, "id"):
+            call_id = tool_call.id
+        elif isinstance(tool_call, dict):
+            call_id = tool_call.get("id")
 
-            if hasattr(tool_call, "name"):
-                if tool_call.name == "take_action":
-                    try:
-                        raw_args = tool_call.arguments
-                        if isinstance(raw_args, str):
-                            args = json.loads(raw_args)
-                        elif isinstance(raw_args, dict):
-                            args = raw_args
-                        else:
-                            args = {}
-                        action = args.get("action")
-                    except:
-                        pass
-            elif isinstance(tool_call, dict):
-                if tool_call.get("name") == "take_action" or tool_call.get("function", {}).get("name") == "take_action":
-                    try:
-                        args = tool_call.get("arguments") or tool_call.get("function", {}).get("arguments", {})
-                        if isinstance(args, str):
-                            args = json.loads(args)
-                        elif not isinstance(args, dict):
-                            args = {}
-                        action = args.get("action")
-                    except:
-                        pass
+        if hasattr(tool_call, "name"):
+            if tool_call.name == "take_action":
+                try:
+                    raw_args = tool_call.arguments
+                    if isinstance(raw_args, str):
+                        args = json.loads(raw_args)
+                    elif isinstance(raw_args, dict):
+                        args = raw_args
+                    else:
+                        args = {}
+                    action = args.get("action")
+                except:
+                    pass
+        elif isinstance(tool_call, dict):
+            if tool_call.get("name") == "take_action" or tool_call.get("function", {}).get("name") == "take_action":
+                try:
+                    args = tool_call.get("arguments") or tool_call.get("function", {}).get("arguments", {})
+                    if isinstance(args, str):
+                        args = json.loads(args)
+                    elif not isinstance(args, dict):
+                        args = {}
+                    action = args.get("action")
+                except:
+                    pass
+
+        logger.info(
+            f"[DEBUG] Processing tool_call: call_id='{call_id}', action='{action}', reasoning='{assistant_reasoning if assistant_reasoning else None}'"
+        )
+
+        if call_id is None:
+            obs = state.get("observation")
+            if obs is None:
+                return []
+            response_content = self.format_balrog_observation(obs, state["environment"], state["history_manager"])
+            return [{"role": "user", "content": response_content}]
+
+        if action is None:
+            return [vf.ToolMessage(
+                tool_call_id=call_id,
+                content="Error: Invalid or missing action. Please use the take_action function with a valid action from BALROG's action space.",
+            )]
+
+        try:
+            env = state["env"]
+            history_manager = state["history_manager"]
+
+            logger.info(f"[DEBUG] Executing BALROG action '{action}' in environment")
+
+            if assistant_reasoning:
+                history_manager.update_reasoning(assistant_reasoning)
+
+            valid_action: str = env.check_action_validity(action)
+            obs, reward, terminated, truncated, info = env.step(valid_action)
+            done = bool(terminated or truncated)
+
+            state["observation"] = obs
+            state["step_count"] += 1
+            state["done"] = done
+            state["episode_return"] += float(reward)
+
+            if "game_trajectory" not in state:
+                state["game_trajectory"] = []
+            state["game_trajectory"].append({
+                "action": valid_action,
+                "observation": obs,
+                "reward": reward,
+                "info": info,
+                "reasoning": assistant_reasoning or "",
+                "terminated": terminated,
+                "truncated": truncated,
+            })
+
+            history_manager.update_action(valid_action)
+
+            if isinstance(obs, dict):
+                history_manager.update_observation(obs)
+            else:
+                formatted_obs = {"text": {"long_term_context": str(obs), "short_term_context": ""}}
+                history_manager.update_observation(formatted_obs)
 
             logger.info(
-                f"[DEBUG] Processing tool_call: call_id='{call_id}', action='{action}', reasoning='{assistant_reasoning if assistant_reasoning else None}'"
+                f" BALROG action executed: step={state['step_count']}, reward={reward}, done={done}, return={state['episode_return']}"
+            )
+            response_content: str = self.format_balrog_observation(obs, state["environment"], history_manager)
+
+            if done:
+                response_content += f"\n\nEpisode completed! Final score: {state['episode_return']}"
+
+            tool_reply = vf.ToolMessage(
+                tool_call_id=call_id,
+                content=response_content,
             )
 
-            if call_id is None:
-                continue
+        except Exception as e:
+            logger.error(f" Exception executing action for call_id {call_id}: {e}")
+            tool_reply = vf.ToolMessage(
+                tool_call_id=call_id,
+                content=f"Error executing BALROG action: {str(e)}",
+            )
 
-            if action is None:
-                tool_reply = vf.ToolMessage(
-                    tool_call_id=call_id,
-                    content="Error: Invalid or missing action. Please use the take_action function with a valid action from BALROG's action space.",
-                )
-                messages_out.append(tool_reply)
-                continue
-
-            try:
-                env = state["env"]
-                history_manager = state["history_manager"]
-
-                logger.info(f"[DEBUG] Executing BALROG action '{action}' in environment")
-
-                if assistant_reasoning:
-                    history_manager.update_reasoning(assistant_reasoning)
-
-                # Use BALROG's action validation
-                valid_action: str = env.check_action_validity(action)
-                obs, reward, terminated, truncated, info = env.step(valid_action)
-                done = bool(terminated or truncated)
-
-                state["observation"] = obs
-                state["step_count"] += 1
-                state["done"] = done
-                state["episode_return"] += float(reward)
-
-                # Add to game trajectory with BALROG format including reasoning
-                # Note: We use a separate "game_trajectory" field because state["trajectory"]
-                # is managed by the verifiers framework and should not be modified directly
-                trajectory_step = {
-                    "action": valid_action,
-                    "observation": obs,
-                    "reward": reward,
-                    "info": info,
-                    "reasoning": assistant_reasoning or "",
-                    "terminated": terminated,
-                    "truncated": truncated,
-                }
-
-                if "game_trajectory" not in state:
-                    state["game_trajectory"] = []
-                state["game_trajectory"].append(trajectory_step)
-
-                history_manager.update_action(valid_action)
-
-                if isinstance(obs, dict):
-                    history_manager.update_observation(obs)
-                else:
-                    formatted_obs = {"text": {"long_term_context": str(obs), "short_term_context": ""}}
-                    history_manager.update_observation(formatted_obs)
-
-                logger.info(
-                    f" BALROG action executed: step={state['step_count']}, reward={reward}, done={done}, return={state['episode_return']}"
-                )
-                response_content: str = self.format_balrog_observation(obs, state["environment"], history_manager)
-
-                if done:
-                    response_content += f"\n\nEpisode completed! Final score: {state['episode_return']}"
-
-                tool_reply = vf.ToolMessage(
-                    tool_call_id=call_id,
-                    content=response_content,
-                )
-
-            except Exception as e:
-                logger.error(f" Exception executing action for call_id {call_id}: {e}")
-                tool_reply = vf.ToolMessage(
-                    tool_call_id=call_id,
-                    content=f"Error executing BALROG action: {str(e)}",
-                )
-
-            messages_out.append(tool_reply)
-
-        return messages_out
+        return [tool_reply]
 
     def format_balrog_observation(self, obs: Any, env_name: str, history_manager=None) -> str:
         """Format observation using BALROG's standard formatting with history context."""
@@ -756,7 +822,7 @@ def load_environment(
                     }
 
                     row = {
-                        "prompt": [{"role": "system", "content": system_prompt}],
+                        "prompt": [{"role": "system", "content": system_prompt + "\n\nReason step by step before acting."}],
                         "info": info_dict,
                     }
 

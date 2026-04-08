@@ -46,6 +46,7 @@ class WandbMonitor(Monitor):
             project=config.project,
             name=config.name,
             id=config.id,
+            tags=config.tags or None,
             dir=output_dir,
             resume="allow",
             config=run_config.model_dump() if run_config else None,
@@ -104,10 +105,60 @@ class WandbMonitor(Monitor):
             trajectory = rollout["trajectory"]
             if not trajectory:
                 continue
-            last_step = trajectory[-1]
-            tokens = last_step["tokens"]
-            full_ids = tokens["prompt_ids"] + tokens["completion_ids"]
-            messages_text = self.tokenizer.decode(full_ids)
+            # Reconstruct the full episode conversation from trajectory steps.
+            # Each TrajectoryStep has `prompt` (Messages) and `completion`
+            # (Messages). Build the complete history by walking steps:
+            # step 0's prompt has [system, user_obs], then each step adds
+            # its completion. For step > 0, the prompt also contains the
+            # new env response (user message) appended after the previous
+            # completion. After resets (markovian_pure/summary), later
+            # prompts are shorter but still end with the new observation.
+            prev_prompt_len = 0
+            all_msgs: list[dict] = []
+            for traj_step in trajectory:
+                prompt_msgs = traj_step.get("prompt") or []
+                completion_msgs = traj_step.get("completion") or []
+                # Add any new messages from the prompt (env responses, obs)
+                # that weren't already in our accumulated conversation.
+                # For step 0: all prompt messages are new.
+                # For step N: new messages are those beyond prev_prompt_len,
+                # UNLESS a reset happened (prompt got shorter), in which case
+                # only the last message (new observation) is truly new.
+                if len(prompt_msgs) > prev_prompt_len:
+                    all_msgs.extend(prompt_msgs[prev_prompt_len:])
+                elif len(prompt_msgs) <= prev_prompt_len and prev_prompt_len > 0:
+                    # Reset happened — prompt is shorter. Insert a compaction
+                    # marker so the viz can show where turns were dropped/compressed.
+                    dropped = prev_prompt_len - len(prompt_msgs)
+                    all_msgs.append({
+                        "role": "system",
+                        "content": f"[COMPACTION: {dropped} messages dropped from context]",
+                    })
+                    if prompt_msgs:
+                        all_msgs.append(prompt_msgs[-1])
+                all_msgs.extend(completion_msgs)
+                prev_prompt_len = len(prompt_msgs) + len(completion_msgs)
+            # Convert verifiers Message objects to plain dicts for the tokenizer
+            msg_dicts = []
+            for m in all_msgs:
+                if hasattr(m, "model_dump"):
+                    d = m.model_dump()
+                elif isinstance(m, dict):
+                    d = dict(m)
+                else:
+                    d = {"role": getattr(m, "role", "user"), "content": str(getattr(m, "content", ""))}
+                for key in ("reasoning_content", "thinking_blocks"):
+                    d.pop(key, None)
+                if "tool_calls" in d and not d["tool_calls"]:
+                    del d["tool_calls"]
+                msg_dicts.append(d)
+            try:
+                messages_text = self.tokenizer.apply_chat_template(
+                    msg_dicts, tokenize=False, add_generation_prompt=False,
+                )
+            except Exception:
+                messages_text = "\n".join(f"[{m.get('role', '?')}] {m.get('content', '')}" for m in msg_dicts)
+            full_ids = self.tokenizer.encode(messages_text)
             sample = {
                 "step": step,
                 "task": rollout.get("task"),

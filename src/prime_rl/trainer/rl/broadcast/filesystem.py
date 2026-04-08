@@ -51,6 +51,11 @@ class FileSystemWeightBroadcast(WeightBroadcast):
 
                 state_dict = revert_weight_conversion(model, state_dict)
 
+            # Composition models (text_config extracted): add language_model. prefix
+            # so vLLM's weight mapper can match the keys to its internal structure.
+            if getattr(model.config, "_composition_source", None):
+                state_dict = {f"language_model.{k}": v for k, v in state_dict.items()}
+
         for idx in self.multi_run_manager.ready_to_update_idxs:
             self.logger.debug(
                 f"Broadcasting weights for run {idx} (ready_to_update={self.multi_run_manager.ready_to_update[idx]})"

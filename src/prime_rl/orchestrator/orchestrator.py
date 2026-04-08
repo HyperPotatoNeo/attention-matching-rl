@@ -190,9 +190,21 @@ async def orchestrate(config: OrchestratorConfig):
             "Rollouts run individually and are scored once each group completes."
         )
 
+    # CompactionEnv / TurnCompactionEnv override get_model_response() and must
+    # run in-process to call /compact_generate or /compact_session/* on the
+    # local inference server.  Skip spawning ZMQ servers for these.
+    _INPROCESS_ENVS = {"CompactionEnv", "TurnCompactionEnv"}
+
     train_env_addresses = []
+    train_env_inprocess = []
     env_processes: list[mp.Process] = []
-    for env_id, env, env_name in zip(env_ids, config.env, train_env_names):
+    for env_id, env, env_name, train_env in zip(env_ids, config.env, train_env_names, train_env_group.envs):
+        is_inprocess = type(train_env).__name__ in _INPROCESS_ENVS
+        train_env_inprocess.append(is_inprocess)
+        if is_inprocess:
+            logger.info("Skipping ZMQ server for train %s (runs in-process)", type(train_env).__name__)
+            train_env_addresses.append(None)
+            continue
         if env.address is None:
             address, process = spawn_env_server(
                 env_id=env_id,
@@ -213,23 +225,19 @@ async def orchestrate(config: OrchestratorConfig):
             address = env.address
         logger.info(f"Connecting train environment {env_name} to server at {address}")
         train_env_addresses.append(address)
-    train_env_clients = [
-        setup_env_client(address=address, name=name) for name, address in zip(train_env_names, train_env_addresses)
+
+    remote_train = [
+        (name, addr) for name, addr, inp in zip(train_env_names, train_env_addresses, train_env_inprocess) if not inp
     ]
-
-    logger.info("Waiting for train environment servers to be ready")
-    await wait_for_env_servers(train_env_clients)
-    logger.success("Train environment servers ready")
-
-    # this puts all train envs into server mode
-    # all calls to run_rollout and run_group will be routed to the server via the env client
-    # Skip env_client for CompactionEnv — it overrides get_model_response() and must
-    # run in-process to call /compact_generate on the local inference server.
-    for env, env_client in zip(train_env_group.envs, train_env_clients):
-        if type(env).__name__ == "CompactionEnv":
-            logger.info("Skipping env_client for CompactionEnv (runs in-process)")
-        else:
-            env.env_client = env_client
+    if remote_train:
+        train_env_clients = [setup_env_client(address=addr, name=name) for name, addr in remote_train]
+        logger.info("Waiting for train environment servers to be ready")
+        await wait_for_env_servers(train_env_clients)
+        logger.success("Train environment servers ready")
+        client_iter = iter(train_env_clients)
+        for env, inp in zip(train_env_group.envs, train_env_inprocess):
+            if not inp:
+                env.env_client = next(client_iter)
 
     if config.eval:
         env_ids = [strip_env_version(env.id) for env in config.eval.env]
@@ -237,8 +245,15 @@ async def orchestrate(config: OrchestratorConfig):
         eval_env_names = [env.name or env_id for env_id, env in zip(env_ids, config.eval.env)]
         eval_sampling_args = get_eval_sampling_args(config.eval.sampling)
         eval_env_addresses = []
+        eval_env_inprocess = []
 
-        for env_id, env, eval_env_name in zip(env_ids, config.eval.env, eval_env_names):
+        for env_id, env, eval_env_name, eval_env in zip(env_ids, config.eval.env, eval_env_names, eval_envs):
+            is_inprocess = type(eval_env).__name__ in _INPROCESS_ENVS
+            eval_env_inprocess.append(is_inprocess)
+            if is_inprocess:
+                logger.info("Skipping ZMQ server for eval %s (runs in-process)", type(eval_env).__name__)
+                eval_env_addresses.append(None)
+                continue
             if env.address is None:
                 address, process = spawn_env_server(
                     env_id=env_id,
@@ -255,18 +270,18 @@ async def orchestrate(config: OrchestratorConfig):
             logger.info(f"Connecting eval environment {eval_env_name} to server at {address}")
             eval_env_addresses.append(address)
 
-        eval_env_clients = [
-            setup_env_client(address=address, name=name) for name, address in zip(eval_env_names, eval_env_addresses)
+        remote_eval = [
+            (name, addr) for name, addr, inp in zip(eval_env_names, eval_env_addresses, eval_env_inprocess) if not inp
         ]
-
-        logger.info("Waiting for eval environment servers to be ready")
-        await wait_for_env_servers(eval_env_clients)
-        logger.success("Eval environment servers ready")
-
-        # this puts all eval envs into server mode
-        # all calls to run_rollout and run_group will be routed to the server via the env client
-        for eval_env, eval_env_client in zip(eval_envs, eval_env_clients):
-            eval_env.env_client = eval_env_client
+        if remote_eval:
+            eval_env_clients = [setup_env_client(address=addr, name=name) for name, addr in remote_eval]
+            logger.info("Waiting for eval environment servers to be ready")
+            await wait_for_env_servers(eval_env_clients)
+            logger.success("Eval environment servers ready")
+            client_iter = iter(eval_env_clients)
+            for eval_env, inp in zip(eval_envs, eval_env_inprocess):
+                if not inp:
+                    eval_env.env_client = next(client_iter)
     else:
         eval_envs: list[vf.Environment] = []
         eval_env_names: list[str] = []

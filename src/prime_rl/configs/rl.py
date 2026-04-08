@@ -71,6 +71,8 @@ class SharedWandbConfig(BaseConfig):
 
     offline: Annotated[bool | None, Field(description="Whether to run W&B in offline mode.")] = False
 
+    tags: Annotated[list[str], Field(description="Tags for the W&B run.")] = []
+
 
 class SharedCheckpointConfig(BaseConfig):
     """Configures shared checkpoint configs."""
@@ -408,6 +410,10 @@ class RLConfig(BaseConfig):
             if self.wandb.offline:
                 self.trainer.wandb.offline = self.wandb.offline
                 self.orchestrator.wandb.offline = self.wandb.offline
+
+            if self.wandb.tags:
+                self.trainer.wandb.tags = self.wandb.tags
+                self.orchestrator.wandb.tags = self.wandb.tags
 
         validate_shared_wandb_config(self.trainer, self.orchestrator)
 
