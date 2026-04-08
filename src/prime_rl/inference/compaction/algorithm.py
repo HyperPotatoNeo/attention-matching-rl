@@ -281,3 +281,100 @@ def compact_kv(
         seed=seed,
         forced_indices=forced_indices,
     )
+
+
+def compact_kv_range_alllayers(
+    keys: list[torch.Tensor],
+    values: list[torch.Tensor],
+    compact_start: int,
+    compact_end: int,
+    target_ratio: float,
+    num_kv_heads: int,
+    head_size: int,
+    device: torch.device,
+    num_queries: int = 64,
+    suffix_queries: list[torch.Tensor] | None = None,
+    seed: int | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], None, list[torch.Tensor]]:
+    """Compact KV range with all layers in a single batched operation.
+
+    Stacks L layers into the BMM batch dimension (L*H heads), eliminating the
+    per-layer Python loop. Does not support compute_beta or forced_indices —
+    use compact_kv_range for those features.
+
+    Same return format as compact_kv_range for drop-in substitution.
+    """
+    L = len(keys)
+    H = num_kv_heads
+    D = head_size
+    scale = 1.0 / math.sqrt(D)
+    region_len = compact_end - compact_start
+    target_len = max(1, int(region_len * target_ratio))
+    dtype = keys[0].dtype
+
+    # Stack all layers: (L, seq_len, H, D) → (L*H, seq_len, D)
+    all_K = torch.stack(keys)
+    all_V = torch.stack(values)
+    seq_len = all_K.shape[1]
+
+    K_lh = all_K.permute(0, 2, 1, 3).reshape(L * H, seq_len, D).float()
+    V_lh = all_V.permute(0, 2, 1, 3).reshape(L * H, seq_len, D).float()
+
+    Rk_lh = K_lh[:, compact_start:compact_end, :]
+    Rv_lh = V_lh[:, compact_start:compact_end, :]
+
+    # Build queries: (L*H, num_queries, D)
+    if suffix_queries is not None:
+        Q = torch.cat(suffix_queries, dim=0).float()
+    else:
+        rng = torch.Generator(device=device)
+        if seed is not None:
+            rng.manual_seed(seed)
+        Q_single = torch.randn(H, num_queries, D, device=device, dtype=torch.float32,
+                                generator=rng if seed is not None else None)
+        Q = Q_single.repeat(L, 1, 1)
+
+    # Single batched attention: (L*H, Q, seq_len)
+    full_scores = torch.bmm(Q, K_lh.transpose(1, 2)) * scale
+    full_attn = torch.softmax(full_scores, dim=-1)
+    region_attn = full_attn[:, :, compact_start:compact_end]
+
+    # Importance scoring + top-k
+    importance = region_attn.pow(2).mean(dim=1).sqrt()
+    topk_indices = importance.topk(target_len, dim=-1).indices
+    topk_indices = topk_indices.sort(dim=-1).values
+
+    # Gather selected keys: (L*H, target_len, D)
+    idx_exp = topk_indices.unsqueeze(-1).expand(-1, -1, D)
+    c1_lh = torch.gather(Rk_lh, 1, idx_exp)
+
+    # lstsq for C2
+    Y = torch.bmm(region_attn, Rv_lh)
+    X = torch.bmm(Q, c1_lh.transpose(1, 2)) * scale
+    X = torch.softmax(X, dim=-1)
+
+    XtX = torch.bmm(X.transpose(1, 2), X)
+    XtX.diagonal(dim1=-2, dim2=-1).add_(1e-3)
+    c2_lh = torch.linalg.solve(XtX, torch.bmm(X.transpose(1, 2), Y))
+
+    v_absmax = Rv_lh.abs().max().item() * 2.0 + 1.0
+    c2_lh = c2_lh.clamp(-v_absmax, v_absmax)
+
+    # Unstack back to per-layer format
+    topk_lh = topk_indices.view(L, H, target_len)
+    c2_reshaped = c2_lh.view(L, H, target_len, D)
+
+    region_K = all_K[:, compact_start:compact_end, :, :]
+
+    c1_list, c2_list, indices_list = [], [], []
+    for l in range(L):
+        per_layer_idx = topk_lh[l]
+        c1_out = torch.gather(
+            region_K[l], 0,
+            per_layer_idx.permute(1, 0).unsqueeze(-1).expand(-1, -1, D),
+        )
+        c1_list.append(c1_out)
+        c2_list.append(c2_reshaped[l].permute(1, 0, 2).to(dtype))
+        indices_list.append(per_layer_idx)
+
+    return c1_list, c2_list, None, indices_list

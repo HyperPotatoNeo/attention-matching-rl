@@ -23,7 +23,7 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.forward_context import set_forward_context
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 
-from prime_rl.inference.compaction.algorithm import compact_kv, compact_kv_range
+from prime_rl.inference.compaction.algorithm import compact_kv, compact_kv_range, compact_kv_range_alllayers
 from prime_rl.inference.compaction.beta_attention import (
     BetaState, patch_attention_layers, unpatch_attention_layers,
 )
@@ -734,6 +734,19 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                         beta_list = None
                         compacted_prefix_len = 0
                         inject_think[i] = True
+                    elif not compute_beta:
+                        # All-layers batched compaction: L*H batch dim, single kernel
+                        c1_list, c2_list, _, indices_list = compact_kv_range_alllayers(
+                            keys, values,
+                            compact_start=prompt_lens[i],
+                            compact_end=prompt_lens[i] + window,
+                            target_ratio=compact_target_ratio,
+                            num_kv_heads=num_kv_heads,
+                            head_size=head_size,
+                            device=device,
+                        )
+                        beta_list = None
+                        compacted_prefix_len = c1_list[0].shape[0]
                     else:
                         c1_list, c2_list, beta_list, indices_list = compact_kv(
                             keys, values, prompt_lens[i], compact_target_ratio,
