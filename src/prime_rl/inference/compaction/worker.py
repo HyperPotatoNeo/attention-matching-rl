@@ -2039,6 +2039,229 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             "diagnostics": {"compaction_events": compaction_events},
         }
 
+    def compact_session_create_batch(
+        self,
+        session_ids: list[str],
+        prompt_ids_list: list[list[int]],
+        max_kv_len: int,
+        max_response_tokens: int,
+        eos_token_id: int,
+        compact_target_ratio: float = 0.25,
+        compact_window: int | None = None,
+        temperature: float = 0.6,
+        top_p: float = 0.95,
+        compaction_mode: str = "attention_matching",
+        use_suffix_queries: bool = True,
+        n_max_turns: int = -1,
+        n_preserved_turns: int = 0,
+        system_prompt_len: int | None = None,
+    ) -> list[dict]:
+        """Batched session create: prefill + generate first response for B sessions."""
+        B = len(session_ids)
+        if B == 0:
+            return []
+        if B == 1:
+            return [self.compact_session_create(
+                session_ids[0], prompt_ids_list[0], max_kv_len, max_response_tokens,
+                eos_token_id, compact_target_ratio=compact_target_ratio,
+                compact_window=compact_window, temperature=temperature, top_p=top_p,
+                compaction_mode=compaction_mode, use_suffix_queries=use_suffix_queries,
+                n_max_turns=n_max_turns, n_preserved_turns=n_preserved_turns,
+                system_prompt_len=system_prompt_len,
+            )]
+
+        # If any prompt could trigger mid-create compaction, fall back to sequential.
+        max_prompt_len = max(len(p) for p in prompt_ids_list)
+        if max_prompt_len + max_response_tokens >= max_kv_len:
+            return [
+                self.compact_session_create(
+                    session_ids[i], prompt_ids_list[i], max_kv_len, max_response_tokens,
+                    eos_token_id, compact_target_ratio=compact_target_ratio,
+                    compact_window=compact_window, temperature=temperature, top_p=top_p,
+                    compaction_mode=compaction_mode, use_suffix_queries=use_suffix_queries,
+                    n_max_turns=n_max_turns, n_preserved_turns=n_preserved_turns,
+                    system_prompt_len=system_prompt_len,
+                )
+                for i in range(B)
+            ]
+
+        t_start = time.time()
+        if not hasattr(self, "_sessions"):
+            self._sessions = {}
+        for sid in session_ids:
+            assert sid not in self._sessions, f"Session {sid!r} already exists"
+
+        model = self._get_model()
+        device = self._get_device()
+        vllm_config = self.model_runner.vllm_config
+
+        kv_caches = self.model_runner.kv_caches
+        num_layers = len(kv_caches)
+        kv_shape = kv_caches[0].shape
+        num_total_blocks = kv_shape[1]
+        block_size = kv_shape[2]
+
+        attn_layer_names = self._get_attn_layer_names(model)
+        rng = torch.Generator(device=device)
+
+        # --- Allocate blocks for all B sessions ---
+        prompt_lens = [len(p) for p in prompt_ids_list]
+        per_seq_blocks = []
+        for i in range(B):
+            if compaction_mode == "attention_matching_full":
+                initial_len = min(prompt_lens[i] * 2 + max_response_tokens,
+                                  max_kv_len * 2 + max_response_tokens)
+            else:
+                initial_len = prompt_lens[i] + max_response_tokens
+            blocks_needed = math.ceil(initial_len / block_size)
+            free_blocks = self._find_free_blocks(num_total_blocks)
+            if len(free_blocks) < blocks_needed:
+                self._expire_stale_sessions()
+                free_blocks = self._find_free_blocks(num_total_blocks)
+            assert len(free_blocks) >= blocks_needed, (
+                f"Session create batch: session[{i}] needs {blocks_needed} blocks, "
+                f"only {len(free_blocks)} free"
+            )
+            per_seq_blocks.append(free_blocks[:blocks_needed])
+            # Reserve blocks by creating placeholder sessions
+            self._sessions[session_ids[i]] = SessionState(
+                block_ids=free_blocks[:blocks_needed],
+                current_seq_len=1,
+                prompt_len=prompt_lens[i],
+                position_offset=0,
+                max_kv_len=max_kv_len,
+                compact_target_ratio=compact_target_ratio,
+                compact_window=compact_window,
+                compaction_mode=compaction_mode,
+                temperature=temperature,
+                top_p=top_p,
+                eos_token_id=eos_token_id,
+                use_suffix_queries=use_suffix_queries,
+                turn_user_lens=[0],
+                turn_asst_lens=[0],
+                n_max_turns=n_max_turns,
+                n_preserved_turns=n_preserved_turns,
+                system_prompt_len=system_prompt_len,
+                compacted_prefix_end=prompt_lens[i],
+                last_access=time.monotonic(),
+            )
+
+        # --- Batched prefill ---
+        prefill_logits = _run_batched_prefill(
+            model, prompt_ids_list, per_seq_blocks, block_size,
+            attn_layer_names, vllm_config, device,
+        )
+
+        # --- Sample first tokens ---
+        current_seq_lens_t = torch.tensor(prompt_lens, dtype=torch.long, device=device) + 1
+        rng.manual_seed(0)
+        first_tokens, first_lps = _sample_batch(prefill_logits, temperature, top_p, rng)
+
+        all_token_ids = [[t.item()] for t in first_tokens]
+        all_logprobs = [[lp.item()] for lp in first_lps]
+        last_tokens = first_tokens.clone()
+
+        # --- Build batch decode context ---
+        max_blocks_now = max(len(b) for b in per_seq_blocks)
+        padded_blocks_decode = [
+            b + [-1] * (max_blocks_now - len(b)) for b in per_seq_blocks
+        ]
+        batch_ctx = _BatchDecodeContext.create(
+            B=B,
+            per_seq_blocks=padded_blocks_decode,
+            block_size=block_size,
+            max_blocks_per_seq=max_blocks_now,
+            attn_layer_names=attn_layer_names,
+            vllm_config=vllm_config,
+            device=device,
+        )
+        batch_ctx.metadata.max_seq_len = max_prompt_len + max_response_tokens
+
+        pos_offsets_t = torch.zeros(B, dtype=torch.long, device=device)
+        active = [True] * B
+        step = 0
+
+        # --- Batched decode loop ---
+        with set_forward_context(
+            batch_ctx.attn_metadata_dict, batch_ctx.vllm_config,
+            virtual_engine=0, num_tokens=B,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            slot_mapping=batch_ctx.slot_mapping_ctx,
+        ):
+            while any(active) and step < max_response_tokens - 1:
+                batch_ctx.input_ids[:] = last_tokens
+                batch_ctx.positions[:] = current_seq_lens_t - 1 + pos_offsets_t
+                batch_ctx.seq_lens[:] = current_seq_lens_t.int()
+                _update_batch_slots(batch_ctx, current_seq_lens_t)
+
+                hidden = model(input_ids=batch_ctx.input_ids,
+                               positions=batch_ctx.positions)
+                logits = model.compute_logits(hidden)
+
+                rng.manual_seed(step)
+                tokens, lps = _sample_batch(logits, temperature, top_p, rng)
+
+                for i in range(B):
+                    if not active[i]:
+                        continue
+                    tid = tokens[i].item()
+                    all_token_ids[i].append(tid)
+                    all_logprobs[i].append(lps[i].item())
+                    if tid == eos_token_id or len(all_token_ids[i]) >= max_response_tokens:
+                        active[i] = False
+
+                last_tokens = tokens
+                current_seq_lens_t += 1
+                step += 1
+
+        # --- Store session states ---
+        results = []
+        for i in range(B):
+            current_seq_len = current_seq_lens_t[i].item()
+            my_blocks = per_seq_blocks[i]
+            min_blocks = math.ceil(current_seq_len / block_size)
+            if len(my_blocks) > min_blocks:
+                my_blocks = my_blocks[:min_blocks]
+
+            self._sessions[session_ids[i]] = SessionState(
+                block_ids=my_blocks,
+                current_seq_len=current_seq_len,
+                prompt_len=prompt_lens[i],
+                position_offset=0,
+                max_kv_len=max_kv_len,
+                compact_target_ratio=compact_target_ratio,
+                compact_window=compact_window,
+                compaction_mode=compaction_mode,
+                temperature=temperature,
+                top_p=top_p,
+                eos_token_id=eos_token_id,
+                use_suffix_queries=use_suffix_queries,
+                turn_user_lens=[0],
+                turn_asst_lens=[len(all_token_ids[i])],
+                n_max_turns=n_max_turns,
+                n_preserved_turns=n_preserved_turns,
+                system_prompt_len=system_prompt_len,
+                compacted_prefix_end=prompt_lens[i],
+                last_access=time.monotonic(),
+            )
+
+            results.append({
+                "session_id": session_ids[i],
+                "all_token_ids": all_token_ids[i],
+                "all_logprobs": all_logprobs[i],
+                "current_seq_len": current_seq_len,
+                "diagnostics": {"compaction_events": []},
+            })
+
+        logger.info(
+            "compact_session_create_batch: B=%d, prompt_lens=%s, "
+            "resp_lens=%s, time=%.3fs",
+            B, prompt_lens, [len(t) for t in all_token_ids],
+            time.time() - t_start,
+        )
+
+        return results
+
     def compact_session_step(
         self,
         session_id: str,

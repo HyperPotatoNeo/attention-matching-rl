@@ -358,6 +358,137 @@ class SessionStepRequest(BaseModel):
     trigger_compact: bool = False
 
 
+SESSION_CREATE_MAX_BATCH = 16
+SESSION_CREATE_MAX_WAIT = 0.1
+
+
+class _SessionCreateBatcher:
+    """Accumulates individual session create requests and dispatches them in batch.
+
+    Groups by DP rank so all sessions in a batch go to the same engine.
+    """
+
+    def __init__(self):
+        self._queue: asyncio.Queue[tuple[SessionCreateRequest, int, asyncio.Future]] = asyncio.Queue()
+        self._started = False
+
+    def _ensure_started(self, app):
+        if not self._started:
+            self._started = True
+            asyncio.create_task(self._worker(app))
+
+    async def submit(self, body: SessionCreateRequest, eos_token_id: int, app) -> dict:
+        self._ensure_started(app)
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        await self._queue.put((body, eos_token_id, future))
+        return await future
+
+    async def _worker(self, app):
+        while True:
+            item = await self._queue.get()
+            batch = [item]
+
+            deadline = asyncio.get_event_loop().time() + SESSION_CREATE_MAX_WAIT
+            while len(batch) < SESSION_CREATE_MAX_BATCH:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                    batch.append(item)
+                except asyncio.TimeoutError:
+                    break
+
+            try:
+                await self._dispatch_batch(app, batch)
+            except Exception as e:
+                for _, _, future in batch:
+                    if not future.done():
+                        future.set_exception(e)
+
+    async def _dispatch_batch(self, app, batch):
+        engine = app.state.engine_client
+        tokenizer = engine.get_tokenizer()
+
+        _, dp_engines = _get_dp_engines(engine)
+        by_rank: dict[int, list[tuple[SessionCreateRequest, int, asyncio.Future]]] = {}
+
+        global _dp_counter
+        for body, eos_token_id, future in batch:
+            if dp_engines is not None:
+                rank = _dp_counter % len(dp_engines)
+                _dp_counter += 1
+                _session_dp_map[body.session_id] = rank
+            else:
+                rank = 0
+            by_rank.setdefault(rank, []).append((body, eos_token_id, future))
+
+        for rank, group in by_rank.items():
+            first = group[0][0]
+            session_ids = [b.session_id for b, _, _ in group]
+            prompt_ids_list = [b.prompt_ids for b, _, _ in group]
+            eos_token_id = group[0][1]
+
+            try:
+                if dp_engines is not None:
+                    client, _ = _get_dp_engines(engine)
+                    results = await client._call_utility_async(
+                        "collective_rpc", "compact_session_create_batch", None,
+                        (session_ids, prompt_ids_list, first.max_kv_len,
+                         first.max_response_tokens, eos_token_id), {
+                            "compact_target_ratio": first.compact_target_ratio,
+                            "compact_window": first.compact_window,
+                            "temperature": first.temperature,
+                            "top_p": first.top_p,
+                            "compaction_mode": first.compaction_mode,
+                            "use_suffix_queries": first.use_suffix_queries,
+                            "n_max_turns": first.n_max_turns,
+                            "n_preserved_turns": first.n_preserved_turns,
+                            "system_prompt_len": first.system_prompt_len,
+                        },
+                        engine=dp_engines[rank],
+                    )
+                else:
+                    results = await engine.collective_rpc(
+                        "compact_session_create_batch",
+                        args=(session_ids, prompt_ids_list, first.max_kv_len,
+                              first.max_response_tokens, eos_token_id),
+                        kwargs={
+                            "compact_target_ratio": first.compact_target_ratio,
+                            "compact_window": first.compact_window,
+                            "temperature": first.temperature,
+                            "top_p": first.top_p,
+                            "compaction_mode": first.compaction_mode,
+                            "use_suffix_queries": first.use_suffix_queries,
+                            "n_max_turns": first.n_max_turns,
+                            "n_preserved_turns": first.n_preserved_turns,
+                            "system_prompt_len": first.system_prompt_len,
+                        },
+                    )
+
+                batch_results = results[0]
+                for j, (_, _, future) in enumerate(group):
+                    data = batch_results[j]
+                    final_text = _decode_response(tokenizer, data["all_token_ids"])
+                    if not future.done():
+                        future.set_result({
+                            "session_id": data["session_id"],
+                            "all_token_ids": data["all_token_ids"],
+                            "all_logprobs": data.get("all_logprobs", []),
+                            "final_text": final_text,
+                            "current_seq_len": data["current_seq_len"],
+                            "diagnostics": data.get("diagnostics", {}),
+                        })
+            except Exception as e:
+                for _, _, future in group:
+                    if not future.done():
+                        future.set_exception(e)
+
+
+_session_create_batcher = _SessionCreateBatcher()
+
+
 @router.post("/compact_session/create")
 async def compact_session_create(body: SessionCreateRequest, request: Request):
     engine = request.app.state.engine_client
@@ -369,38 +500,7 @@ async def compact_session_create(body: SessionCreateRequest, request: Request):
         body.session_id, len(body.prompt_ids), body.max_kv_len,
     )
 
-    result = await _session_rpc(
-        engine, "compact_session_create", body.session_id,
-        args=(
-            body.session_id,
-            body.prompt_ids,
-            body.max_kv_len,
-            body.max_response_tokens,
-            eos_token_id,
-        ),
-        kwargs={
-            "compact_target_ratio": body.compact_target_ratio,
-            "compact_window": body.compact_window,
-            "temperature": body.temperature,
-            "top_p": body.top_p,
-            "compaction_mode": body.compaction_mode,
-            "use_suffix_queries": body.use_suffix_queries,
-            "n_max_turns": body.n_max_turns,
-            "n_preserved_turns": body.n_preserved_turns,
-            "system_prompt_len": body.system_prompt_len,
-        },
-    )
-
-    data = result[0]
-    final_text = _decode_response(tokenizer, data["all_token_ids"])
-    return {
-        "session_id": data["session_id"],
-        "all_token_ids": data["all_token_ids"],
-        "all_logprobs": data.get("all_logprobs", []),
-        "final_text": final_text,
-        "current_seq_len": data["current_seq_len"],
-        "diagnostics": data.get("diagnostics", {}),
-    }
+    return await _session_create_batcher.submit(body, eos_token_id, request.app)
 
 
 SESSION_STEP_MAX_BATCH = 16
