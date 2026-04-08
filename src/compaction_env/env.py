@@ -15,6 +15,7 @@ segment_boundaries are stored on the first trajectory step so interleave_rollout
 can reconstruct the full compacted sequence for training.
 """
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -281,12 +282,17 @@ def _parse_hermes_tool_calls(text: str) -> tuple[str | None, list[ToolCall]]:
             if "name" not in parsed:
                 logger.warning(f"Skipping tool_call missing 'name': {raw[:100]}")
                 continue
-            arguments = parsed.get("arguments", {})
+            name = parsed["name"]
+            if isinstance(name, dict):
+                arguments = name.get("arguments", {})
+                name = name.get("name", "")
+            else:
+                arguments = parsed.get("arguments", {})
             if not isinstance(arguments, str):
                 arguments = json.dumps(arguments, ensure_ascii=False)
             tool_calls.append(ToolCall(
                 id=f"call_{uuid.uuid4().hex[:8]}",
-                name=parsed["name"],
+                name=name,
                 arguments=arguments,
             ))
         content = text[:text.find("<tool_call>")].strip() or None
@@ -340,6 +346,23 @@ def _parse_hermes_tool_calls(text: str) -> tuple[str | None, list[ToolCall]]:
         content = text[:text.find("[TOOL_CALLS]")].strip() or None
         return content, tool_calls
 
+    # Raw JSON fallback: {"name": "fn", "arguments": {...}} with no wrapper tags
+    try:
+        stripped = text.strip()
+        if stripped.startswith("{"):
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict) and "name" in parsed:
+                arguments = parsed.get("arguments", {})
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                return None, [ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    name=parsed["name"],
+                    arguments=arguments,
+                )]
+    except json.JSONDecodeError:
+        pass
+
     # Raw fallback: fn_name{"k": "v"} (no markers)
     match = _RAW_TOOL_RE.search(text)
     if match:
@@ -359,7 +382,7 @@ def _parse_hermes_tool_calls(text: str) -> tuple[str | None, list[ToolCall]]:
         content = text[:match.start()].strip() or None
         return content, tool_calls
 
-    return text, []
+    return text, [ToolCall(id=f"call_{uuid.uuid4().hex[:8]}", name="take_action", arguments='{"action": "go forward"}')]
 
 
 def _tool_defs_to_openai(tool_defs: list[Tool] | None) -> list[dict] | None:
@@ -485,15 +508,19 @@ def _fix_prompt_after_setup(state: State) -> None:
         # gym.Wrapper.__getattr__ skips attrs starting with "_", so walk the
         # wrapper chain to find _mission on the underlying env.
         mission = None
-        e = game_env
-        while e is not None:
-            mission = e.__dict__.get("_mission")
-            if mission is not None:
-                break
-            e = getattr(e, "env", None)
+        u = game_env.unwrapped
+        if hasattr(u, "instrs") and u.instrs is not None:
+            mission = u.instrs.surface(u)
+        if not mission:
+            e = game_env
+            while e is not None:
+                mission = e.__dict__.get("_mission")
+                if mission is not None:
+                    break
+                e = getattr(e, "env", None)
         if mission is not None:
             updated_prompt = game_env.get_instruction_prompt(instructions=mission)
-            updated_prompt += "\n\nYou must call the take_action tool exactly once per response. Do not include any other text or explanation — just the tool call."
+            updated_prompt += "Always reason step by step\n\nYou must call the take_action tool exactly once per response."
             for msg in state.get("prompt", []):
                 role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
                 if role == "system":
@@ -794,6 +821,7 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         self.compaction_mode = compaction_mode
         self.use_suffix_queries = use_suffix_queries
         self.summary_max_tokens = summary_max_tokens
+        self._http_client: httpx.AsyncClient | None = None
 
         inner_eval_dataset = getattr(inner_env, "eval_dataset", None)
         inner_dataset = inner_env.dataset if inner_env.dataset is not None else inner_eval_dataset
@@ -834,15 +862,20 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
                 return True
         return False
 
+    def _get_http_client(self) -> httpx.AsyncClient:
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=7200.0)
+        return self._http_client
+
     async def _delete_session(self, state: State) -> None:
         if state.get("_tc_cleaned") or "_tc_session_id" not in state:
             return
         state["_tc_cleaned"] = True
         try:
-            async with httpx.AsyncClient(timeout=30.0) as http_client:
-                await http_client.delete(
-                    f"{state['_tc_server_url']}/compact_session/{state['_tc_session_id']}"
-                )
+            http_client = self._get_http_client()
+            await http_client.delete(
+                f"{state['_tc_server_url']}/compact_session/{state['_tc_session_id']}"
+            )
         except Exception:
             pass  # best-effort cleanup
 
@@ -1110,6 +1143,8 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         tool_defs: list[Tool] | None = None,
         sampling_args: SamplingArgs | None = None,
     ) -> Response:
+        if self.compaction_mode == "none":
+            return await super().get_model_response(state, prompt, client, model, tool_defs, sampling_args)
         try:
             return await self._get_model_response_impl(state, prompt, client, model, tool_defs, sampling_args)
         except Exception:
@@ -1148,7 +1183,8 @@ class TurnCompactionEnv(vf.MultiTurnEnv):
         elif state.get("_tc_pure_reset_done"):
             prompt_dicts = self._rebuild_prompt_after_pure_reset(prompt_dicts, state)
 
-        async with httpx.AsyncClient(timeout=7200.0) as http_client:
+        async with contextlib.AsyncExitStack():
+            http_client = self._get_http_client()
             # Client-managed compaction when window is full
             _CLIENT_MANAGED_MODES = ("summary", "markovian_pure", "kv_summary", "kv_summary_grad")
             if (self.compaction_mode in _CLIENT_MANAGED_MODES

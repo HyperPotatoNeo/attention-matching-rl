@@ -358,7 +358,7 @@ class SessionStepRequest(BaseModel):
     trigger_compact: bool = False
 
 
-SESSION_CREATE_MAX_BATCH = 16
+SESSION_CREATE_MAX_BATCH = 64
 SESSION_CREATE_MAX_WAIT = 0.1
 
 
@@ -424,66 +424,72 @@ class _SessionCreateBatcher:
                 rank = 0
             by_rank.setdefault(rank, []).append((body, eos_token_id, future))
 
-        for rank, group in by_rank.items():
-            first = group[0][0]
-            session_ids = [b.session_id for b, _, _ in group]
-            prompt_ids_list = [b.prompt_ids for b, _, _ in group]
-            eos_token_id = group[0][1]
+        # Dispatch all DP ranks in parallel
+        await asyncio.gather(*[
+            self._dispatch_create_rank(engine, dp_engines, tokenizer, rank, group)
+            for rank, group in by_rank.items()
+        ])
 
-            try:
-                if dp_engines is not None:
-                    client, _ = _get_dp_engines(engine)
-                    results = await client._call_utility_async(
-                        "collective_rpc", "compact_session_create_batch", None,
-                        (session_ids, prompt_ids_list, first.max_kv_len,
-                         first.max_response_tokens, eos_token_id), {
-                            "compact_target_ratio": first.compact_target_ratio,
-                            "compact_window": first.compact_window,
-                            "temperature": first.temperature,
-                            "top_p": first.top_p,
-                            "compaction_mode": first.compaction_mode,
-                            "use_suffix_queries": first.use_suffix_queries,
-                            "n_max_turns": first.n_max_turns,
-                            "n_preserved_turns": first.n_preserved_turns,
-                            "system_prompt_len": first.system_prompt_len,
-                        },
-                        engine=dp_engines[rank],
-                    )
-                else:
-                    results = await engine.collective_rpc(
-                        "compact_session_create_batch",
-                        args=(session_ids, prompt_ids_list, first.max_kv_len,
-                              first.max_response_tokens, eos_token_id),
-                        kwargs={
-                            "compact_target_ratio": first.compact_target_ratio,
-                            "compact_window": first.compact_window,
-                            "temperature": first.temperature,
-                            "top_p": first.top_p,
-                            "compaction_mode": first.compaction_mode,
-                            "use_suffix_queries": first.use_suffix_queries,
-                            "n_max_turns": first.n_max_turns,
-                            "n_preserved_turns": first.n_preserved_turns,
-                            "system_prompt_len": first.system_prompt_len,
-                        },
-                    )
+    async def _dispatch_create_rank(self, engine, dp_engines, tokenizer, rank, group):
+        first = group[0][0]
+        session_ids = [b.session_id for b, _, _ in group]
+        prompt_ids_list = [b.prompt_ids for b, _, _ in group]
+        eos_token_id = group[0][1]
 
-                batch_results = results[0]
-                for j, (_, _, future) in enumerate(group):
-                    data = batch_results[j]
-                    final_text = _decode_response(tokenizer, data["all_token_ids"])
-                    if not future.done():
-                        future.set_result({
-                            "session_id": data["session_id"],
-                            "all_token_ids": data["all_token_ids"],
-                            "all_logprobs": data.get("all_logprobs", []),
-                            "final_text": final_text,
-                            "current_seq_len": data["current_seq_len"],
-                            "diagnostics": data.get("diagnostics", {}),
-                        })
-            except Exception as e:
-                for _, _, future in group:
-                    if not future.done():
-                        future.set_exception(e)
+        try:
+            if dp_engines is not None:
+                client, _ = _get_dp_engines(engine)
+                results = await client._call_utility_async(
+                    "collective_rpc", "compact_session_create_batch", None,
+                    (session_ids, prompt_ids_list, first.max_kv_len,
+                     first.max_response_tokens, eos_token_id), {
+                        "compact_target_ratio": first.compact_target_ratio,
+                        "compact_window": first.compact_window,
+                        "temperature": first.temperature,
+                        "top_p": first.top_p,
+                        "compaction_mode": first.compaction_mode,
+                        "use_suffix_queries": first.use_suffix_queries,
+                        "n_max_turns": first.n_max_turns,
+                        "n_preserved_turns": first.n_preserved_turns,
+                        "system_prompt_len": first.system_prompt_len,
+                    },
+                    engine=dp_engines[rank],
+                )
+            else:
+                results = await engine.collective_rpc(
+                    "compact_session_create_batch",
+                    args=(session_ids, prompt_ids_list, first.max_kv_len,
+                          first.max_response_tokens, eos_token_id),
+                    kwargs={
+                        "compact_target_ratio": first.compact_target_ratio,
+                        "compact_window": first.compact_window,
+                        "temperature": first.temperature,
+                        "top_p": first.top_p,
+                        "compaction_mode": first.compaction_mode,
+                        "use_suffix_queries": first.use_suffix_queries,
+                        "n_max_turns": first.n_max_turns,
+                        "n_preserved_turns": first.n_preserved_turns,
+                        "system_prompt_len": first.system_prompt_len,
+                    },
+                )
+
+            batch_results = results[0]
+            for j, (_, _, future) in enumerate(group):
+                data = batch_results[j]
+                final_text = _decode_response(tokenizer, data["all_token_ids"])
+                if not future.done():
+                    future.set_result({
+                        "session_id": data["session_id"],
+                        "all_token_ids": data["all_token_ids"],
+                        "all_logprobs": data.get("all_logprobs", []),
+                        "final_text": final_text,
+                        "current_seq_len": data["current_seq_len"],
+                        "diagnostics": data.get("diagnostics", {}),
+                    })
+        except Exception as e:
+            for _, _, future in group:
+                if not future.done():
+                    future.set_exception(e)
 
 
 _session_create_batcher = _SessionCreateBatcher()
@@ -503,7 +509,7 @@ async def compact_session_create(body: SessionCreateRequest, request: Request):
     return await _session_create_batcher.submit(body, eos_token_id, request.app)
 
 
-SESSION_STEP_MAX_BATCH = 32
+SESSION_STEP_MAX_BATCH = 128
 SESSION_STEP_MAX_WAIT = 0.2
 
 
@@ -597,42 +603,47 @@ class _SessionStepBatcher:
                 rank = 0
             by_rank.setdefault(rank, []).append((body, future))
 
-        # Dispatch each DP rank's batch
-        for rank, group in by_rank.items():
-            session_ids = [b.session_id for b, _ in group]
-            new_token_ids_list = [b.new_token_ids for b, _ in group]
-            max_resp_list = [b.max_response_tokens for b, _ in group]
+        # Dispatch all DP ranks in parallel
+        await asyncio.gather(*[
+            self._dispatch_step_rank(engine, dp_engines, tokenizer, rank, group)
+            for rank, group in by_rank.items()
+        ])
 
-            try:
-                if dp_engines is not None:
-                    client, _ = _get_dp_engines(engine)
-                    results = await client._call_utility_async(
-                        "collective_rpc", "compact_session_step_batch", None,
-                        (session_ids, new_token_ids_list, max_resp_list), {},
-                        engine=dp_engines[rank],
-                    )
-                else:
-                    results = await engine.collective_rpc(
-                        "compact_session_step_batch",
-                        args=(session_ids, new_token_ids_list, max_resp_list),
-                    )
+    async def _dispatch_step_rank(self, engine, dp_engines, tokenizer, rank, group):
+        session_ids = [b.session_id for b, _ in group]
+        new_token_ids_list = [b.new_token_ids for b, _ in group]
+        max_resp_list = [b.max_response_tokens for b, _ in group]
 
-                batch_results = results[0]
-                for j, (_, future) in enumerate(group):
-                    data = batch_results[j]
-                    final_text = _decode_response(tokenizer, data["all_token_ids"])
-                    if not future.done():
-                        future.set_result({
-                            "all_token_ids": data["all_token_ids"],
-                            "all_logprobs": data.get("all_logprobs", []),
-                            "final_text": final_text,
-                            "current_seq_len": data["current_seq_len"],
-                            "diagnostics": data.get("diagnostics", {}),
-                        })
-            except Exception as e:
-                for _, future in group:
-                    if not future.done():
-                        future.set_exception(e)
+        try:
+            if dp_engines is not None:
+                client, _ = _get_dp_engines(engine)
+                results = await client._call_utility_async(
+                    "collective_rpc", "compact_session_step_batch", None,
+                    (session_ids, new_token_ids_list, max_resp_list), {},
+                    engine=dp_engines[rank],
+                )
+            else:
+                results = await engine.collective_rpc(
+                    "compact_session_step_batch",
+                    args=(session_ids, new_token_ids_list, max_resp_list),
+                )
+
+            batch_results = results[0]
+            for j, (_, future) in enumerate(group):
+                data = batch_results[j]
+                final_text = _decode_response(tokenizer, data["all_token_ids"])
+                if not future.done():
+                    future.set_result({
+                        "all_token_ids": data["all_token_ids"],
+                        "all_logprobs": data.get("all_logprobs", []),
+                        "final_text": final_text,
+                        "current_seq_len": data["current_seq_len"],
+                        "diagnostics": data.get("diagnostics", {}),
+                    })
+        except Exception as e:
+            for _, future in group:
+                if not future.done():
+                    future.set_exception(e)
 
 
 _session_step_batcher = _SessionStepBatcher()

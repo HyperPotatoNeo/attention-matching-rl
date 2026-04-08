@@ -2353,15 +2353,17 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             window = min(state.compact_window or asst_len, asst_len)
             suffix_len = asst_len - window
 
-            keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
-
             indices_list = None
             if state.compaction_mode == "markovian":
-                kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
-                c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
-                c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
+                compact_start = state.prompt_len
+                compact_end = state.prompt_len + window
+                _markovian_shift_kv(
+                    kv_caches, state.block_ids, block_size, num_layers,
+                    compact_start, compact_end, kv_len,
+                )
                 compacted_prefix_len = 0
             else:
+                keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
                 compact_seed = state.prompt_len * 10000 + state.compaction_count
                 c1_list, c2_list, _, indices_list = compact_kv(
                     keys, values, state.prompt_len, state.compact_target_ratio,
@@ -2370,14 +2372,14 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     seed=compact_seed,
                 )
                 compacted_prefix_len = c1_list[0].shape[0]
+                _inject_compacted_kv(
+                    kv_caches, keys, values, c1_list, c2_list,
+                    state.block_ids, block_size, state.prompt_len, num_layers,
+                    old_seq_len=kv_len, compact_window=window,
+                )
             state.compaction_count += 1
 
             new_seq_len = state.prompt_len + compacted_prefix_len + suffix_len
-            _inject_compacted_kv(
-                kv_caches, keys, values, c1_list, c2_list,
-                state.block_ids, block_size, state.prompt_len, num_layers,
-                old_seq_len=kv_len, compact_window=window,
-            )
             position_offset += kv_len - new_seq_len
             current_seq_len = new_seq_len + 1
             compaction_events.append({
@@ -2403,15 +2405,17 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     window = min(state.compact_window or asst_len, asst_len)
                     suffix_len = asst_len - window
 
-                    keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
-
                     indices_list = None
                     if state.compaction_mode == "markovian":
-                        kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
-                        c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
-                        c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
+                        compact_start = state.prompt_len
+                        compact_end = state.prompt_len + window
+                        _markovian_shift_kv(
+                            kv_caches, state.block_ids, block_size, num_layers,
+                            compact_start, compact_end, kv_len,
+                        )
                         compacted_prefix_len = 0
                     else:
+                        keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
                         compact_seed = state.prompt_len * 10000 + state.compaction_count
                         c1_list, c2_list, _, indices_list = compact_kv(
                             keys, values, state.prompt_len, state.compact_target_ratio,
@@ -2420,14 +2424,14 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                             seed=compact_seed,
                         )
                         compacted_prefix_len = c1_list[0].shape[0]
+                        _inject_compacted_kv(
+                            kv_caches, keys, values, c1_list, c2_list,
+                            state.block_ids, block_size, state.prompt_len, num_layers,
+                            old_seq_len=kv_len, compact_window=window,
+                        )
                     state.compaction_count += 1
 
                     new_seq_len = state.prompt_len + compacted_prefix_len + suffix_len
-                    _inject_compacted_kv(
-                        kv_caches, keys, values, c1_list, c2_list,
-                        state.block_ids, block_size, state.prompt_len, num_layers,
-                        old_seq_len=kv_len, compact_window=window,
-                    )
                     position_offset += kv_len - new_seq_len
                     current_seq_len = new_seq_len + 1
                     compaction_events.append({
@@ -2478,19 +2482,18 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 compact_start = state.prompt_len
 
             if compact_end > compact_start:
-                keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
                 turn_compact_window = compact_end - compact_start
-
                 indices_list = None
+
                 if state.compaction_mode == "markovian":
-                    kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
-                    c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
-                    c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
+                    # Fast path: shift suffix left without extracting full KV
+                    _markovian_shift_kv(
+                        kv_caches, state.block_ids, block_size, num_layers,
+                        compact_start, compact_end, kv_len,
+                    )
                     compacted_prefix_len = 0
                 else:
-                    # Use K-vectors of the most recent assistant response as importance queries.
-                    # Subtract 1 from asst_len because EOS is counted in turn_asst_lens but
-                    # not yet written to KV (it's the boundary token for the next step).
+                    keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
                     asst_len_in_kv = state.turn_asst_lens[-1] - 1
                     asst_start = kv_len - asst_len_in_kv
                     query_vecs = [k[asst_start:kv_len].permute(1, 0, 2) for k in keys]
@@ -2508,15 +2511,15 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                         seed=compact_seed,
                     )
                     compacted_prefix_len = c1_list[0].shape[0]
+                    _inject_compacted_kv(
+                        kv_caches, keys, values, c1_list, c2_list,
+                        state.block_ids, block_size, compact_start, num_layers,
+                        old_seq_len=kv_len,
+                        compact_window=turn_compact_window,
+                    )
+
                 state.compaction_count += 1
                 new_seq_len = compact_start + compacted_prefix_len + (kv_len - compact_end)
-
-                _inject_compacted_kv(
-                    kv_caches, keys, values, c1_list, c2_list,
-                    state.block_ids, block_size, compact_start, num_layers,
-                    old_seq_len=kv_len,
-                    compact_window=turn_compact_window,
-                )
                 position_offset += kv_len - new_seq_len
                 current_seq_len = new_seq_len + 1
 
@@ -2784,16 +2787,18 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     compact_start = state.prompt_len
 
                 if compact_end > compact_start:
-                    keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
                     turn_compact_window = compact_end - compact_start
-
                     indices_list = None
+
                     if state.compaction_mode == "markovian":
-                        kv_dim = (0, keys[0].shape[1], keys[0].shape[2])
-                        c1_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in keys]
-                        c2_list = [torch.empty(kv_dim, dtype=keys[0].dtype, device=device) for _ in values]
+                        # Fast path: shift suffix left without extracting full KV
+                        _markovian_shift_kv(
+                            kv_caches, state.block_ids, block_size, num_layers,
+                            compact_start, compact_end, kv_len,
+                        )
                         compacted_prefix_len = 0
                     else:
+                        keys, values = _extract_kv(kv_caches, state.block_ids, kv_len, block_size, num_layers)
                         asst_len_in_kv = state.turn_asst_lens[-1] - 1
                         asst_start = kv_len - asst_len_in_kv
                         query_vecs = [k[asst_start:kv_len].permute(1, 0, 2) for k in keys]
@@ -2811,15 +2816,15 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                             seed=compact_seed,
                         )
                         compacted_prefix_len = c1_list[0].shape[0]
+                        _inject_compacted_kv(
+                            kv_caches, keys, values, c1_list, c2_list,
+                            state.block_ids, block_size, compact_start, num_layers,
+                            old_seq_len=kv_len,
+                            compact_window=turn_compact_window,
+                        )
+
                     state.compaction_count += 1
                     new_seq_len = compact_start + compacted_prefix_len + (kv_len - compact_end)
-
-                    _inject_compacted_kv(
-                        kv_caches, keys, values, c1_list, c2_list,
-                        state.block_ids, block_size, compact_start, num_layers,
-                        old_seq_len=kv_len,
-                        compact_window=turn_compact_window,
-                    )
                     position_offset += kv_len - new_seq_len
                     current_seq_len = new_seq_len + 1
 
@@ -3498,6 +3503,46 @@ def _zero_blocks(
         bid = block_ids[b]
         kv[0, bid, block_offset:block_offset + count] = 0
         kv[1, bid, block_offset:block_offset + count] = 0
+
+
+def _markovian_shift_kv(
+    kv_caches: list[torch.Tensor],
+    block_ids: list[int],
+    block_size: int,
+    num_layers: int,
+    compact_start: int,
+    compact_end: int,
+    old_seq_len: int,
+) -> None:
+    """Markovian compaction: shift suffix left and zero tail, no extraction needed.
+
+    Moves KV data from [compact_end, old_seq_len) to [compact_start, ...),
+    then zeros [compact_start + suffix_len, old_seq_len). Operates directly
+    on paged blocks without extracting the full KV cache.
+    """
+    suffix_len = old_seq_len - compact_end
+    if suffix_len <= 0:
+        for layer_idx in range(num_layers):
+            _zero_blocks(kv_caches[layer_idx], block_ids, block_size, compact_start, old_seq_len)
+        return
+
+    # Read suffix from source positions, write to destination
+    for layer_idx in range(num_layers):
+        kv = kv_caches[layer_idx]
+        # Read suffix into contiguous tensor
+        src_blocks_start = compact_end // block_size
+        src_blocks_end = (old_seq_len - 1) // block_size + 1
+        src_bids = block_ids[src_blocks_start:src_blocks_end]
+        raw = kv[:, src_bids].reshape(2, -1, kv.shape[3], kv.shape[4])
+        src_offset = compact_end - src_blocks_start * block_size
+        suffix_k = raw[0, src_offset:src_offset + suffix_len]
+        suffix_v = raw[1, src_offset:src_offset + suffix_len]
+
+        _write_to_blocks(kv, block_ids, block_size, compact_start, suffix_k, suffix_v)
+
+        new_total = compact_start + suffix_len
+        if new_total < old_seq_len:
+            _zero_blocks(kv, block_ids, block_size, new_total, old_seq_len)
 
 
 def _inject_compacted_kv(
