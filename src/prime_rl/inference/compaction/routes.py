@@ -503,8 +503,8 @@ async def compact_session_create(body: SessionCreateRequest, request: Request):
     return await _session_create_batcher.submit(body, eos_token_id, request.app)
 
 
-SESSION_STEP_MAX_BATCH = 16
-SESSION_STEP_MAX_WAIT = 0.05
+SESSION_STEP_MAX_BATCH = 32
+SESSION_STEP_MAX_WAIT = 0.2
 
 
 class _SessionStepBatcher:

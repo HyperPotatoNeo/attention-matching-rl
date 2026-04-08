@@ -1,0 +1,95 @@
+# Debug speed test: attention_matching, 10 steps
+max_steps = 10
+seq_len = 6000
+output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/debug-speed/debug-speed-am"
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "balrog-rl-speed-debug"
+tags = ["debug", "speed", "babyai", "attention_matching"]
+name = "debug-speed-am-speed"
+
+[trainer.wandb]
+tags = ["debug", "speed", "babyai", "attention_matching"]
+id = "debug-speed-am-trainer"
+
+[orchestrator.wandb]
+tags = ["debug", "speed", "babyai", "attention_matching"]
+id = "debug-speed-am-orch"
+
+[ckpt]
+interval = 100
+resume_step = -1
+
+[deployment]
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[inference]
+gpu_memory_utilization = 0.95
+
+[inference.model]
+enforce_eager = true
+max_model_len = 16384
+
+[inference.vllm_extra]
+enable_compaction = true
+
+[trainer]
+dist_timeout_seconds = 3600
+compact_target_ratio = 0.25
+compaction_mode = "attention_matching"
+use_suffix_queries = true
+
+[trainer.model]
+impl = "auto"
+optim_cpu_offload = true
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+lr = 1e-06
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+
+[trainer.loss]
+type = "default"
+kl_tau = 0.1
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 4
+max_inflight_rollouts = 128
+
+[orchestrator.advantage]
+type = "default"
+
+[orchestrator.client]
+base_url = ["http://localhost:8000/v1"]
+
+[orchestrator.sampling]
+max_tokens = 512
+temperature = 1.0
+
+[[orchestrator.env]]
+id = "turn_compaction_env"
+name = "debug-speed-am"
+args = { gym = "balrog-bench", max_kv_len = 6000, max_response_tokens = 512, compact_target_ratio = 0.25, n_max_turns = 4, n_preserved_turns = 3, max_turns = 60, compaction_mode = "attention_matching", use_suffix_queries = true, environments = ["babyai"], max_text_history = 16 }
+
+[orchestrator.eval]
+interval = 5
+num_examples = 20
+rollouts_per_example = 1
+
+[orchestrator.eval.sampling]
+temperature = 1.0
+max_tokens = 512
+
+[[orchestrator.eval.env]]
+id = "turn_compaction_env"
+name = "debug-speed-am-eval"
+args = { gym = "balrog-bench", max_kv_len = 6000, max_response_tokens = 512, compact_target_ratio = 0.25, n_max_turns = 4, n_preserved_turns = 3, max_turns = 60, compaction_mode = "attention_matching", use_suffix_queries = true, environments = ["babyai"], max_text_history = 16 }
