@@ -530,8 +530,8 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             B, max_kv_len, max_total_tokens, compact_target_ratio, max_blocks_per_seq,
         )
 
-        # --- Prefill each prompt separately ---
-        prompt_lens = []
+        # --- Batched prefill ---
+        prompt_lens = [len(p) for p in prompt_ids_list]
         current_seq_lens = torch.zeros(B, dtype=torch.long, device=device)
         position_offsets = torch.zeros(B, dtype=torch.long, device=device)
         last_tokens = torch.zeros(B, dtype=torch.long, device=device)
@@ -539,31 +539,19 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         all_logprobs: list[list[float]] = [[] for _ in range(B)]
 
         t_prefill = time.time()
+        batched_logits = _run_batched_prefill(
+            model, prompt_ids_list, per_seq_blocks,
+            block_size, attn_layer_names, vllm_config, device,
+        )
+
         for i in range(B):
-            prompt_ids = prompt_ids_list[i]
-            plen = len(prompt_ids)
-            prompt_lens.append(plen)
-
-            input_ids_t = torch.tensor(prompt_ids, dtype=torch.long, device=device)
-            positions_t = torch.arange(plen, dtype=torch.long, device=device)
-
-            logits = _run_prefill(
-                model, input_ids_t, positions_t,
-                seq_len=plen,
-                block_ids=per_seq_blocks[i],
-                block_size=block_size,
-                attn_layer_names=attn_layer_names,
-                vllm_config=vllm_config,
-                device=device,
-            )
-
-            token, logprob = _sample_token(logits[-1:], temperature, top_p, rng, seed=i)
+            token, logprob = _sample_token(batched_logits[i:i+1], temperature, top_p, rng, seed=i)
             all_token_ids[i].append(token.item())
             all_logprobs[i].append(logprob.item())
-            current_seq_lens[i] = plen + 1
+            current_seq_lens[i] = prompt_lens[i] + 1
             last_tokens[i] = token
 
-        logger.info("Prefilled %d prompts in %.3fs", B, time.time() - t_prefill)
+        logger.info("Batched prefill: %d prompts in %.3fs", B, time.time() - t_prefill)
 
         # --- Beta state setup (contiguous KV + beta buffers) ---
         beta_state = None
@@ -2565,6 +2553,88 @@ def _run_prefill(
         hidden_states = model(input_ids=input_ids, positions=positions)
 
     return model.compute_logits(hidden_states[-1:])
+
+
+def _run_batched_prefill(
+    model,
+    prompt_ids_list: list[list[int]],
+    per_seq_blocks: list[list[int]],
+    block_size: int,
+    attn_layer_names: list[str],
+    vllm_config,
+    device: torch.device,
+) -> torch.Tensor:
+    """Run prefill for B sequences in a single packed forward pass.
+
+    Uses FlashAttention's variable-length support via query_start_loc
+    to pack multiple sequences into one forward call.
+
+    Returns: logits (B, vocab_size) — last-token logits for each sequence.
+    """
+    B = len(prompt_ids_list)
+    prompt_lens = [len(p) for p in prompt_ids_list]
+    total_tokens = sum(prompt_lens)
+    max_prompt_len = max(prompt_lens)
+
+    all_input_ids = torch.cat([
+        torch.tensor(p, dtype=torch.long, device=device)
+        for p in prompt_ids_list
+    ])
+
+    all_positions = torch.cat([
+        torch.arange(plen, dtype=torch.long, device=device)
+        for plen in prompt_lens
+    ])
+
+    slots = []
+    for i, plen in enumerate(prompt_lens):
+        for pos in range(plen):
+            block_idx = pos // block_size
+            offset = pos % block_size
+            slots.append(per_seq_blocks[i][block_idx] * block_size + offset)
+    slot_mapping = torch.tensor(slots, dtype=torch.int64, device=device)
+
+    query_start_loc = torch.zeros(B + 1, dtype=torch.int32, device=device)
+    for i, plen in enumerate(prompt_lens):
+        query_start_loc[i + 1] = query_start_loc[i] + plen
+
+    seq_lens = torch.tensor(prompt_lens, dtype=torch.int32, device=device)
+
+    max_blocks = max(len(b) for b in per_seq_blocks)
+    padded_blocks = [
+        b + [-1] * (max_blocks - len(b)) for b in per_seq_blocks
+    ]
+    block_table = torch.tensor(padded_blocks, dtype=torch.int32, device=device)
+
+    metadata = FlashAttentionMetadata(
+        num_actual_tokens=total_tokens,
+        max_query_len=max_prompt_len,
+        query_start_loc=query_start_loc,
+        max_seq_len=max_prompt_len,
+        seq_lens=seq_lens,
+        block_table=block_table,
+        slot_mapping=slot_mapping,
+        use_cascade=False,
+        common_prefix_len=0,
+        cu_prefix_query_lens=None,
+        prefix_kv_lens=None,
+        suffix_kv_lens=None,
+    )
+
+    attn_metadata = {name: metadata for name in attn_layer_names}
+    slot_mapping_dict = {name: slot_mapping for name in attn_layer_names}
+
+    with set_forward_context(
+        attn_metadata, vllm_config,
+        virtual_engine=0, num_tokens=total_tokens,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        slot_mapping=slot_mapping_dict,
+    ):
+        hidden_states = model(input_ids=all_input_ids, positions=all_positions)
+
+    last_indices = query_start_loc[1:].long() - 1
+    last_hidden = hidden_states[last_indices]
+    return model.compute_logits(last_hidden)
 
 
 def _update_decode_state(
