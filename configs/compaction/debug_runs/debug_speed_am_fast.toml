@@ -1,6 +1,4 @@
-# Debug speed test: AM inference + kv_markovian_grad training, 10 steps
-# Inference uses attention_matching (high-quality compaction).
-# Trainer uses FlexAttention deletion mask (single forward pass, ~15x faster than segmented_forward).
+# Debug speed test: am_fast, 10 steps
 max_steps = 10
 seq_len = 6000
 output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/debug-speed/debug-speed-am-fast"
@@ -11,15 +9,15 @@ name = "Qwen/Qwen3-4B-Instruct-2507"
 [wandb]
 project = "balrog-rl-speed-debug"
 tags = ["debug", "speed", "babyai", "am_fast"]
-name = "debug-speed-am-fast"
+name = "debug-speed-am_fast-speed"
 
 [trainer.wandb]
 tags = ["debug", "speed", "babyai", "am_fast"]
-id = "debug-speed-am-fast-trainer"
+id = "debug-speed-am_fast-trainer"
 
 [orchestrator.wandb]
 tags = ["debug", "speed", "babyai", "am_fast"]
-id = "debug-speed-am-fast-orch"
+id = "debug-speed-am_fast-orch"
 
 [ckpt]
 interval = 100
@@ -42,7 +40,6 @@ enable_compaction = true
 [trainer]
 dist_timeout_seconds = 3600
 compact_target_ratio = 0.25
-# Override trainer to use single-pass deletion mask instead of segmented_forward
 compaction_mode = "kv_markovian_grad"
 
 [trainer.model]
@@ -80,8 +77,7 @@ temperature = 1.0
 
 [[orchestrator.env]]
 id = "turn_compaction_env"
-name = "debug-speed-am-fast"
-# Env uses attention_matching for inference — auto_setup won't override trainer since AM is the default
+name = "debug-speed-am_fast"
 args = { gym = "balrog-bench", max_kv_len = 6000, max_response_tokens = 512, compact_target_ratio = 0.25, n_max_turns = 4, n_preserved_turns = 3, max_turns = 60, compaction_mode = "attention_matching", use_suffix_queries = true, environments = ["babyai"], max_text_history = 16 }
 
 [orchestrator.eval]
@@ -95,5 +91,5 @@ max_tokens = 512
 
 [[orchestrator.eval.env]]
 id = "turn_compaction_env"
-name = "debug-speed-am-fast-eval"
+name = "debug-speed-am_fast-eval"
 args = { gym = "balrog-bench", max_kv_len = 6000, max_response_tokens = 512, compact_target_ratio = 0.25, n_max_turns = 4, n_preserved_turns = 3, max_turns = 60, compaction_mode = "attention_matching", use_suffix_queries = true, environments = ["babyai"], max_text_history = 16 }
