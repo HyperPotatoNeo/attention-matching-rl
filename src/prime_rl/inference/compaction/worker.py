@@ -1883,17 +1883,16 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         num_kv_heads = kv_shape[3]
         head_size = kv_shape[4]
 
-        # Allocate a fixed block budget for the entire session lifetime.
-        # The caller (TurnCompactionEnv) already inflates max_kv_len to cover
-        # n_max_turns turns (prompt + n_max_turns * (max_response_tokens + obs_tokens)).
-        # attention_matching_full stacks compacted blocks so allocate 2x to avoid
-        # OOB during generation before compaction fires.
-        # Step-time dynamic extension (compact_session_step) handles any overflow.
+        # Lazy allocation: only reserve blocks for the first turn (prompt + response).
+        # compact_session_step dynamically extends block_ids when more are needed
+        # (lines below in compact_session_step) and trims them after each step.
+        prompt_len_est = len(prompt_ids)
         if compaction_mode == "attention_matching_full":
-            max_possible_len = max_kv_len * 2 + max_response_tokens
+            initial_len = min(prompt_len_est * 2 + max_response_tokens,
+                              max_kv_len * 2 + max_response_tokens)
         else:
-            max_possible_len = max_kv_len + max_response_tokens
-        blocks_needed = math.ceil(max_possible_len / block_size)
+            initial_len = prompt_len_est + max_response_tokens
+        blocks_needed = math.ceil(initial_len / block_size)
         free_blocks = self._find_free_blocks(num_total_blocks)
         if len(free_blocks) < blocks_needed:
             self._expire_stale_sessions()
@@ -1996,6 +1995,11 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                 last_token_gpu = token.view(1)
                 current_seq_len += 1
                 seg_count += 1
+
+        # Shrink blocks to actual usage before storing session state.
+        min_blocks = math.ceil(current_seq_len / block_size)
+        if len(my_blocks) > min_blocks:
+            my_blocks = my_blocks[:min_blocks]
 
         self._sessions[session_id] = SessionState(
             block_ids=my_blocks,
@@ -2308,11 +2312,16 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         state.current_seq_len = current_seq_len
         state.position_offset = position_offset
 
+        # Shrink block allocation to actual usage — frees blocks for other sessions.
+        min_blocks = math.ceil(current_seq_len / block_size)
+        if len(state.block_ids) > min_blocks:
+            state.block_ids = state.block_ids[:min_blocks]
+
         logger.info(
             "compact_session_step: session=%s, new_tokens=%d, response_tokens=%d, "
-            "current_seq_len=%d, compactions=%d",
+            "current_seq_len=%d, blocks=%d, compactions=%d",
             session_id, len(new_token_ids), len(all_token_ids),
-            current_seq_len, len(compaction_events),
+            current_seq_len, len(state.block_ids), len(compaction_events),
         )
 
         return {
