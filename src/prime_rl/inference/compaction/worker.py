@@ -2107,6 +2107,8 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         # --- Allocate blocks for all B sessions ---
         prompt_lens = [len(p) for p in prompt_ids_list]
         per_seq_blocks = []
+        free_blocks = self._find_free_blocks(num_total_blocks)
+        free_idx = 0
         for i in range(B):
             if compaction_mode == "attention_matching_full":
                 initial_len = min(prompt_lens[i] * 2 + max_response_tokens,
@@ -2114,18 +2116,19 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
             else:
                 initial_len = prompt_lens[i] + max_response_tokens
             blocks_needed = math.ceil(initial_len / block_size)
-            free_blocks = self._find_free_blocks(num_total_blocks)
-            if len(free_blocks) < blocks_needed:
+            if free_idx + blocks_needed > len(free_blocks):
                 self._expire_stale_sessions()
                 free_blocks = self._find_free_blocks(num_total_blocks)
-            assert len(free_blocks) >= blocks_needed, (
+                free_idx = 0
+            assert free_idx + blocks_needed <= len(free_blocks), (
                 f"Session create batch: session[{i}] needs {blocks_needed} blocks, "
-                f"only {len(free_blocks)} free"
+                f"only {len(free_blocks) - free_idx} free"
             )
-            per_seq_blocks.append(free_blocks[:blocks_needed])
+            per_seq_blocks.append(free_blocks[free_idx:free_idx + blocks_needed])
+            free_idx += blocks_needed
             # Reserve blocks by creating placeholder sessions
             self._sessions[session_ids[i]] = SessionState(
-                block_ids=free_blocks[:blocks_needed],
+                block_ids=per_seq_blocks[i],
                 current_seq_len=1,
                 prompt_len=prompt_lens[i],
                 position_offset=0,
@@ -2603,19 +2606,21 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
         max_response_tokens = max(max_response_tokens_list)
 
         # --- Extend block allocations for each session ---
+        free_blocks = self._find_free_blocks(num_total_blocks)
+        free_idx = 0
         for i, state in enumerate(states):
             existing_seq_len = state.current_seq_len - 1
             max_seq_this = existing_seq_len + len(new_token_ids_list[i]) + max_response_tokens_list[i]
             blocks_required = math.ceil(max_seq_this / block_size)
             if blocks_required > len(state.block_ids):
                 extra_needed = blocks_required - len(state.block_ids)
-                free_blocks = self._find_free_blocks(num_total_blocks)
-                if len(free_blocks) < extra_needed:
+                if free_idx + extra_needed > len(free_blocks):
                     raise RuntimeError(
                         f"compact_session_step_batch: session={session_ids[i]!r} needs "
-                        f"{extra_needed} extra blocks but only {len(free_blocks)} free"
+                        f"{extra_needed} extra blocks but only {len(free_blocks) - free_idx} free"
                     )
-                state.block_ids = state.block_ids + free_blocks[:extra_needed]
+                state.block_ids = state.block_ids + free_blocks[free_idx:free_idx + extra_needed]
+                free_idx += extra_needed
 
         # --- Batched append-prefill ---
         t_prefill_start = time.time()
