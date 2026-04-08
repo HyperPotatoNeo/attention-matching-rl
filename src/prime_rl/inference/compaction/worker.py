@@ -2496,7 +2496,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                     query_vecs = [k[asst_start:kv_len].permute(1, 0, 2) for k in keys]
 
                     compact_seed = state.prompt_len * 10000 + state.compaction_count
-                    c1_list, c2_list, _, indices_list = compact_kv_range(
+                    c1_list, c2_list, _, indices_list = compact_kv_range_alllayers(
                         keys, values,
                         compact_start=compact_start,
                         compact_end=compact_end,
@@ -2799,7 +2799,7 @@ class CompactionWorker(FileSystemWeightUpdateWorker):
                         query_vecs = [k[asst_start:kv_len].permute(1, 0, 2) for k in keys]
 
                         compact_seed = state.prompt_len * 10000 + state.compaction_count
-                        c1_list, c2_list, _, indices_list = compact_kv_range(
+                        c1_list, c2_list, _, indices_list = compact_kv_range_alllayers(
                             keys, values,
                             compact_start=compact_start,
                             compact_end=compact_end,
