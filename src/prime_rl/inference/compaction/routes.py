@@ -403,35 +403,144 @@ async def compact_session_create(body: SessionCreateRequest, request: Request):
     }
 
 
+SESSION_STEP_MAX_BATCH = 16
+SESSION_STEP_MAX_WAIT = 0.05
+
+
+class _SessionStepBatcher:
+    """Accumulates individual session step requests and dispatches them in batch.
+
+    Groups by DP rank so all sessions in a batch go to the same engine.
+    Falls back to sequential dispatch for requests with is_summary or trigger_compact.
+    """
+
+    def __init__(self):
+        self._queue: asyncio.Queue[tuple[SessionStepRequest, asyncio.Future]] = asyncio.Queue()
+        self._started = False
+
+    def _ensure_started(self, app):
+        if not self._started:
+            self._started = True
+            asyncio.create_task(self._worker(app))
+
+    async def submit(self, body: SessionStepRequest, app) -> dict:
+        self._ensure_started(app)
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        await self._queue.put((body, future))
+        return await future
+
+    async def _worker(self, app):
+        while True:
+            item = await self._queue.get()
+            batch = [item]
+
+            deadline = asyncio.get_event_loop().time() + SESSION_STEP_MAX_WAIT
+            while len(batch) < SESSION_STEP_MAX_BATCH:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                    batch.append(item)
+                except asyncio.TimeoutError:
+                    break
+
+            try:
+                await self._dispatch_batch(app, batch)
+            except Exception as e:
+                for _, future in batch:
+                    if not future.done():
+                        future.set_exception(e)
+
+    async def _dispatch_batch(self, app, batch):
+        engine = app.state.engine_client
+        tokenizer = engine.get_tokenizer()
+
+        # Split: special requests (is_summary/trigger_compact) go sequential,
+        # normal requests get batched by DP rank.
+        special = [(b, f) for b, f in batch if b.is_summary or b.trigger_compact]
+        normal = [(b, f) for b, f in batch if not b.is_summary and not b.trigger_compact]
+
+        # Dispatch special requests sequentially
+        for body, future in special:
+            try:
+                result = await _session_rpc(
+                    engine, "compact_session_step", body.session_id,
+                    args=(body.session_id, body.new_token_ids, body.max_response_tokens),
+                    kwargs={"is_summary": body.is_summary, "trigger_compact": body.trigger_compact},
+                )
+                data = result[0]
+                final_text = _decode_response(tokenizer, data["all_token_ids"])
+                if not future.done():
+                    future.set_result({
+                        "all_token_ids": data["all_token_ids"],
+                        "all_logprobs": data.get("all_logprobs", []),
+                        "final_text": final_text,
+                        "current_seq_len": data["current_seq_len"],
+                        "diagnostics": data.get("diagnostics", {}),
+                    })
+            except Exception as e:
+                if not future.done():
+                    future.set_exception(e)
+
+        if not normal:
+            return
+
+        # Group normal requests by DP rank
+        _, dp_engines = _get_dp_engines(engine)
+        by_rank: dict[int, list[tuple[SessionStepRequest, asyncio.Future]]] = {}
+        for body, future in normal:
+            if dp_engines is not None and body.session_id in _session_dp_map:
+                rank = _session_dp_map[body.session_id]
+            else:
+                rank = 0
+            by_rank.setdefault(rank, []).append((body, future))
+
+        # Dispatch each DP rank's batch
+        for rank, group in by_rank.items():
+            session_ids = [b.session_id for b, _ in group]
+            new_token_ids_list = [b.new_token_ids for b, _ in group]
+            max_resp_list = [b.max_response_tokens for b, _ in group]
+
+            try:
+                if dp_engines is not None:
+                    client, _ = _get_dp_engines(engine)
+                    results = await client._call_utility_async(
+                        "collective_rpc", "compact_session_step_batch", None,
+                        (session_ids, new_token_ids_list, max_resp_list), {},
+                        engine=dp_engines[rank],
+                    )
+                else:
+                    results = await engine.collective_rpc(
+                        "compact_session_step_batch",
+                        args=(session_ids, new_token_ids_list, max_resp_list),
+                    )
+
+                batch_results = results[0]
+                for j, (_, future) in enumerate(group):
+                    data = batch_results[j]
+                    final_text = _decode_response(tokenizer, data["all_token_ids"])
+                    if not future.done():
+                        future.set_result({
+                            "all_token_ids": data["all_token_ids"],
+                            "all_logprobs": data.get("all_logprobs", []),
+                            "final_text": final_text,
+                            "current_seq_len": data["current_seq_len"],
+                            "diagnostics": data.get("diagnostics", {}),
+                        })
+            except Exception as e:
+                for _, future in group:
+                    if not future.done():
+                        future.set_exception(e)
+
+
+_session_step_batcher = _SessionStepBatcher()
+
+
 @router.post("/compact_session/step")
 async def compact_session_step(body: SessionStepRequest, request: Request):
-    engine = request.app.state.engine_client
-    tokenizer = engine.get_tokenizer()
-
-    logger.info(
-        "/compact_session/step: session=%s, new_tokens=%d",
-        body.session_id, len(body.new_token_ids),
-    )
-
-    result = await _session_rpc(
-        engine, "compact_session_step", body.session_id,
-        args=(
-            body.session_id,
-            body.new_token_ids,
-            body.max_response_tokens,
-        ),
-        kwargs={"is_summary": body.is_summary, "trigger_compact": body.trigger_compact},
-    )
-
-    data = result[0]
-    final_text = _decode_response(tokenizer, data["all_token_ids"])
-    return {
-        "all_token_ids": data["all_token_ids"],
-        "all_logprobs": data.get("all_logprobs", []),
-        "final_text": final_text,
-        "current_seq_len": data["current_seq_len"],
-        "diagnostics": data.get("diagnostics", {}),
-    }
+    return await _session_step_batcher.submit(body, request.app)
 
 
 @router.delete("/compact_session/{session_id}")
