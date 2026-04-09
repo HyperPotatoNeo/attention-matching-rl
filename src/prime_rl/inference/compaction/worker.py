@@ -3458,6 +3458,19 @@ def _extract_kv(
     return keys, values
 
 
+def _pos_to_slots(
+    block_ids: list[int],
+    block_size: int,
+    start_pos: int,
+    count: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Map sequential positions [start_pos, start_pos+count) to flat KV cache slots."""
+    positions = torch.arange(start_pos, start_pos + count, device=device)
+    bid_t = torch.tensor(block_ids, dtype=torch.long, device=device)
+    return bid_t[positions // block_size] * block_size + positions % block_size
+
+
 def _write_to_blocks(
     kv: torch.Tensor,
     block_ids: list[int],
@@ -3466,30 +3479,14 @@ def _write_to_blocks(
     data_k: torch.Tensor,
     data_v: torch.Tensor,
 ) -> None:
-    """Write N tokens of K/V data starting at start_pos into paged blocks.
-
-    Handles partial first/last blocks and vectorizes writes to complete middle blocks.
-    """
+    """Write N tokens of K/V data starting at start_pos into paged blocks."""
     N = data_k.shape[0]
     if N == 0:
         return
-
-    end_pos = start_pos + N
-    first_block = start_pos // block_size
-    last_block = (end_pos - 1) // block_size
-
-    data_offset = 0
-    for b in range(first_block, last_block + 1):
-        block_start = b * block_size
-        write_start = max(start_pos, block_start)
-        write_end = min(end_pos, block_start + block_size)
-        count = write_end - write_start
-        block_offset = write_start - block_start
-
-        bid = block_ids[b]
-        kv[0, bid, block_offset:block_offset + count] = data_k[data_offset:data_offset + count]
-        kv[1, bid, block_offset:block_offset + count] = data_v[data_offset:data_offset + count]
-        data_offset += count
+    slots = _pos_to_slots(block_ids, block_size, start_pos, N, data_k.device)
+    flat_kv = kv.reshape(2, -1, kv.shape[3], kv.shape[4])
+    flat_kv[0, slots] = data_k
+    flat_kv[1, slots] = data_v
 
 
 def _zero_blocks(
@@ -3502,20 +3499,9 @@ def _zero_blocks(
     """Zero out KV cache entries in positions [start_pos, end_pos)."""
     if start_pos >= end_pos:
         return
-
-    first_block = start_pos // block_size
-    last_block = (end_pos - 1) // block_size
-
-    for b in range(first_block, last_block + 1):
-        block_start = b * block_size
-        zero_start = max(start_pos, block_start)
-        zero_end = min(end_pos, block_start + block_size)
-        block_offset = zero_start - block_start
-        count = zero_end - zero_start
-
-        bid = block_ids[b]
-        kv[0, bid, block_offset:block_offset + count] = 0
-        kv[1, bid, block_offset:block_offset + count] = 0
+    slots = _pos_to_slots(block_ids, block_size, start_pos, end_pos - start_pos, kv.device)
+    flat_kv = kv.reshape(2, -1, kv.shape[3], kv.shape[4])
+    flat_kv[:, slots] = 0
 
 
 def _markovian_shift_kv(
@@ -3531,31 +3517,31 @@ def _markovian_shift_kv(
 
     Moves KV data from [compact_end, old_seq_len) to [compact_start, ...),
     then zeros [compact_start + suffix_len, old_seq_len). Operates directly
-    on paged blocks without extracting the full KV cache.
+    on paged blocks using vectorized slot mappings.
     """
+    device = kv_caches[0].device
     suffix_len = old_seq_len - compact_end
+    new_total = compact_start + suffix_len
+
     if suffix_len <= 0:
+        zero_slots = _pos_to_slots(block_ids, block_size, compact_start,
+                                   old_seq_len - compact_start, device)
         for layer_idx in range(num_layers):
-            _zero_blocks(kv_caches[layer_idx], block_ids, block_size, compact_start, old_seq_len)
+            flat = kv_caches[layer_idx].reshape(2, -1, kv_caches[0].shape[3], kv_caches[0].shape[4])
+            flat[:, zero_slots] = 0
         return
 
-    # Read suffix from source positions, write to destination
+    src_slots = _pos_to_slots(block_ids, block_size, compact_end, suffix_len, device)
+    dst_slots = _pos_to_slots(block_ids, block_size, compact_start, suffix_len, device)
+    zero_slots = (_pos_to_slots(block_ids, block_size, new_total,
+                                old_seq_len - new_total, device)
+                  if new_total < old_seq_len else None)
+
     for layer_idx in range(num_layers):
-        kv = kv_caches[layer_idx]
-        # Read suffix into contiguous tensor
-        src_blocks_start = compact_end // block_size
-        src_blocks_end = (old_seq_len - 1) // block_size + 1
-        src_bids = block_ids[src_blocks_start:src_blocks_end]
-        raw = kv[:, src_bids].reshape(2, -1, kv.shape[3], kv.shape[4])
-        src_offset = compact_end - src_blocks_start * block_size
-        suffix_k = raw[0, src_offset:src_offset + suffix_len]
-        suffix_v = raw[1, src_offset:src_offset + suffix_len]
-
-        _write_to_blocks(kv, block_ids, block_size, compact_start, suffix_k, suffix_v)
-
-        new_total = compact_start + suffix_len
-        if new_total < old_seq_len:
-            _zero_blocks(kv, block_ids, block_size, new_total, old_seq_len)
+        flat = kv_caches[layer_idx].reshape(2, -1, kv_caches[0].shape[3], kv_caches[0].shape[4])
+        flat[:, dst_slots] = flat[:, src_slots].clone()
+        if zero_slots is not None:
+            flat[:, zero_slots] = 0
 
 
 def _inject_compacted_kv(
